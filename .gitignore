@@ -1,0 +1,22 @@
+# Build outputs
+target/
+**/target/
+
+# Native scratch / IDE
+kbox-work/
+*.class
+*.jar
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.log
+hs_err_*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/

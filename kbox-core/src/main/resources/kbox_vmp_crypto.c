@@ -24,6 +24,53 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+/* Key-material intermediates (HMAC salt||ikm buffers, T-blocks) are held in
+ * page-aligned, wipe-then-release memory rather than the heap, so a libc
+ * heap-dump scan cannot recover derived keying material left over from HKDF
+ * frames. Same contract as kbox_bf_loader.c's secure alloc. */
+static void kbox_crypto_memwipe(void* p, size_t n) {
+    volatile unsigned char* v = (volatile unsigned char*)p;
+    while (n--) *v++ = 0;
+}
+static void* kbox_cryptoAlloc(size_t n) {
+    size_t ps = 4096;
+#if defined(_WIN32)
+    DWORD64 sz = (DWORD64)n;
+    if (sz < 4096) sz = 4096;
+    sz = (sz + 4095) & ~(DWORD64)4095;
+    return VirtualAlloc(NULL, (SIZE_T)sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    (void)ps;
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg > 0) ps = (size_t)pg;
+    size_t cap = (n + ps - 1) & ~(ps - 1);
+    void* p = mmap(NULL, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+#endif
+}
+static void kbox_cryptoFree(void* p, size_t cap) {
+    if (p == NULL) return;
+    size_t ps = 4096;
+#if defined(_WIN32)
+    (void)cap;
+    kbox_crypto_memwipe(p, cap);
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg > 0) ps = (size_t)pg;
+    size_t capR = (cap + ps - 1) & ~(ps - 1);
+    kbox_crypto_memwipe(p, cap);
+    munmap(p, capR);
+#endif
+}
+
 /* ============================================================ */
 /*  SHA-256 (FIPS 180-4)                                        */
 /* ============================================================ */
@@ -168,12 +215,12 @@ static void kbox_hkdf(const uint8_t* ikm, size_t ikmLen,
     if (salt != NULL && saltLen > 0) {
         /* prk = HMAC(key=ikm, msg = salt||ikm) -- exactly mirrors Java:
              mac.init(ikm); mac.update(salt); prk = mac.doFinal(ikm) */
-        uint8_t* ibuf = (uint8_t*)malloc(saltLen + ikmLen);
+        uint8_t* ibuf = (uint8_t*)kbox_cryptoAlloc(saltLen + ikmLen);
         if (!ibuf) { memset(okm, 0x2a, okmLen); return; }
         memcpy(ibuf, salt, saltLen);
         memcpy(ibuf + saltLen, ikm, ikmLen);
         kbox_hmac(ikm, ikmLen, ibuf, saltLen + ikmLen, prkBuf);
-        free(ibuf);
+        kbox_cryptoFree(ibuf, saltLen + ikmLen);
         memcpy(prkKey, prkBuf, 32);
         prkKeyLen = 32;
         prkBufLen = 32;
@@ -191,14 +238,14 @@ static void kbox_hkdf(const uint8_t* ikm, size_t ikmLen,
         size_t outLen;
         /* msg = T || info || ctr(1 byte, starting 0x01) */
         mlen = tlen + infoLen + 1;
-        m = (uint8_t*)malloc(mlen);
+        m = (uint8_t*)kbox_cryptoAlloc(mlen);
         if (!m) { memset(okm, 0x2a, okmLen); return; }
         memcpy(m, t, tlen);
         memcpy(m + tlen, info, infoLen);
         m[mlen - 1] = (uint8_t)ctr;
         kbox_hmac((prkBufLen ? prkBuf : (const uint8_t*)prkKey),
                   (prkBufLen ? 32 : prkKeyLen), m, mlen, t);
-        free(m);
+        kbox_cryptoFree(m, mlen);
         outLen = 32;
         if (outLen > (okmLen - pos)) outLen = okmLen - pos;
         memcpy(okm + pos, t, outLen);
@@ -228,13 +275,13 @@ JNIEXPORT jbyteArray JNICALL Java_com_kbox_runtime_NativeCrypto_hkdfSha2560
     if (saltLen > 0 && jsalt) { sraw = (*env)->GetByteArrayElements(env, jsalt, NULL); salt = (uint8_t*)sraw; }
     if (infoLen > 0 && jinfo) { oraw = (*env)->GetByteArrayElements(env, jinfo, NULL); info = (uint8_t*)oraw; }
 
-    okm = (uint8_t*)calloc(okLen > 0 ? (size_t)okLen : 1, 1);
+    okm = (uint8_t*)kbox_cryptoAlloc(okLen > 0 ? (size_t)okLen : 1);
     if (!okm) return NULL;
     kbox_hkdf(ikm, (size_t)ikmLen, salt, (size_t)saltLen, info, (size_t)infoLen, okm, (size_t)okLen);
 
     result = (*env)->NewByteArray(env, okLen);
     if (result) (*env)->SetByteArrayRegion(env, result, 0, okLen, (jbyte*)okm);
-    free(okm);
+    kbox_cryptoFree(okm, (size_t)okLen);
 
     if (oraw) (*env)->ReleaseByteArrayElements(env, jinfo, oraw, JNI_ABORT);
     if (sraw) (*env)->ReleaseByteArrayElements(env, jsalt, sraw, JNI_ABORT);

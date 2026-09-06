@@ -4,7 +4,6 @@ import java.lang.invoke.CallSite;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
-import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -34,7 +33,6 @@ public final class JnicIndy {
     private static final char SEP = 0x1f;   // top-level metadata field separator
     private static final char PARTS = 0x1e; // static-argument payload separator
     private static final Class<?> SELF = JnicIndy.class;
-    private static final boolean DEBUG = Boolean.getBoolean("kbox.jnic.indydbg");
 
     private JnicIndy() {
     }
@@ -51,7 +49,6 @@ public final class JnicIndy {
      * @throws Throwable if bootstrap resolution or target invocation fails
      */
     public static Object invoke(String meta, Object[] args) throws Throwable {
-        if (DEBUG) System.err.println("[JNIC-INDY] ENTER args=" + (args == null ? "?" : Arrays.toString(args)));
         String[] f = meta.split(String.valueOf(SEP), -1);
         MethodHandle target;
         try {
@@ -60,16 +57,13 @@ public final class JnicIndy {
                     return resolveTarget(f[9], f[0], f[1], f[2], Integer.parseInt(f[3]),
                             "1".equals(f[4]), f[5], f[6], f[7], f[8]);
                 } catch (Throwable t) {
-                    if (DEBUG) t.printStackTrace();
                     throw new RuntimeException("indy bootstrap failed", t);
                 }
             });
         } catch (RuntimeException wrapped) {
             throw wrapped.getCause() != null ? wrapped.getCause() : wrapped;
         }
-        if (DEBUG) System.err.println("[JNIC-INDY] target=" + target.type() + " impl=" + f[0] + "." + f[1] + f[2]);
         Object res = target.invokeWithArguments(args);
-        if (DEBUG) System.err.println("[JNIC-INDY] RESULT=" + res);
         return res;
     }
 
@@ -95,8 +89,20 @@ public final class JnicIndy {
 
     /** A lookup with access to the caller class's own (including private) members. */
     private static MethodHandles.Lookup callerLookup(String internal) throws Throwable {
-        Class<?> c = Class.forName(internal.replace('/', '.'), false, SELF.getClassLoader());
+        Class<?> c = Class.forName(internal.replace('/', '.'), false, callerLoader());
         return MethodHandles.privateLookupIn(c, LOOKUP);
+    }
+
+    /**
+     * The JNIC caller class may live in a custom (Brainfuck/guard) loader that
+     * holds the actual bytecode, so {@code JnicIndy}'s own loader cannot see it.
+     * Prefer the current thread's context class loader (BfSecureLoader sets it to
+     * itself in {@code main}), falling back to JnicIndy's own loader.
+     */
+    private static ClassLoader callerLoader() {
+        ClassLoader ctx = Thread.currentThread().getContextClassLoader();
+        if (ctx != null) return ctx;
+        return SELF.getClassLoader();
     }
 
     private static Object[] rebuild(MethodHandles.Lookup lk, String tags, String[] parts) throws Throwable {

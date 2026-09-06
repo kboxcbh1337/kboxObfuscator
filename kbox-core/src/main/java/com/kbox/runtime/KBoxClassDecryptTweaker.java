@@ -33,7 +33,9 @@ import java.util.zip.ZipEntry;
 public class KBoxClassDecryptTweaker {
 
     private static final String SEED_PATH = "META-INF/kbox/class-seed.bin";
-    private static final byte[] MAGIC = { 0x4B, 0x42, 0x43, 0x45 }; // "KBCE"
+    // XOR-masked magic (NOT ASCII "KBCE"): 'K'^0x29, 'B'^0x7B, 'C'^0xA1, 'E'^0xC3.
+    // Prevents grep-fingerprinting of encrypted-class headers (坑④).
+    private static final byte[] MAGIC = { 0x62, 0x39, (byte) 0xE2, (byte) 0x86 };
 
     // ----- ITweaker -----
 

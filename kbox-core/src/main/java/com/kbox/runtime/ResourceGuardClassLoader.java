@@ -59,6 +59,12 @@ public final class ResourceGuardClassLoader extends ClassLoader {
     // JNIC native class list (populated from META-INF/kbox/jnic-classes.list)
     private final Set<String> jnicClasses = new HashSet<>();
 
+    // Parent-delegated library classes (asm/kotlin/third-party). These are always
+    // resolved by the PARENT loader so only ONE copy exists across classloaders —
+    // otherwise ASM-style engines land with two copies and any cross-loader
+    // hand-off throws ClassCastException.
+    private final Set<String> parentDelegate = new HashSet<>();
+
     public static final class Entry {
         public final String newPath;
         public final boolean encrypted;
@@ -103,6 +109,12 @@ public final class ResourceGuardClassLoader extends ClassLoader {
     public void setJnicClasses(Set<String> classNames) {
         this.jnicClasses.clear();
         if (classNames != null) this.jnicClasses.addAll(classNames);
+    }
+
+    /** Populate the parent-delegated library class list (META-INF/kbox/parent-delegate.list). */
+    public void setParentDelegate(Set<String> classNames) {
+        this.parentDelegate.clear();
+        if (classNames != null) this.parentDelegate.addAll(classNames);
     }
 
     /**
@@ -163,6 +175,14 @@ public final class ResourceGuardClassLoader extends ClassLoader {
             // this loader breaks Kotlin reflection ("Built-in class kotlin.Any
             // is not found") because it sees two distinct kotlin.Any classes.
             if (internal.startsWith("kotlin/")) {
+                return super.loadClass(name, resolve);
+            }
+            // Parent-delegated library classes: always resolved by the parent so
+            // exactly ONE copy exists across loaders (avoids ClassCastException
+            // for bytecode/lib engines like ASM bundled inside the jar). These
+            // classes are never renamed or encrypted, so a single shared copy is
+            // semantically safe. Check BEFORE JNIC/encrypted handling.
+            if (parentDelegate.contains(internal)) {
                 return super.loadClass(name, resolve);
             }
             // JNIC / native-method classes must be loaded by the
@@ -342,12 +362,12 @@ public final class ResourceGuardClassLoader extends ClassLoader {
         return decryptClass(raw);
     }
 
-    /** Decrypts a class body encrypted with the "KBCE" magic scheme. */
+    /** Decrypts a class body encrypted with the masked KBCE magic scheme. */
     private byte[] decryptClass(byte[] blob) throws Exception {
         if (blob == null || blob.length < 16) return blob;
-        // Check magic "KBCE"
-        if (blob[0] != (byte) 0x4B || blob[1] != (byte) 0x42
-                || blob[2] != (byte) 0x43 || blob[3] != (byte) 0x45) {
+        // Check masked magic (NOT ASCII "KBCE"): 0x62 0x39 0xE2 0x86
+        if (blob[0] != (byte) 0x62 || blob[1] != (byte) 0x39
+                || blob[2] != (byte) 0xE2 || blob[3] != (byte) 0x86) {
             return blob; // not encrypted, return as-is
         }
         byte[] iv = new byte[12];

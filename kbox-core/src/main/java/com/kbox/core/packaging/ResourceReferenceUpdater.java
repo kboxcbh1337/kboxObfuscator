@@ -88,11 +88,15 @@ public final class ResourceReferenceUpdater {
         return path;
     }
 
-    /** Maps a dotted FQCN to its renamed form; leaves non-matching strings alone. */
+    /** Maps a dotted FQCN to its renamed form; leaves non-matching strings alone.
+     *  The class map is keyed by internal ('/'-separated) names; service files
+     *  carry dotted FQCNs, so try both forms. */
     private String map(String dotted) {
         if (dotted == null || dotted.isEmpty()) return dotted;
         String mapped = classMap.get(dotted);
         if (mapped != null) return mapped;
+        mapped = classMap.get(dotted.replace('.', '/'));
+        if (mapped != null) return mapped.replace('/', '.');
         return dotted;
     }
 }

@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KBox Obfuscator</title>
+<style>
+/* ============================================================
+   KBox — HTML UI（白绿 / 黑绿 双主题 · 灵动动画）
+   ============================================================ */
+:root{
+  --bg-0:#070c08; --bg-1:#0b130d;
+  --panel:rgba(17,26,19,.82);
+  --panel-2:rgba(24,36,27,.9);
+  --border:rgba(74,222,128,.16);
+  --border-strong:rgba(74,222,128,.38);
+  --text:#e9f6ed; --text-dim:#8fb39c; --text-faint:#5d7a68;
+  --green:#22c55e; --green-2:#4ade80; --green-3:#16a34a;
+  --grad:linear-gradient(135deg,#16a34a 0%,#4ade80 50%,#22c55e 100%);
+  --danger:#f87171;
+  --glow:rgba(74,222,128,.35);
+  --code-bg:#0a110c;
+  --shadow:0 18px 50px rgba(0,0,0,.55);
+}
+html[data-theme="light"]{
+  --bg-0:#f2faf4; --bg-1:#e6f5ea;
+  --panel:rgba(255,255,255,.88);
+  --panel-2:rgba(255,255,255,.96);
+  --border:rgba(22,163,74,.18);
+  --border-strong:rgba(22,163,74,.45);
+  --text:#10251a; --text-dim:#3f6a52; --text-faint:#6d917e;
+  --green:#16a34a; --green-2:#22c55e; --green-3:#15803d;
+  --grad:linear-gradient(135deg,#15803d 0%,#22c55e 50%,#16a34a 100%);
+  --code-bg:#0b1810;
+  --shadow:0 18px 50px rgba(22,120,60,.18);
+  --glow:rgba(34,197,94,.28);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  color:var(--text);
+  background:linear-gradient(160deg,var(--bg-0),var(--bg-1));
+  min-height:100vh;overflow-x:hidden;
+  transition:background .6s ease,color .6s ease;
+}
+/* ---- 灵动背景：漂浮光斑 + 网格 ---- */
+.bg-blobs{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.blob{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5;mix-blend-mode:screen}
+html[data-theme="light"] .blob{mix-blend-mode:multiply;opacity:.22}
+.blob.b1{width:520px;height:520px;background:#16a34a;top:-140px;left:-120px;animation:drift1 16s ease-in-out infinite}
+.blob.b2{width:460px;height:460px;background:#22c55e;bottom:-160px;right:-100px;animation:drift2 19s ease-in-out infinite}
+.blob.b3{width:340px;height:340px;background:#4ade80;top:38%;left:58%;opacity:.32;animation:drift3 22s ease-in-out infinite}
+@keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(90px,60px) scale(1.14)}}
+@keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-110px,-70px) scale(1.1)}}
+@keyframes drift3{0%,100%{transform:translate(0,0)}50%{transform:translate(-70px,80px) scale(1.18)}}
+.grid-veil{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.5;
+  background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:44px 44px;mask-image:radial-gradient(ellipse 90% 80% at 50% 20%,#000 30%,transparent 100%);}
+.wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:26px 22px 60px}
+
+/* ---- 头部 ---- */
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;animation:slideDown .7s cubic-bezier(.22,1,.36,1)}
+.logo{display:flex;align-items:center;gap:14px}
+.logo-badge{width:52px;height:52px;border-radius:15px;display:grid;place-items:center;
+  background:var(--grad);box-shadow:0 0 26px var(--glow);animation:pulseBadge 3.2s ease-in-out infinite;position:relative}
+.logo-badge::after{content:"";position:absolute;inset:0;border-radius:15px;
+  background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.55) 50%,transparent 70%);
+  background-size:250% 100%;animation:shimmer 3s linear infinite}
+.logo-badge svg{width:30px;height:30px;fill:#06130a}
+.logo h1{font-size:26px;font-weight:800;letter-spacing:.5px;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.logo p{font-size:12.5px;color:var(--text-dim);letter-spacing:.14em;margin-top:2px}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-60% 0}}
+@keyframes pulseBadge{0%,100%{box-shadow:0 0 22px var(--glow)}50%{box-shadow:0 0 42px var(--glow)}}
+.theme-btn{cursor:pointer;border:1px solid var(--border-strong);background:var(--panel);
+  color:var(--text);width:46px;height:46px;border-radius:13px;display:grid;place-items:center;
+  font-size:21px;transition:transform .3s cubic-bezier(.34,1.56,.64,1),box-shadow .3s,border-color .3s}
+.theme-btn:hover{transform:rotate(18deg) scale(1.08);box-shadow:0 0 20px var(--glow);border-color:var(--green-2)}
+.theme-btn .moon{display:none}
+html[data-theme="light"] .theme-btn .moon{display:inline}
+html[data-theme="light"] .theme-btn .sun{display:none}
+
+/* ---- 卡片 ---- */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:22px;
+  padding:24px;margin-bottom:20px;backdrop-filter:blur(14px);
+  box-shadow:var(--shadow);transition:transform .4s cubic-bezier(.22,1,.36,1),border-color .4s,background .6s;
+  animation:rise .8s cubic-bezier(.22,1,.36,1) both}
+.card:nth-child(2){animation-delay:.08s}.card:nth-child(3){animation-delay:.16s}.card:nth-child(4){animation-delay:.24s}
+.card:hover{border-color:var(--border-strong);transform:translateY(-2px)}
+@keyframes rise{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:none}}
+@keyframes slideDown{from{opacity:0;transform:translateY(-24px)}to{opacity:1;transform:none}}
+.sec-title{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;margin-bottom:18px;letter-spacing:.04em}
+.sec-title .dot{width:9px;height:9px;border-radius:50%;background:var(--grad);box-shadow:0 0 12px var(--glow)}
+.sec-title small{font-weight:500;color:var(--text-faint);margin-left:auto;font-size:12px}
+
+/* ---- 文件行 ---- */
+.file-row{display:flex;gap:10px;margin-bottom:13px;align-items:center}
+.file-row label{width:128px;flex:none;font-size:13px;color:var(--text-dim);letter-spacing:.03em}
+.file-row input{flex:1;background:var(--code-bg);border:1px solid var(--border);color:var(--text);
+  border-radius:12px;padding:12px 14px;font-size:13.5px;outline:none;
+  transition:border-color .3s,box-shadow .3s,transform .3s;font-family:Consolas,monospace}
+.file-row input:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
+.btn{border:none;cursor:pointer;border-radius:12px;font-weight:600;font-size:13px;
+  transition:transform .25s cubic-bezier(.34,1.56,.64,1),box-shadow .3s,filter .3s;position:relative;overflow:hidden}
+.btn-ghost{background:var(--panel-2);color:var(--text);border:1px solid var(--border-strong);padding:12px 20px}
+.btn-ghost:hover{transform:translateY(-2px);box-shadow:0 8px 22px var(--glow)}
+.btn-ghost:active{transform:translateY(0)}
+
+/* ---- 选项开关 ---- */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:11px 16px}
+.toggle{display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:13px;
+  border:1px solid transparent;cursor:pointer;transition:background .3s,border-color .3s,transform .3s}
+.toggle:hover{background:var(--panel-2);border-color:var(--border);transform:translateX(3px)}
+.toggle .lbl{font-size:13px;color:var(--text);line-height:1.25}
+.toggle .sub{font-size:11px;color:var(--text-faint);margin-top:1px}
+.sw{position:relative;width:44px;height:24px;flex:none;border-radius:99px;background:rgba(120,140,128,.28);
+  transition:background .35s;box-shadow:inset 0 1px 3px rgba(0,0,0,.35)}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;
+  background:#fff;transition:transform .35s cubic-bezier(.34,1.56,.64,1);box-shadow:0 2px 6px rgba(0,0,0,.4)}
+input[type=checkbox]{display:none}
+input[type=checkbox]:checked + .sw{background:var(--grad)}
+input[type=checkbox]:checked + .sw::after{transform:translateX(20px)}
+input[type=checkbox]:checked + .sw::before{content:"";position:absolute;inset:0;border-radius:99px;box-shadow:0 0 14px var(--glow);animation:swGlow 2s ease-in-out infinite}
+@keyframes swGlow{0%,100%{box-shadow:0 0 10px var(--glow)}50%{box-shadow:0 0 20px var(--glow)}}
+.row{display:flex;gap:14px;flex-wrap:wrap;margin-top:15px;align-items:center}
+.field{display:flex;flex-direction:column;gap:6px}
+.field>label{font-size:12px;color:var(--text-dim);letter-spacing:.04em}
+select,input[type=text]{background:var(--code-bg);border:1px solid var(--border);color:var(--text);
+  border-radius:11px;padding:10px 12px;font-size:13px;outline:none;transition:border-color .3s,box-shadow .3s}
+select:focus,input[type=text]:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
+textarea{background:var(--code-bg);border:1px solid var(--border);color:var(--text);border-radius:12px;
+  padding:11px 13px;font-size:12.5px;font-family:Consolas,monospace;resize:vertical;width:100%;min-height:74px;outline:none;transition:border-color .3s,box-shadow .3s}
+textarea:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
+
+/* ---- 主按钮 ---- */
+.run-zone{display:flex;align-items:center;gap:22px;margin-top:6px;flex-wrap:wrap}
+.btn-run{flex:1;min-width:240px;background:var(--grad);color:#07160c;font-size:17px;letter-spacing:.16em;
+  padding:17px 30px;border-radius:16px;font-weight:800;box-shadow:0 10px 34px var(--glow);position:relative;overflow:hidden}
+.btn-run::before{content:"";position:absolute;top:0;left:-80%;width:60%;height:100%;
+  background:linear-gradient(120deg,transparent,rgba(255,255,255,.5),transparent);animation:sweep 2.6s ease-in-out infinite}
+@keyframes sweep{0%{left:-80%}55%,100%{left:130%}}
+.btn-run:hover:not(:disabled){transform:translateY(-3px);box-shadow:0 16px 44px var(--glow)}
+.btn-run:active:not(:disabled){transform:translateY(0) scale(.985)}
+.btn-run:disabled{filter:grayscale(.4) brightness(.75);cursor:not-allowed;animation:none}
+.btn-run:disabled::before{display:none}
+.ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,.5);transform:scale(0);
+  animation:ripple .65s ease-out forwards;pointer-events:none}
+@keyframes ripple{to{transform:scale(4);opacity:0}}
+
+/* ---- 状态 / 进度 ---- */
+.status-head{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+.status-dot{width:13px;height:13px;border-radius:50%;background:var(--text-faint);position:relative;transition:background .4s}
+.status-dot.running{background:var(--green-2);animation:dotPulse 1.1s ease-in-out infinite}
+.status-dot.done{background:var(--green-2);box-shadow:0 0 16px var(--glow)}
+.status-dot.error{background:var(--danger);animation:dotPulse 1.1s ease-in-out infinite}
+@keyframes dotPulse{0%,100%{box-shadow:0 0 0 0 var(--glow)}50%{box-shadow:0 0 0 8px transparent}}
+.status-txt{font-size:14.5px;font-weight:700;flex:1}
+.status-txt small{display:block;font-weight:500;color:var(--text-dim);font-size:12.5px;margin-top:3px}
+.percent{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--green-2);text-shadow:0 0 18px var(--glow);transition:color .3s}
+.progress{height:14px;border-radius:99px;background:var(--code-bg);overflow:hidden;border:1px solid var(--border);position:relative}
+.progress>span{display:block;height:100%;width:0%;border-radius:99px;background:var(--grad);
+  position:relative;transition:width .5s cubic-bezier(.22,1,.36,1);box-shadow:0 0 16px var(--glow)}
+.progress.running>span::after{content:"";position:absolute;inset:0;border-radius:99px;
+  background:linear-gradient(120deg,transparent 20%,rgba(255,255,255,.5) 50%,transparent 80%);
+  background-size:220% 100%;animation:stripe .9s linear infinite}
+@keyframes stripe{0%{background-position:220% 0}100%{background-position:-60% 0}}
+.stage-chip{margin-top:13px;font-size:12.5px;color:var(--text-dim);letter-spacing:.04em;font-family:Consolas,monospace}
+.stage-chip b{color:var(--green-2)}
+
+/* ---- 日志控制台 ---- */
+.console{margin-top:16px;background:var(--code-bg);border:1px solid var(--border);border-radius:15px;overflow:hidden}
+.console-bar{display:flex;align-items:center;gap:8px;padding:10px 15px;border-bottom:1px solid var(--border);
+  background:var(--panel-2);font-size:12px;color:var(--text-dim);letter-spacing:.08em}
+.console-bar .led{width:9px;height:9px;border-radius:50%;background:var(--green-3);box-shadow:0 0 8px var(--glow);animation:ledBlink 2.2s ease-in-out infinite}
+@keyframes ledBlink{0%,100%{opacity:1}50%{opacity:.35}}
+.console-bar .clear{margin-left:auto;cursor:pointer;color:var(--text-dim);transition:color .3s;background:none;border:none;font-size:12px}
+.console-bar .clear:hover{color:var(--green-2)}
+#log{height:268px;overflow-y:auto;padding:12px 15px;font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;line-height:1.7}
+#log .ln{white-space:pre-wrap;word-break:break-all;animation:lineIn .3s ease both}
+#log .ln b{font-weight:600}
+#log .l-debug{color:var(--text-faint)}#log .l-info{color:var(--text-dim)}#log .l-warn{color:#fbbf24}#log .l-error{color:var(--danger)}
+@keyframes lineIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+#log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:8px}
+
+/* ---- 加载/等待动画：环 + 闪烁 ---- */
+.loading-ring{display:none;position:relative;width:64px;height:64px}
+.loading-ring.show{display:block;animation:fadeIn .3s}
+.loading-ring .ring{position:absolute;inset:0;border-radius:50%;border:4px solid var(--border);border-top-color:var(--green-2);
+  animation:spin 1s cubic-bezier(.6,.2,.4,.8) infinite}
+.loading-ring .ring.r2{inset:9px;border-width:3px;border-top-color:var(--green-3);animation-duration:1.5s;animation-direction:reverse}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.ready-badge{display:inline-flex;align-items:center;gap:7px;padding:8px 15px;border-radius:99px;
+  border:1px solid var(--border);background:var(--panel-2);font-size:12.5px;color:var(--text-dim)}
+.ready-badge .ok{color:var(--green-2);font-weight:800}
+.summary{display:none;margin-top:14px;padding:15px 17px;border-radius:14px;border:1px solid var(--green-3);
+  background:color-mix(in srgb,var(--green-3) 9%,transparent);font-size:13.5px;line-height:1.7}
+.summary.show{display:block;animation:rise .6s cubic-bezier(.22,1,.36,1)}
+.err-box{display:none;margin-top:14px;padding:15px 17px;border-radius:14px;border:1px solid var(--danger);
+  background:color-mix(in srgb,var(--danger) 8%,transparent);font-size:13px;color:var(--danger);white-space:pre-wrap;word-break:break-all}
+.err-box.show{display:block;animation:rise .6s}
+footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26px;letter-spacing:.06em}
+@media(max-width:720px){.file-row{flex-direction:column;align-items:stretch}.file-row label{width:auto}}
+</style>
+</head>
+<body>
+<div class="bg-blobs">
+  <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+</div>
+<div class="grid-veil"></div>
+
+<div class="wrap">
+  <header>
+    <div class="logo">
+      <div class="logo-badge">
+        <svg viewBox="0 0 24 24"><path d="M12 1l8.5 4.5v5.7c0 5.4-3.7 10.4-8.5 11.8-4.8-1.4-8.5-6.4-8.5-11.8V5.5L12 1z"/><path fill="#4ade80" d="M8.5 12.4l2.4 2.4 4.6-4.8-1.5-1.4-3.1 3.3-1-1z"/></svg>
+      </div>
+      <div>
+        <h1>KBox Obfuscator</h1>
+        <p>ZKM-LEVEL · JNIC NATIVE · VMP VIRTUALIZATION</p>
+      </div>
+    </div>
+    <button class="theme-btn" id="themeBtn" title="切换主题">
+      <span class="sun">☀</span><span class="moon">☾</span>
+    </button>
+  </header>
+
+  <!-- 目标文件 -->
+  <section class="card">
+    <div class="sec-title"><span class="dot"></span>保护目标 <small>INPUT · OUTPUT · CONFIG</small></div>
+    <div class="file-row"><label>输入 jar</label>
+      <input id="inField" placeholder="D:\path\to\app.jar" spellcheck="false">
+      <button class="btn btn-ghost" onclick="browse('open','inField')">浏览…</button></div>
+    <div class="file-row"><label>输出 jar</label>
+      <input id="outField" placeholder="D:\path\to\out.jar" spellcheck="false">
+      <button class="btn btn-ghost" onclick="browse('save','outField')">浏览…</button></div>
+    <div class="file-row"><label>配置（可选）</label>
+      <input id="cfgField" placeholder="ns-full.conf · 留空则默认保护" spellcheck="false">
+      <button class="btn btn-ghost" onclick="browse('open','cfgField')">浏览…</button></div>
+    <div class="row">
+      <div class="field" style="flex:1;min-width:260px">
+        <label>C 编译器（native 链路）</label>
+        <input type="text" id="ccField" value="C:\msys64\mingw64\bin\gcc.exe" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>混淆范围</label>
+        <select id="scopeSel">
+          <option value="ALL">ALL · 全部混淆</option>
+          <option value="SELECTIVE">SELECTIVE · 仅白名单</option>
+          <option value="EXCLUDE">EXCLUDE · 除黑名单外</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- 混淆选项 -->
+  <section class="card">
+    <div class="sec-title"><span class="dot"></span>混淆选项 <small>OBFUSCATION MATRIX</small></div>
+    <div class="file-row" style="margin-bottom:16px">
+      <label style="width:auto;padding-right:4px">全开档</label>
+      <div style="flex:1">
+        <label class="toggle" id="allMaxRow" style="border:1px solid var(--border-strong);background:color-mix(in srgb,var(--green-3) 12%,transparent)">
+          <input type="checkbox" id="allMax" onchange="toggleAllMax(this.checked)">
+          <span class="sw"></span>
+          <span class="lbl">一键全开 · 最大强度<span class="sub">allMax=true 全部选项拉满 · 再微调下面任一开关覆盖 · 全部项目类型自动适配（mod/库/Spring Boot 优雅降级）</span></span>
+        </label>
+      </div>
+    </div>
+    <div class="grid">
+      <label class="toggle"><input type="checkbox" id="rename" checked><span class="sw"></span><span class="lbl">标识符重命名<span class="sub">类 / 方法 / 字段</span></span></label>
+      <label class="toggle"><input type="checkbox" id="strings" checked><span class="sw"></span><span class="lbl">字符串加密<span class="sub">AES-256-CTR + KBNL 密钥域</span></span></label>
+      <label class="toggle"><input type="checkbox" id="scatter"><span class="sw"></span><span class="lbl">字符串分散<span class="sub">内联解密 · 摊薄统计特征</span></span></label>
+      <label class="toggle"><input type="checkbox" id="cf" checked><span class="sw"></span><span class="lbl">控制流混淆<span class="sub">平坦化 + 不透明谓词</span></span></label>
+      <label class="toggle"><input type="checkbox" id="classEnc"><span class="sw"></span><span class="lbl">类体加密<span class="sub">AES-256-GCM · 反 dump</span></span></label>
+      <label class="toggle"><input type="checkbox" id="vmp"><span class="sw"></span><span class="lbl">VMP 虚拟化<span class="sub">双状态异或解释器</span></span></label>
+      <label class="toggle"><input type="checkbox" id="jnic"><span class="sw"></span><span class="lbl">JNIC 原生化<span class="sub">Java → C 本地化</span></span></label>
+      <label class="toggle"><input type="checkbox" id="resources"><span class="sw"></span><span class="lbl">资源混淆<span class="sub">重命名 + 加密</span></span></label>
+      <label class="toggle"><input type="checkbox" id="kotlin" checked><span class="sw"></span><span class="lbl">Kotlin 元数据修复<span class="sub">@Metadata 一致性</span></span></label>
+      <label class="toggle"><input type="checkbox" id="antiDebug"><span class="sw"></span><span class="lbl">深反调试<span class="sub">JDWP / agent / 时序探针</span></span></label>
+      <label class="toggle"><input type="checkbox" id="vmpSelfCheck"><span class="sw"></span><span class="lbl">VMP 自校验<span class="sub">解释器字节码哈希</span></span></label>
+      <label class="toggle"><input type="checkbox" id="integrity"><span class="sw"></span><span class="lbl">完整性校验<span class="sub">SHA-256 · 反篡改</span></span></label>
+      <label class="toggle"><input type="checkbox" id="exJump"><span class="sw"></span><span class="lbl">异常跳转混淆<span class="sub">athrow + catch</span></span></label>
+      <label class="toggle"><input type="checkbox" id="nativeAntiHook"><span class="sw"></span><span class="lbl">Native 反钩子<span class="sub">入口完整性 + 环境清理</span></span></label>
+    </div>
+    <div class="row">
+      <div class="field"><label>控制流强度</label>
+        <select id="cfStrength"><option value="1">1 · 轻</option><option value="2" selected>2 · 中</option><option value="3">3 · 激进</option></select></div>
+      <div class="field"><label>字符串强度</label>
+        <select id="strStrength"><option value="1">1 · XOR</option><option value="2">2 · AES</option><option value="3" selected>3 · AES-256-CTR</option></select></div>
+      <div class="field"><label>反编译器对抗</label>
+        <select id="antiDec"><option value="0">0 · 关</option><option value="1">1 · 轻</option><option value="2">2 · 中</option><option value="3">3 · 激进</option></select></div>
+      <div class="field" style="flex:1;min-width:200px"><label>水印</label>
+        <input type="text" id="watermark" placeholder="kbox-web-ui" spellcheck="false"></div>
+    </div>
+  </section>
+
+  <!-- 高级选项（config 常见强开项，UI 可直接关闭） -->
+  <section class="card">
+    <div class="sec-title"><span class="dot"></span>高级选项 <small>ADVANCED · 未勾选=关闭（可覆盖 config 中的对应键）</small></div>
+    <div class="grid">
+      <label class="toggle"><input type="checkbox" id="bfLoader"><span class="sw"></span><span class="lbl">Brainfuck 混沌加载<span class="sub">类/资源打包进 native 解码器 · 明文只驻 native 堆</span></span></label>
+      <label class="toggle"><input type="checkbox" id="bfShield"><span class="sw"></span><span class="lbl">BrainfuckShield 二次虚拟化<span class="sub">VMP 之上磁带化 · 需 VMP</span></span></label>
+      <label class="toggle"><input type="checkbox" id="bfvm"><span class="sw"></span><span class="lbl">BFVM 全方法虚拟化<span class="sub">方法体→Brainfuck 磁带程序 · 需 config 指定 bfvmMethod</span></span></label>
+      <label class="toggle"><input type="checkbox" id="whiteboxStrings"><span class="sw"></span><span class="lbl">白盒字符串<span class="sub">单点查找表解密 · 字节码无密钥</span></span></label>
+      <label class="toggle"><input type="checkbox" id="obfConstants"><span class="sw"></span><span class="lbl">常量查表加密<span class="sub">_KboxConsts.I(k)=T[k]^K</span></span></label>
+      <label class="toggle"><input type="checkbox" id="vmpNative"><span class="sw"></span><span class="lbl">VMP 原生化<span class="sub">kbox_vmp_core.c → vmp.bin · 需 cc</span></span></label>
+      <label class="toggle"><input type="checkbox" id="autoAdaptMc"><span class="sw"></span><span class="lbl">MC mod 自动适配<span class="sub">fabric.mod.json / mixins 自动 keep</span></span></label>
+      <label class="toggle"><input type="checkbox" id="reflectionGate"><span class="sw"></span><span class="lbl">反射门禁<span class="sub">Class.forName 白名单 · 拦截非白名单</span></span></label>
+      <label class="toggle"><input type="checkbox" id="jnicEpl"><span class="sw"></span><span class="lbl">JNIC 吃 EPL 选例<span class="sub">native 选例对齐平坦化窗口</span></span></label>
+      <label class="toggle"><input type="checkbox" id="hideCallGraph"><span class="sw"></span><span class="lbl">调用图隐藏<span class="sub">合成间接跳转 + 死代码诱饵</span></span></label>
+      <label class="toggle"><input type="checkbox" id="fakeDebugInfo"><span class="sw"></span><span class="lbl">伪造调试信息<span class="sub">假局部变量 / 行号误导</span></span></label>
+      <label class="toggle"><input type="checkbox" id="methodInlineExtract"><span class="sw"></span><span class="lbl">方法内联抽取<span class="sub">内联热点 · 拆分大方法</span></span></label>
+      <label class="toggle"><input type="checkbox" id="eraseAnnotations"><span class="sw"></span><span class="lbl">注解擦除<span class="sub">移除语义元数据</span></span></label>
+      <label class="toggle"><input type="checkbox" id="nullGuard"><span class="sw"></span><span class="lbl">资源空守卫<span class="sub">getResourceAsStream null 兜底</span></span></label>
+      <label class="toggle"><input type="checkbox" id="vmpProtectRuntime"><span class="sw"></span><span class="lbl">VMP 保护运行期<span class="sub">运行时解密方法也虚拟化</span></span></label>
+      <label class="toggle"><input type="checkbox" id="silentShield" checked><span class="sw"></span><span class="lbl">SilentShield 适配审计<span class="sub">弱点驱动自动策略</span></span></label>
+    </div>
+    <div class="row">
+      <div class="field"><label>nativeShell 增强壳</label>
+        <select id="nativeShell"><option value="0">0 · 关</option><option value="1">1 · M1 字符串擦除</option><option value="2">2 · +M2 控制流变异</option><option value="3" selected>3 · +M3 IAT 隐藏</option></select></div>
+      <div class="field"><label>BrainfuckShield 强度</label>
+        <select id="bfShieldLevel"><option value="0">0 · 关</option><option value="1">1 · 轻</option><option value="2">2 · 中</option><option value="3" selected>3 · 最强</option></select></div>
+      <div class="field"><label>类型混淆</label>
+        <select id="typeConfusion"><option value="0" selected>0 · 关</option><option value="1">1 · 注入</option><option value="2">2 · 深</option></select></div>
+      <div class="field"><label>交织表达式常量</label>
+        <select id="mbaConstants"><option value="0" selected>0 · 关</option><option value="1">1 · 基础</option><option value="2">2 · 深</option></select></div>
+      <div class="field"><label>S2 不透明状态机</label>
+        <select id="opaqueStateMachine"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>S4 蜜罐诱饵</label>
+        <select id="honeypot"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>S1 方法切分</label>
+        <select id="methodSplit"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>S3 sentinel 交错</label>
+        <select id="sentinelInterleave"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>S5 blob mock 填充</label>
+        <select id="blobMockFill"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>D1 栈帧重定向</label>
+        <select id="stackFrameRedirect"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>D2 熵·时间锚</label>
+        <select id="entropyTimeAnchor"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>D3 节自擦</label>
+        <select id="selfWipeSections"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>D4 进程心跳</label>
+        <select id="processHeartbeat"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>D5 蜜罐 PE</label>
+        <select id="honeypotPe"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>C1 一次性语义</label>
+        <select id="oneTimeSemantic"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>C2 血缘链</label>
+        <select id="lineageChain"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>C3 自反认证</label>
+        <select id="selfRefAuth"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>C4 多元表示</label>
+        <select id="multiRep"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>C5 计算镀金</label>
+        <select id="polyGold"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>X1 信号 poison</label>
+        <select id="signalPoison"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+      <div class="field"><label>X2 构建签名绑定</label>
+        <select id="buildSigBind"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+    </div>
+  </section>
+
+  <!-- 运行 -->
+  <section class="card">
+    <div class="sec-title"><span class="dot"></span>执行 <small>PROTECTION ENGINE</small></div>
+    <div class="run-zone">
+      <button class="btn btn-run" id="runBtn">开始混淆</button>
+      <div class="loading-ring" id="ring"><div class="ring"></div><div class="ring r2"></div></div>
+    </div>
+
+    <div class="status-head" style="margin-top:22px">
+      <span class="status-dot" id="statusDot"></span>
+      <div class="status-txt" id="statusTxt">就绪<small id="statusSub">等待执行</small></div>
+      <span class="percent" id="percent">0%</span>
+    </div>
+    <div class="progress" id="progressTrack"><span id="progressBar"></span></div>
+    <div class="stage-chip" id="stageChip"><b>IDLE</b> · 引擎就绪</div>
+
+    <div class="console">
+      <div class="console-bar"><span class="led"></span>LIVE LOG
+        <button class="clear" onclick="document.getElementById('log').innerHTML=''">清空</button></div>
+      <div id="log"></div>
+    </div>
+
+    <div class="summary" id="summary"></div>
+    <div class="err-box" id="errBox"></div>
+  </section>
+
+  <footer>KBox Obfuscator · 白绿 / 黑绿 双主题 · HTML UI</footer>
+</div>
+
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let runId=0, since=0, pollTimer=null;
+
+/* ---------- 主题 ---------- */
+function applyTheme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem('kbox-theme',t)}catch(e){}}
+$('themeBtn').addEventListener('click',()=>{
+  const cur=document.documentElement.dataset.theme;
+  applyTheme(cur==='dark'?'light':'dark');
+});
+try{const saved=localStorage.getItem('kbox-theme');if(saved)applyTheme(saved);}catch(e){}
+
+/* ---------- 涟漪 ---------- */
+document.addEventListener('click',e=>{
+  const b=e.target.closest('.btn-run');if(!b||b.disabled)return;
+  const r=b.getBoundingClientRect(),ri=document.createElement('span');
+  ri.className='ripple';
+  const d=Math.max(r.width,r.height);
+  ri.style.width=ri.style.height=d+'px';
+  ri.style.left=(e.clientX-r.left-d/2)+'px';
+  ri.style.top=(e.clientY-r.top-d/2)+'px';
+  b.appendChild(ri);setTimeout(()=>ri.remove(),700);
+});
+
+/* ---------- 浏览（后端 JFileChooser） ---------- */
+async function browse(mode,field){
+  const res=await fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode,current:$(field).value})});
+  const j=await res.json();
+  if(j.path)$(field).value=j.path;
+}
+
+/* ---------- 状态轮询 ---------- */
+function setUi(status){
+  const dot=$('statusDot');
+  dot.className='status-dot'+(status==='running'?' running':status==='done'?' done':status==='error'?' error':'');
+  $('ring').classList.toggle('show',status==='running');
+  $('runBtn').disabled=status==='running';
+  $('progressTrack').classList.toggle('running',status==='running');
+}
+async function poll(){
+  try{
+    const res=await fetch('/api/state?runId='+runId+'&since='+since);
+    const j=await res.json();
+    if(j.runId!==runId)return;                 // 新一轮开始，丢弃旧响应
+    if(j.entries&&j.entries.length){
+      for(const e of j.entries){
+        since=e.s;
+        const cls='l-'+((e.lvl)||'info');
+        $('log').insertAdjacentHTML('beforeend','<div class="ln '+cls+'">'+e.l+'</div>');
+      }
+      const lg=$('log');lg.scrollTop=lg.scrollHeight;
+    }
+    $('percent').textContent=j.percent+'%';
+    $('progressBar').style.width=j.percent+'%';
+    $('stageChip').innerHTML='<b>'+(j.stage>0?('Stage '+j.stage+'/'+j.total):'IDLE')+'</b>'+
+      (j.stageName?' · '+escapeHtml(j.stageName):' · 引擎就绪');
+    if(j.status==='running'){
+      $('statusTxt').innerHTML='正在混淆…<small>'+escapeHtml(j.stageName||'')+'</small>';
+    }else if(j.status==='done'){
+      $('statusTxt').innerHTML='混淆完成<small>'+escapeHtml(j.summary||'')+'</small>';
+      $('summary').textContent='✓ 保护完成：'+(j.summary||'');
+      $('summary').classList.add('show');
+    }else if(j.status==='error'){
+      $('statusTxt').innerHTML='混淆失败<small>'+escapeHtml(j.error||'')+'</small>';
+      $('errBox').textContent=(j.error||'');
+      $('errBox').classList.add('show');
+    }
+    setUi(j.status);
+    if(j.status==='running')pollTimer=setTimeout(poll,250);   // 250ms 快速同步进度
+  }catch(err){pollTimer=setTimeout(poll,800);}
+}
+
+/* ---------- 一键全开：把全部开关/滑杆置为最大强度 ---------- */
+const MAX_SELECTS={'cfStrength':3,'strStrength':3,'antiDec':3,'nativeShell':3,'bfShieldLevel':3,
+  'typeConfusion':2,'mbaConstants':2,'opaqueStateMachine':3,'honeypot':3,'methodSplit':3,
+  'sentinelInterleave':3,'blobMockFill':3,'stackFrameRedirect':3,'entropyTimeAnchor':3,
+  'selfWipeSections':3,'processHeartbeat':3,'honeypotPe':3,'oneTimeSemantic':3,'lineageChain':3,
+  'selfRefAuth':3,'multiRep':3,'polyGold':3,'signalPoison':3,'buildSigBind':3};
+const MAX_CHECKED=['rename','strings','scatter','cf','classEnc','vmp','jnic','resources','kotlin',
+  'antiDebug','vmpSelfCheck','integrity','exJump','nativeAntiHook','bfLoader','bfShield','bfvm',
+  'whiteboxStrings','obfConstants','vmpNative','autoAdaptMc','reflectionGate','jnicEpl',
+  'hideCallGraph','fakeDebugInfo','methodInlineExtract','eraseAnnotations','nullGuard',
+  'vmpProtectRuntime','silentShield'];
+const DEFAULT_SELECTS={'cfStrength':2,'strStrength':3,'antiDec':0,'nativeShell':3,'bfShieldLevel':3,
+  'typeConfusion':0,'mbaConstants':0,'opaqueStateMachine':0,'honeypot':0,'methodSplit':0,
+  'sentinelInterleave':0,'blobMockFill':0,'stackFrameRedirect':0,'entropyTimeAnchor':0,
+  'selfWipeSections':0,'processHeartbeat':0,'honeypotPe':0,'oneTimeSemantic':0,'lineageChain':0,
+  'selfRefAuth':0,'multiRep':0,'polyGold':0,'signalPoison':0,'buildSigBind':0};
+const DEFAULT_CHECKED=['rename','strings','cf','kotlin','silentShield'];
+function toggleAllMax(on){
+  for(const id of MAX_CHECKED){if($(id))$(id).checked=on;}
+  for(const id in MAX_SELECTS){if($(id))$(id).value=on?MAX_SELECTS[id]:DEFAULT_SELECTS[id];}
+  if(!on){
+    for(const id of DEFAULT_CHECKED){if($(id))$(id).checked=true;}
+  }
+}
+
+/* ---------- 启动混淆 ---------- */
+async function protect(){
+  const inV=$('inField').value.trim(),outV=$('outField').value.trim();
+  if(!inV||!outV){flash('输入与输出 jar 均为必填');return;}
+  runId=Date.now();since=0;                                 // 先清 UI；真正批号以服务端下发为准
+  $('log').innerHTML='';$('summary').classList.remove('show');$('errBox').classList.remove('show');
+  $('percent').textContent='0%';$('progressBar').style.width='0%';
+  setUi('running');
+  const body={
+    input:inV,output:outV,config:$('cfgField').value.trim(),cc:$('ccField').value.trim(),
+    scope:$('scopeSel').value,
+    allMax:$('allMax').checked,
+    rename:$('rename').checked,strings:$('strings').checked,scatter:$('scatter').checked,
+    cf:$('cf').checked,classEnc:$('classEnc').checked,vmp:$('vmp').checked,jnic:$('jnic').checked,
+    resources:$('resources').checked,kotlin:$('kotlin').checked,
+    antiDebug:$('antiDebug').checked,vmpSelfCheck:$('vmpSelfCheck').checked,
+    integrity:$('integrity').checked,exJump:$('exJump').checked,nativeAntiHook:$('nativeAntiHook').checked,
+    cfStrength:+$('cfStrength').value,strStrength:+$('strStrength').value,
+    antiDec:+$('antiDec').value,watermark:$('watermark').value.trim(),
+    bfLoader:$('bfLoader').checked,bfShield:$('bfShield').checked,bfShieldLevel:+$('bfShieldLevel').value,
+    bfvm:$('bfvm').checked,
+    nativeShell:+$('nativeShell').value,typeConfusion:+$('typeConfusion').value,mbaConstants:+$('mbaConstants').value,
+    whiteboxStrings:$('whiteboxStrings').checked,obfConstants:$('obfConstants').checked,
+    opaqueStateMachine:+$('opaqueStateMachine').value,honeypot:+$('honeypot').value,methodSplit:+$('methodSplit').value,
+    silentShield:$('silentShield').checked,
+    vmpNative:$('vmpNative').checked,autoAdaptMc:$('autoAdaptMc').checked,reflectionGate:$('reflectionGate').checked,
+    jnicEpl:$('jnicEpl').checked,hideCallGraph:$('hideCallGraph').checked,fakeDebugInfo:$('fakeDebugInfo').checked,
+    methodInlineExtract:$('methodInlineExtract').checked,eraseAnnotations:$('eraseAnnotations').checked,
+    nullGuard:$('nullGuard').checked,vmpProtectRuntime:$('vmpProtectRuntime').checked,
+    sentinelInterleave:+$('sentinelInterleave').value,blobMockFill:+$('blobMockFill').value,
+    stackFrameRedirect:+$('stackFrameRedirect').value,entropyTimeAnchor:+$('entropyTimeAnchor').value,
+    selfWipeSections:+$('selfWipeSections').value,processHeartbeat:+$('processHeartbeat').value,
+    honeypotPe:+$('honeypotPe').value,oneTimeSemantic:+$('oneTimeSemantic').value,lineageChain:+$('lineageChain').value,
+    selfRefAuth:+$('selfRefAuth').value,multiRep:+$('multiRep').value,polyGold:+$('polyGold').value,
+    signalPoison:+$('signalPoison').value,buildSigBind:+$('buildSigBind').value
+  };
+  try{
+    const res=await fetch('/api/protect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await res.json();
+    if(!j.ok){
+      // 已有任务在执行：保持轮询以跟踪进行中的进度，仅提示。
+      if(j.error&&j.error.indexOf('正在执行')>=0){flash('已有任务正在执行，请等待');pollTimer=setTimeout(poll,300);return;}
+      setUi('idle');flash(j.error||'启动失败');return;
+    }
+    runId=j.runId||runId;                                  // 采用服务端下发的批号（状态隔离的依据）
+  }catch(err){setUi('idle');flash('无法连接后端服务');return;}
+  pollTimer=setTimeout(poll,300);
+}
+function flash(msg){const s=$('summary');s.textContent='⚠ '+msg;s.classList.add('show');setTimeout(()=>s.classList.remove('show'),2600);}
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+$('runBtn').addEventListener('click',protect);
+</script>
+</body>
+</html>

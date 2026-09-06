@@ -14,6 +14,17 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#if defined(__linux__) || defined(__linux)
+#include <link.h>
+#endif
+#endif
 
 /* ===== Compiler compatibility macros ===== */
 #ifdef _MSC_VER
@@ -41,11 +52,15 @@ typedef union KBOX_ALIGNED(8) {
 typedef kbox_slot_t kbox_value_t;
 
 typedef struct {
-    uint32_t start_pc;
-    uint32_t end_pc;
-    uint32_t handler_pc;
-    uint16_t catch_type;
+    uint32_t start_pc;      /* first covered pc (inclusive) */
+    uint32_t end_pc;        /* first uncovered pc (exclusive) */
+    uint32_t handler_pc;    /* handler entry pc */
+    uint32_t catch_type;    /* sequential cp_cls index; KBOX_CATCH_ALL = catch-all */
 } kbox_ex_handler_t;
+
+/* Sentinel catch_type for a catch-all handler (TryCatchBlockNode.type == NULL).
+ * cp_cls sequential indices are small non-zero numbers, so this never collides. */
+#define KBOX_CATCH_ALL 0xFFFFFFFFu
 
 /* Hard upper bound on operand-stack depth and local-variable slots in a single
  * translated method. The stub generator MUST reject any method whose
@@ -55,33 +70,13 @@ typedef struct {
 #define KBOX_MAX_SLOTS  256
 #define KBOX_MAX_ARGS   32
 
-/* Debug helper: resolve a jclass to its dotted name for KBOX_JNIC_DBG logging.
- * Returns a pointer to a static buffer (overwritten on next call). Used only in
- * the INSTANCEOF debug branch; never called on the release path. */
-static const char* getClassName(JNIEnv* env, jclass cls) {
-    static char _buf[512];
-    if (!cls) return "(null)";
-    _buf[0] = '\0';
-    jmethodID gm = (*env)->GetMethodID(env, cls, "getName", "()Ljava/lang/String;");
-    if (!gm) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); return "<unknown>"; }
-    jstring ns = (jstring)(*env)->CallObjectMethod(env, cls, gm);
-    if (!ns) { if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); return "<unknown>"; }
-    const char* c = (*env)->GetStringUTFChars(env, ns, NULL);
-    if (c) {
-        strncpy(_buf, c, sizeof(_buf) - 1);
-        _buf[sizeof(_buf) - 1] = '\0';
-        (*env)->ReleaseStringUTFChars(env, ns, c);
-    }
-    return _buf;
-}
-
 /* ===== Opcode constants (standard JVM) ===== */
 enum {
     K_NOP=0x00, K_ACONST_NULL=0x01, K_ICONST_M1=0x02, K_ICONST_0=0x03,
     K_ICONST_1=0x04, K_ICONST_2=0x05, K_ICONST_3=0x06, K_ICONST_4=0x07,
     K_ICONST_5=0x08, K_LCONST_0=0x09, K_LCONST_1=0x0A, K_FCONST_0=0x0B,
     K_FCONST_1=0x0C, K_FCONST_2=0x0D, K_DCONST_0=0x0E, K_DCONST_1=0x0F,
-    K_BIPUSH=0x10, K_SIPUSH=0x11, K_LDC=0x12,
+    K_BIPUSH=0x10, K_SIPUSH=0x11, K_LDC=0x12, K_LDC2_W=0x14,
     K_ILOAD=0x15, K_LLOAD=0x16, K_FLOAD=0x17, K_DLOAD=0x18, K_ALOAD=0x19,
     K_ILOAD_0=0x1A,K_ILOAD_1=0x1B,K_ILOAD_2=0x1C,K_ILOAD_3=0x1D,
     K_LLOAD_0=0x1E,K_LLOAD_1=0x1F,K_LLOAD_2=0x20,K_LLOAD_3=0x21,
@@ -123,7 +118,9 @@ enum {
     K_INVOKEVIRTUAL=0xB6,K_INVOKESPECIAL=0xB7,K_INVOKESTATIC=0xB8,K_INVOKEINTERFACE=0xB9,
     K_NEW=0xBB,K_NEWARRAY=0xBC,K_ANEWARRAY=0xBD,
     K_ARRAYLENGTH=0xBE,K_ATHROW=0xBF,K_CHECKCAST=0xC0,K_INSTANCEOF=0xC1,
-    K_MULTIANEWARRAY=0xC5, K_IFNULL=0xC6,K_IFNONNULL=0xC7,
+    K_MONITORENTER=0xC2, K_MONITOREXIT=0xC3,
+    K_WIDE=0xC4, K_MULTIANEWARRAY=0xC5, K_IFNULL=0xC6,K_IFNONNULL=0xC7,
+    K_GOTO_W=0xC8, K_JSR=0xC9, K_JSR_W=0xCA, K_RET=0xA9,
     K_TABLESWITCH=0xAA, K_LOOKUPSWITCH=0xAB, K_INVOKEDYNAMIC=0xBA
 };
 
@@ -139,6 +136,8 @@ static void fn_LCONST_0(kbox_ctx_t* ctx); static void fn_LCONST_1(kbox_ctx_t* ct
 static void fn_FCONST_0(kbox_ctx_t* ctx); static void fn_FCONST_1(kbox_ctx_t* ctx); static void fn_FCONST_2(kbox_ctx_t* ctx);
 static void fn_DCONST_0(kbox_ctx_t* ctx); static void fn_DCONST_1(kbox_ctx_t* ctx);
 static void fn_BIPUSH(kbox_ctx_t* ctx); static void fn_SIPUSH(kbox_ctx_t* ctx); static void fn_LDC(kbox_ctx_t* ctx);
+static void fn_LDC2_W(kbox_ctx_t* ctx); static void fn_WIDE(kbox_ctx_t* ctx);
+static void fn_MONITORENTER(kbox_ctx_t* ctx); static void fn_MONITOREXIT(kbox_ctx_t* ctx);
 static void fn_ILOAD(kbox_ctx_t* ctx); static void fn_LLOAD(kbox_ctx_t* ctx); static void fn_FLOAD(kbox_ctx_t* ctx);
 static void fn_DLOAD(kbox_ctx_t* ctx); static void fn_ALOAD(kbox_ctx_t* ctx);
 static void fn_ILOAD_0(kbox_ctx_t* ctx); static void fn_ILOAD_1(kbox_ctx_t* ctx); static void fn_ILOAD_2(kbox_ctx_t* ctx); static void fn_ILOAD_3(kbox_ctx_t* ctx);
@@ -158,7 +157,8 @@ static void fn_ASTORE_0(kbox_ctx_t* ctx); static void fn_ASTORE_1(kbox_ctx_t* ct
 static void fn_IASTORE(kbox_ctx_t* ctx); static void fn_LASTORE(kbox_ctx_t* ctx); static void fn_FASTORE(kbox_ctx_t* ctx); static void fn_DASTORE(kbox_ctx_t* ctx);
 static void fn_AASTORE(kbox_ctx_t* ctx); static void fn_BASTORE(kbox_ctx_t* ctx); static void fn_CASTORE(kbox_ctx_t* ctx); static void fn_SASTORE(kbox_ctx_t* ctx);
 static void fn_POP(kbox_ctx_t* ctx); static void fn_POP2(kbox_ctx_t* ctx); static void fn_DUP(kbox_ctx_t* ctx);
-static void fn_DUP_X1(kbox_ctx_t* ctx); static void fn_DUP2(kbox_ctx_t* ctx);
+static void fn_DUP_X1(kbox_ctx_t* ctx); static void fn_DUP_X2(kbox_ctx_t* ctx);
+static void fn_DUP2(kbox_ctx_t* ctx);
 static void fn_DUP2_X1(kbox_ctx_t* ctx); static void fn_DUP2_X2(kbox_ctx_t* ctx); static void fn_SWAP(kbox_ctx_t* ctx);
 static void fn_IADD(kbox_ctx_t* ctx); static void fn_LADD(kbox_ctx_t* ctx); static void fn_FADD(kbox_ctx_t* ctx); static void fn_DADD(kbox_ctx_t* ctx);
 static void fn_ISUB(kbox_ctx_t* ctx); static void fn_LSUB(kbox_ctx_t* ctx); static void fn_FSUB(kbox_ctx_t* ctx); static void fn_DSUB(kbox_ctx_t* ctx);
@@ -303,35 +303,236 @@ KBOX_INLINE int kbox_collect_args(kbox_slot_t* stk, int len, int start, int ac, 
     return ac;
 }
 
-/* ===== Anti-debug layer ===== */
+/* ===== Anti-debug / anti-patch layer ===== */
 
 /* Global flag: set once, checked periodically. */
 static volatile int g_debugged = -1;
 
 /*
- * Detect JDWP / JVMTI attachment without crashing.
- * Checks JVM input arguments for debug-related flags.
- * Returns 1 if debugger suspected, 0 otherwise.
+ * Detect JDWP / JVMTI agent attachment without crashing by probing the
+ * process's loaded modules. A clean JVM maps none of these; each only appears
+ * when the corresponding agent / debugger / attach feature is turned on.
+ * instrument.dll is the key marker for a dynamic Attach-API agent, jdwp /
+ * dt_socket / dt_shmem catch JDWP debuggers, hprof a profiler.
  */
 static int kbox_detect_jdwp(void) {
-    /* Check java.vm.name for known debug VM variants */
-    /* This is a lightweight check; full checks use JVMTI-native API */
-    return 0;  /* Stub: full implementation requires JVM TI native agent */
+#if defined(_WIN32)
+    static const char* mods[] = {
+        "instrument.dll",   /* -javaagent / Attach-API instrumentation */
+        "attach.dll",       /* Attach API bridge (Windows) */
+        "jdk.attach.dll",   /* Attach API native (some JDK builds) */
+        "jdwp.dll",         /* -Xrunjdwp debugger */
+        "dt_socket.dll",    /* JDWP socket transport */
+        "dt_shmem.dll",     /* JDWP shared-memory transport */
+        "hprof.dll"         /* -Xrunhprof profiler */
+    };
+    for (size_t i = 0; i < sizeof(mods) / sizeof(mods[0]); i++) {
+        if (GetModuleHandleA(mods[i]) != NULL) return 1;
+    }
+#elif defined(__linux__) || defined(__linux)
+    /* Scan /proc/self/maps for mapped agent / debugger libraries. */
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char line[512];
+    static const char* needles[] = {
+        "instrument", "attach", "jdwp", "dt_socket", "dt_shmem", "hprof"
+    };
+    int hit = 0;
+    while (!hit && fgets(line, sizeof(line), fp)) {
+        for (size_t i = 0; i < sizeof(needles) / sizeof(needles[0]); i++) {
+            if (strstr(line, needles[i])) { hit = 1; break; }
+        }
+    }
+    fclose(fp);
+    return hit;
+#else
+    return 0; /* no portable module enumeration on this platform */
+#endif
 }
 
-/*
- * Self-integrity: verify the first bytes of this function match
- * the expected prologue.  If an inline hook (Frida, etc.) has patched
- * the function entry, the hash will mismatch.
- *
- * We compute a simple checksum over the first 64 bytes of the
- * interpreter dispatch table.  The expected value is embedded at
- * obfuscation time; for now we use a placeholder.
+/* ===== .text / image integrity self-check (anti-patch) =====
+ * Mirrors kbox_bf_loader.c: a per-build salt (KBOX_TEXT_SALT, injected by
+ * JnicOrchestrator into the source) plus a build-time expected FNV-1a over the
+ * whole non-writable, non-discardable image, patched into the dedicated
+ * .kboxexp section by NativeImageHash AFTER compilation. Because the hash skips
+ * .kboxexp by name it is independent of the constant's own value, so a runtime
+ * patch can no longer re-baseline the expectation.
  */
-static int kbox_self_check(void) {
-    /* Placeholder: in production this would verify a hash of the
-     * interpreter's code section to detect patching. */
+#ifndef KBOX_TEXT_SALT
+#define KBOX_TEXT_SALT 0x12345678u
+#endif
+#if defined(_MSC_VER)
+#pragma section(".kboxexp", read)
+__declspec(allocate(".kboxexp")) static const uint64_t KBOX_EXPECTED = 0x0u;
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((section(".kboxexp"), used)) static const uint64_t KBOX_EXPECTED = 0x0u;
+#else
+static const uint64_t KBOX_EXPECTED = 0x0u;
+#endif
+#define KBOX_EXPECTED_MAGIC (0x4B424F58u ^ 0x2D7E1A93u) /* masked, NOT 'KBOX' */
+
+static uint32_t kbox_textHash(uint32_t salt, const uint8_t* p, size_t n) {
+    uint32_t h = salt ^ 0x811c9dc5u;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
+    return h;
+}
+
+static uint32_t g_imageHash = 0;
+
+static uintptr_t kbox_selfBase(void) {
+#if defined(_WIN32)
+    HMODULE h = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(uintptr_t)kbox_selfBase, &h) == 0) return 0;
+    return (uintptr_t)h;
+#else
+    Dl_info di;
+    memset(&di, 0, sizeof(di));
+    if (dladdr((void*)(uintptr_t)kbox_selfBase, &di) == 0 || di.dli_fbase == NULL) return 0;
+    return (uintptr_t)di.dli_fbase;
+#endif
+}
+
+#if defined(_WIN32)
+#define KBOX_MAX_RELOC 1024
+static DWORD g_relocRva[KBOX_MAX_RELOC];
+static int g_relocCount = 0;
+static int g_relocInit = 0;
+
+static void kbox_collectRelocs(uintptr_t base) {
+    g_relocInit = 1; g_relocCount = 0;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    DWORD er = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+    DWORD esz = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    if (!er || !esz) return;
+    DWORD off = 0;
+    while (off + 8 <= esz && g_relocCount < KBOX_MAX_RELOC) {
+        IMAGE_BASE_RELOCATION* br = (IMAGE_BASE_RELOCATION*)(base + er + off);
+        if (br->SizeOfBlock == 0) break;
+        DWORD cnt = (br->SizeOfBlock - 8) / 2;
+        const unsigned short* ents = (const unsigned short*)(br + 1);
+        for (DWORD j = 0; j < cnt && g_relocCount < KBOX_MAX_RELOC; j++) {
+            unsigned short e = ents[j];
+            unsigned short t = e >> 12;
+            if (t == 2 || t == 10) g_relocRva[g_relocCount++] = br->VirtualAddress + (e & 0xFFF);
+        }
+        off += br->SizeOfBlock;
+    }
+}
+
+static int kbox_hashImage(uintptr_t base, uint32_t salt, uint32_t* out) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return -1;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return -1;
+    if (!g_relocInit) kbox_collectRelocs(base);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    uintptr_t end = base + (uintptr_t)nt->OptionalHeader.SizeOfImage;
+    uint32_t h = salt ^ 0x811c9dc5u;
+    int ri = 0;
+    for (int i = 0; i < (int)nt->FileHeader.NumberOfSections; i++) {
+        DWORD ch = sec[i].Characteristics;
+        if ((ch & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_DISCARDABLE)) != 0) continue;
+        if (strncmp((const char*)sec[i].Name, ".kboxexp", 8) == 0) continue;
+        if (strncmp((const char*)sec[i].Name, ".idata", 8) == 0) continue;
+        uintptr_t va = base + (uintptr_t)sec[i].VirtualAddress;
+        size_t n = sec[i].Misc.VirtualSize;
+        if (va + n > end) n = end - va;
+        if (n == 0) continue;
+        h ^= (uint32_t)sec[i].VirtualAddress;
+        h ^= ch;
+        h *= 0x01000193u;
+        const uint8_t* p = (const uint8_t*)va;
+        for (size_t j = 0; j < n; j++) {
+            DWORD rva = sec[i].VirtualAddress + (DWORD)j;
+            while (ri < g_relocCount && g_relocRva[ri] < rva) ri++;
+            if (ri < g_relocCount && g_relocRva[ri] == rva) continue;
+            h ^= p[j];
+            h *= 0x01000193u;
+        }
+    }
+    *out = h;
+    return 0;
+}
+#else
+struct kbox_elf_ctx { uint32_t salt; uint32_t hash; int found; };
+static uintptr_t g_selfBase = 0;
+
+#if defined(__linux__) || defined(__linux)
+static int kbox_phdr_cb(struct dl_phdr_info* info, size_t sz, void* data) {
+    (void)sz;
+    struct kbox_elf_ctx* ctx = (struct kbox_elf_ctx*)data;
+    if ((uintptr_t)info->dlpi_addr != g_selfBase) return 0;
+    ctx->found = 1;
+    uint32_t h = ctx->salt ^ 0x811c9dc5u;
+    for (int i = 0; i < (int)info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if ((ph->p_flags & PF_W) != 0 || !(ph->p_flags & PF_X)) continue;
+        if (ph->p_filesz == 0) continue;
+        const uint8_t* p = (const uint8_t*)(info->dlpi_addr + ph->p_vaddr);
+        h ^= (uint32_t)ph->p_vaddr;
+        h ^= ph->p_flags;
+        h *= 0x01000193u;
+        for (uint32_t j = 0; j < ph->p_filesz; j++) { h ^= p[j]; h *= 0x01000193u; }
+    }
+    ctx->hash = h;
     return 1;
+}
+static int kbox_hashImage(uintptr_t base, uint32_t salt, uint32_t* out) {
+    g_selfBase = base;
+    struct kbox_elf_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.salt = salt;
+    dl_iterate_phdr(kbox_phdr_cb, &ctx);
+    if (!ctx.found) return -1;
+    *out = ctx.hash;
+    return 0;
+}
+#else
+static int kbox_hashImage(uintptr_t base, uint32_t salt, uint32_t* out) {
+    (void)base; (void)salt; (void)out;
+    return -1;
+}
+#endif
+#endif /* _WIN32 */
+
+static int kbox_selfCheckInit(void) {
+    if (g_imageHash != 0) return 0;
+    uintptr_t base = kbox_selfBase();
+    if (base == 0) return -1;
+    uint32_t h;
+    if (kbox_hashImage(base, KBOX_TEXT_SALT, &h) != 0) return -1;
+    g_imageHash = h;
+    return 0;
+}
+
+/* Returns 1 when the image was patched (caller terminates), 0 when intact,
+ * -1 when undeterminable (self-check no-ops). */
+static int kbox_self_check(void) {
+    uintptr_t base = kbox_selfBase();
+    if (base == 0) return -1;
+    uint32_t h;
+    if (kbox_hashImage(base, KBOX_TEXT_SALT, &h) != 0) return -1;
+    uint32_t expHash  = (uint32_t)KBOX_EXPECTED;
+    uint32_t expMagic = (uint32_t)(KBOX_EXPECTED >> 32);
+    if (expMagic == KBOX_EXPECTED_MAGIC) return (h != expHash) ? 1 : 0;
+    if (g_imageHash == 0 && kbox_selfCheckInit() != 0) return -1;
+    return (h != g_imageHash) ? 1 : 0;
+}
+
+/* Hard-die the process without running any agent/cleanup code. */
+static void kbox_selfDie(void) {
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), 0x51);
+#else
+    fflush(NULL);
+    _exit(0x51);
+#endif
 }
 
 /*
@@ -373,9 +574,19 @@ typedef struct kbox_ctx_s {
     jmethodID*    cp_mid;      int cp_mid_n;
     const char**  cp_str;      int cp_str_n;
     const jint*   cp_int;      int cp_int_n;
+    const jlong*  cp_long;     int cp_long_n;
+    const jdouble* cp_double;  int cp_double_n;
+    const jfloat* cp_float;    int cp_float_n;
     const int*    cp_mid_ac;   int cp_mid_ac_n;
     const char*   cp_mid_rt;   int cp_mid_rt_n;
     jclass*       cp_mid_cls;  int cp_mid_cls_n;
+
+    /* Exception table (from the serialised method's try/catch blocks). Each
+     * entry: {start_pc, end_pc, handler_pc, catch_type} where catch_type is a
+     * sequential cp_cls index or KBOX_CATCH_ALL (0xFFFFFFFFu) for a catch-all
+     * block. Filled by the v3 entry point. */
+    const kbox_ex_handler_t* ex_table;
+    int                      ex_n;
 
     /* Encryption state */
     uint32_t      key_seed;
@@ -410,6 +621,13 @@ static jclass   g_int_cls;  static jmethodID g_mid_intValueOf,  g_mid_intValue;
 static jclass   g_long_cls; static jmethodID g_mid_longValueOf, g_mid_longValue;
 static jclass   g_float_cls;static jmethodID g_mid_floatValueOf,g_mid_floatValue;
 static jclass   g_double_cls;static jmethodID g_mid_doubleValueOf,g_mid_doubleValue;
+/* int-promotable primitives (Z/C/S/B) are int-typed on the operand stack but
+ * must box to their OWN wrapper for invokedynamic args (StringConcatFactory
+ * sites like makeConcatWithConstants:(Z)Ljava/lang/String; crash otherwise). */
+static jclass   g_boolean_cls; static jmethodID g_mid_booleanValueOf, g_mid_booleanValue;
+static jclass   g_char_cls;    static jmethodID g_mid_charValueOf,    g_mid_charValue;
+static jclass   g_short_cls;   static jmethodID g_mid_shortValueOf,   g_mid_shortValue;
+static jclass   g_byte_cls;    static jmethodID g_mid_byteValueOf,    g_mid_byteValue;
 
 static void kbox_indy_init(JNIEnv* env) {
     if (g_indy_inited) return;
@@ -444,6 +662,26 @@ static void kbox_indy_init(JNIEnv* env) {
     g_double_cls = dc ? (jclass)(*env)->NewGlobalRef(env, dc) : NULL;
     if (dc) { g_mid_doubleValueOf = (*env)->GetStaticMethodID(env, dc, "valueOf", "(D)Ljava/lang/Double;"); }
     if (dc) { g_mid_doubleValue   = (*env)->GetMethodID(env, dc, "doubleValue", "()D"); }
+
+    jclass bc = (*env)->FindClass(env, "java/lang/Boolean");
+    g_boolean_cls = bc ? (jclass)(*env)->NewGlobalRef(env, bc) : NULL;
+    if (bc) { g_mid_booleanValueOf = (*env)->GetStaticMethodID(env, bc, "valueOf", "(Z)Ljava/lang/Boolean;"); }
+    if (bc) { g_mid_booleanValue   = (*env)->GetMethodID(env, bc, "booleanValue", "()Z"); }
+
+    jclass cc = (*env)->FindClass(env, "java/lang/Character");
+    g_char_cls = cc ? (jclass)(*env)->NewGlobalRef(env, cc) : NULL;
+    if (cc) { g_mid_charValueOf = (*env)->GetStaticMethodID(env, cc, "valueOf", "(C)Ljava/lang/Character;"); }
+    if (cc) { g_mid_charValue   = (*env)->GetMethodID(env, cc, "charValue", "()C"); }
+
+    jclass sc = (*env)->FindClass(env, "java/lang/Short");
+    g_short_cls = sc ? (jclass)(*env)->NewGlobalRef(env, sc) : NULL;
+    if (sc) { g_mid_shortValueOf = (*env)->GetStaticMethodID(env, sc, "valueOf", "(S)Ljava/lang/Short;"); }
+    if (sc) { g_mid_shortValue   = (*env)->GetMethodID(env, sc, "shortValue", "()S"); }
+
+    jclass by = (*env)->FindClass(env, "java/lang/Byte");
+    g_byte_cls = by ? (jclass)(*env)->NewGlobalRef(env, by) : NULL;
+    if (by) { g_mid_byteValueOf = (*env)->GetStaticMethodID(env, by, "valueOf", "(B)Ljava/lang/Byte;"); }
+    if (by) { g_mid_byteValue   = (*env)->GetMethodID(env, by, "byteValue", "()B"); }
 
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     g_indy_inited = 1;
@@ -500,19 +738,110 @@ HANDLER(SIPUSH) {
     ctx->stack[ctx->sp].i = (jint)v; ctx->sp++;
 }
 
+/* Tagged sequential-CP encoding for LDC/LDC2_W operands (16-bit raw):
+ *   bit15 0x8000 -> int constant    (cp_int)
+ *   bit14 0x4000 -> long constant   (cp_long)
+ *   bit13 0x2000 -> double constant (cp_double)
+ *   bit12 0x1000 -> float constant  (cp_float)
+ *   bit11 0x0800 -> class constant  (cp_cls)
+ *   else         -> string constant (cp_str)
+ * The tags occupy bits 11..15; the low 11 bits hold the sequential index. */
+#define K_LDC_TAG_INT    0x8000u
+#define K_LDC_TAG_LONG   0x4000u
+#define K_LDC_TAG_DOUBLE 0x2000u
+#define K_LDC_TAG_FLOAT  0x1000u
+#define K_LDC_TAG_CLASS  0x0800u
+#define K_LDC_TAG_MASK   0xF800u
+#define K_LDC_IDX_MASK   0x07FFu
+
 HANDLER(LDC) {
-    int16_t idx = FETCH_S16(ctx);
-    if (idx & 0x8000) {
-        int ii = idx & 0x7FFF;
+    uint16_t raw = (uint16_t)FETCH_S16(ctx);
+    int ii = (int)(raw & K_LDC_IDX_MASK);
+    switch (raw & K_LDC_TAG_MASK) {
+    case K_LDC_TAG_INT:
         ctx->stack[ctx->sp].i = (ii < ctx->cp_int_n) ? ctx->cp_int[ii] : 0;
-    } else {
+        break;
+    case K_LDC_TAG_LONG:
+        ctx->stack[ctx->sp].j = (ii < ctx->cp_long_n) ? ctx->cp_long[ii] : 0;
+        break;
+    case K_LDC_TAG_DOUBLE:
+        ctx->stack[ctx->sp].d = (ii < ctx->cp_double_n) ? ctx->cp_double[ii] : 0.0;
+        break;
+    case K_LDC_TAG_FLOAT:
+        ctx->stack[ctx->sp].f = (ii < ctx->cp_float_n) ? ctx->cp_float[ii] : 0.0f;
+        break;
+    case K_LDC_TAG_CLASS:
+        /* jclass IS the java.lang.Class object: push it as a reference. */
+        ctx->stack[ctx->sp].ptr = (ii < ctx->cp_cls_n) ? (jobject)ctx->cp_cls[ii] : NULL;
+        break;
+    default: {
         jstring s = NULL;
-        if (idx < ctx->cp_str_n && ctx->cp_str[idx]) {
-            s = (*ctx->env)->NewStringUTF(ctx->env, ctx->cp_str[idx]);
+        if (ii < ctx->cp_str_n && ctx->cp_str[ii]) {
+            s = (*ctx->env)->NewStringUTF(ctx->env, ctx->cp_str[ii]);
         }
         ctx->stack[ctx->sp].ptr = s;
+        break;
+    }
     }
     ctx->sp++;
+}
+HANDLER(LDC2_W) {
+    /* The JVM reserves LDC2_W for category-2 constants (long/double). In our
+     * tagged layout they reuse the same sequential CP spaces, so this handler
+     * only needs the LONG/DOUBLE tags. */
+    uint16_t raw = (uint16_t)FETCH_S16(ctx);
+    int ii = (int)(raw & K_LDC_IDX_MASK);
+    switch (raw & K_LDC_TAG_MASK) {
+    case K_LDC_TAG_LONG:
+        ctx->stack[ctx->sp].j = (ii < ctx->cp_long_n) ? ctx->cp_long[ii] : 0;
+        break;
+    case K_LDC_TAG_DOUBLE:
+        ctx->stack[ctx->sp].d = (ii < ctx->cp_double_n) ? ctx->cp_double[ii] : 0.0;
+        break;
+    default: /* malformed operand: push a safe zero rather than corrupt the frame */
+        ctx->stack[ctx->sp].j = 0;
+        break;
+    }
+    ctx->sp++;
+}
+HANDLER(MONITORENTER) {
+    ctx->sp--;
+    jobject o = (jobject)ctx->stack[ctx->sp].ptr;
+    if (o != NULL) (*ctx->env)->MonitorEnter(ctx->env, o);
+    /* A pending IllegalMonitorStateException / NPE is dispatched by the loop. */
+}
+HANDLER(MONITOREXIT) {
+    ctx->sp--;
+    jobject o = (jobject)ctx->stack[ctx->sp].ptr;
+    if (o != NULL) (*ctx->env)->MonitorExit(ctx->env, o);
+    if ((*ctx->env)->ExceptionCheck(ctx->env)) (*ctx->env)->ExceptionClear(ctx->env);
+}
+
+/* WIDE (0xC4): prefix that widens the index operand of the following
+ * instruction. Only the load/store/iinc forms are legal in v52+ class files
+ * (jsr/ret were removed from the language model in Java 7); the serializer
+ * emits this form when a local index exceeds 255. The modified opcode and its
+ * 2-byte index (plus 2-byte signed constant for IINC) follow in the stream.
+ * We parse them directly — the index is defensively clamped so a tampered or
+ * mis-generated operand can never overrun the fixed-size locals[] array. */
+HANDLER(WIDE) {
+    int op = FETCH(ctx);
+    int idx = (int)FETCH_S16(ctx);
+    if (idx < 0 || idx >= KBOX_MAX_SLOTS) idx = 0;
+    switch (op) {
+    case 0x15: ctx->stack[ctx->sp].i   = ctx->locals[idx].i;   ctx->sp++; break; /* ILOAD */
+    case 0x16: ctx->stack[ctx->sp].j   = ctx->locals[idx].j;   ctx->sp++; break; /* LLOAD */
+    case 0x17: ctx->stack[ctx->sp].f   = ctx->locals[idx].f;   ctx->sp++; break; /* FLOAD */
+    case 0x18: ctx->stack[ctx->sp].d   = ctx->locals[idx].d;   ctx->sp++; break; /* DLOAD */
+    case 0x19: ctx->stack[ctx->sp].ptr = ctx->locals[idx].ptr; ctx->sp++; break; /* ALOAD */
+    case 0x36: ctx->sp--; ctx->locals[idx].i   = ctx->stack[ctx->sp].i;   break; /* ISTORE */
+    case 0x37: ctx->sp--; ctx->locals[idx].j   = ctx->stack[ctx->sp].j;   break; /* LSTORE */
+    case 0x38: ctx->sp--; ctx->locals[idx].f   = ctx->stack[ctx->sp].f;   break; /* FSTORE */
+    case 0x39: ctx->sp--; ctx->locals[idx].d   = ctx->stack[ctx->sp].d;   break; /* DSTORE */
+    case 0x3A: ctx->sp--; ctx->locals[idx].ptr = ctx->stack[ctx->sp].ptr; break; /* ASTORE */
+    case 0x84: { int16_t incr = FETCH_S16(ctx); ctx->locals[idx].i += incr; break; } /* IINC */
+    default:   break; /* unknown wide-prefixed opcode: defensive no-op */
+    }
 }
 
 /* ---- Loads ---- */
@@ -593,22 +922,29 @@ HANDLER(FMUL) { ctx->sp--; ctx->stack[ctx->sp-1].f *= ctx->stack[ctx->sp].f; }
 HANDLER(FDIV) { ctx->sp--; ctx->stack[ctx->sp-1].f /= ctx->stack[ctx->sp].f; }
 HANDLER(FNEG) { ctx->stack[ctx->sp-1].f = -ctx->stack[ctx->sp-1].f; }
 HANDLER(FREM) {
+    /* JVM float remainder == IEEE fmod (sign follows the dividend). Truncating
+     * via (jint)(a/b) is wrong for large exponents and overflows; use fmodf. */
     float a=ctx->stack[ctx->sp-2].f, b=ctx->stack[ctx->sp-1].f;
-    ctx->stack[ctx->sp-2].f = a - ((jint)(a/b))*b; ctx->sp-=2;
+    ctx->stack[ctx->sp-2].f = fmodf(a, b); ctx->sp--;
 }
 HANDLER(FCMPL) {
+    /* Pop 2, push 1: result replaces value1 at stack[sp] after sp-=2, then sp++.
+     * NaN maps to -1 for FCMPL. (Writing to stack[sp-1] would clobber the slot
+     * below the result.) */
     float a=ctx->stack[ctx->sp-2].f, b=ctx->stack[ctx->sp-1].f; ctx->sp-=2;
-    if (a>b) ctx->stack[ctx->sp-1].i=1;
-    else if (a==b) ctx->stack[ctx->sp-1].i=0;
-    else ctx->stack[ctx->sp-1].i=-1;
-    if (a!=a||b!=b) ctx->stack[ctx->sp-1].i=-1; /* NaN -> -1 for FCMPL */
+    if (isnan(a) || isnan(b))      ctx->stack[ctx->sp].i = -1;
+    else if (a < b)                ctx->stack[ctx->sp].i = -1;
+    else if (a > b)                ctx->stack[ctx->sp].i = 1;
+    else                           ctx->stack[ctx->sp].i = 0;
+    ctx->sp++;
 }
 HANDLER(FCMPG) {
     float a=ctx->stack[ctx->sp-2].f, b=ctx->stack[ctx->sp-1].f; ctx->sp-=2;
-    if (a>b) ctx->stack[ctx->sp-1].i=1;
-    else if (a==b) ctx->stack[ctx->sp-1].i=0;
-    else ctx->stack[ctx->sp-1].i=-1;
-    if (a!=a||b!=b) ctx->stack[ctx->sp-1].i=1; /* NaN -> 1 for FCMPG */
+    if (isnan(a) || isnan(b))      ctx->stack[ctx->sp].i = 1;
+    else if (a < b)                ctx->stack[ctx->sp].i = -1;
+    else if (a > b)                ctx->stack[ctx->sp].i = 1;
+    else                           ctx->stack[ctx->sp].i = 0;
+    ctx->sp++;
 }
 
 /* ---- Double ---- */
@@ -618,8 +954,11 @@ HANDLER(DMUL) { ctx->sp--; ctx->stack[ctx->sp-1].d *= ctx->stack[ctx->sp].d; }
 HANDLER(DDIV) { ctx->sp--; ctx->stack[ctx->sp-1].d /= ctx->stack[ctx->sp].d; }
 HANDLER(DNEG) { ctx->stack[ctx->sp-1].d = -ctx->stack[ctx->sp-1].d; }
 HANDLER(DREM) {
+    /* JVM double remainder == IEEE fmod (sign follows the dividend). The naive
+     * truncation form a - (jlong)(a/b)*b overflows and is wrong for large
+     * exponents (same defect FREM had); use fmod. */
     double a=ctx->stack[ctx->sp-2].d, b=ctx->stack[ctx->sp-1].d;
-    ctx->stack[ctx->sp-2].d = a - ((jlong)(a/b))*b; ctx->sp--;
+    ctx->stack[ctx->sp-2].d = fmod(a, b); ctx->sp--;
 }
 HANDLER(DCMPL) {
     double a=ctx->stack[ctx->sp-2].d, b=ctx->stack[ctx->sp-1].d; ctx->sp-=2;
@@ -896,11 +1235,6 @@ HANDLER(MULTIANEWARRAY) {
     ctx->sp -= dims;
     const char* desc = (idx >= 0 && idx < ctx->cp_cls_names_n && ctx->cp_cls_names[idx])
                        ? ctx->cp_cls_names[idx] : NULL;
-    if (getenv("KBOX_JNIC_DBG")) {
-        fprintf(stderr, "[JNIC-MANARRAY] idx=%d dims=%d desc='%s' names_n=%d\n",
-                (int)idx, dims, desc ? desc : "(null)", ctx->cp_cls_names_n);
-        fflush(stderr);
-    }
     jobject arr = (desc && desc[0]=='[') ? kbox_alloc_multi(ctx->env, desc, counts, 0, dims) : NULL;
     ctx->stack[ctx->sp].ptr = arr; ctx->sp++;
 }
@@ -958,6 +1292,10 @@ HANDLER(INVOKEDYNAMIC) {
             case 'J': if (g_long_cls && g_mid_longValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_long_cls, g_mid_longValueOf, v.j); break;
             case 'F': if (g_float_cls && g_mid_floatValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_float_cls, g_mid_floatValueOf, v.f); break;
             case 'D': if (g_double_cls && g_mid_doubleValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_double_cls, g_mid_doubleValueOf, v.d); break;
+            case 'Z': if (g_boolean_cls && g_mid_booleanValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_boolean_cls, g_mid_booleanValueOf, (jboolean)(v.i != 0)); break;
+            case 'C': if (g_char_cls && g_mid_charValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_char_cls, g_mid_charValueOf, (jchar)v.i); break;
+            case 'S': if (g_short_cls && g_mid_shortValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_short_cls, g_mid_shortValueOf, (jshort)v.i); break;
+            case 'B': if (g_byte_cls && g_mid_byteValueOf) b = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_byte_cls, g_mid_byteValueOf, (jbyte)v.i); break;
             default:  b = (jobject)v.ptr; break;
             }
             (*ctx->env)->SetObjectArrayElement(ctx->env, boxed, j, b);
@@ -965,26 +1303,6 @@ HANDLER(INVOKEDYNAMIC) {
     }
     ctx->sp = base;
     if ((*ctx->env)->ExceptionCheck(ctx->env)) { (*ctx->env)->ExceptionClear(ctx->env); }
-
-    if (getenv("KBOX_JNIC_DBG")) {
-        fprintf(stderr, "[JNIC-INDY] site=%d argc='%s' n=%d sp=%d base=%d",
-                (int)idx, argc ? argc : "(null)", n, ctx->sp, base);
-        fprintf(stderr, " [l0=%p l1=%p l2=%p i2=%d]",
-                (void*)(ctx->locals[0].ptr), (void*)(ctx->locals[1].ptr),
-                (void*)(ctx->locals[2].ptr), (int)ctx->locals[2].i);
-        if (boxed) {
-            for (int q = 0; q < n && q < 8; q++) {
-                jobject e = (*ctx->env)->GetObjectArrayElement(ctx->env, boxed, q);
-                fprintf(stderr, " b%d=%p", q, (void*)e);
-                if ((*ctx->env)->ExceptionCheck(ctx->env)) (*ctx->env)->ExceptionClear(ctx->env);
-            }
-        }
-        fprintf(stderr, " raw[");
-        for (int q = 0; q < n && q < 8; q++) {
-            fprintf(stderr, "%d:%p/%d ", q, (void*)ctx->stack[base + q].ptr, (int)ctx->stack[base + q].i);
-        }
-        fprintf(stderr, "]\n"); fflush(stderr);
-    }
 
     jstring jm = (*ctx->env)->NewStringUTF(ctx->env, meta);
     jobject res = (*ctx->env)->CallStaticObjectMethod(ctx->env, g_indy_cls, g_indy_invoke, jm, boxed);
@@ -997,6 +1315,10 @@ HANDLER(INVOKEDYNAMIC) {
     case 'J': if (res && g_mid_longValue) ctx->stack[ctx->sp].j = (*ctx->env)->CallLongMethod(ctx->env, res, g_mid_longValue); else ctx->stack[ctx->sp].j = 0; break;
     case 'F': if (res && g_mid_floatValue) ctx->stack[ctx->sp].f = (*ctx->env)->CallFloatMethod(ctx->env, res, g_mid_floatValue); else ctx->stack[ctx->sp].f = 0; break;
     case 'D': if (res && g_mid_doubleValue) ctx->stack[ctx->sp].d = (*ctx->env)->CallDoubleMethod(ctx->env, res, g_mid_doubleValue); else ctx->stack[ctx->sp].d = 0; break;
+    case 'Z': if (res && g_mid_booleanValue) ctx->stack[ctx->sp].i = (*ctx->env)->CallBooleanMethod(ctx->env, res, g_mid_booleanValue); else ctx->stack[ctx->sp].i = 0; break;
+    case 'C': if (res && g_mid_charValue) ctx->stack[ctx->sp].i = (*ctx->env)->CallCharMethod(ctx->env, res, g_mid_charValue); else ctx->stack[ctx->sp].i = 0; break;
+    case 'S': if (res && g_mid_shortValue) ctx->stack[ctx->sp].i = (*ctx->env)->CallShortMethod(ctx->env, res, g_mid_shortValue); else ctx->stack[ctx->sp].i = 0; break;
+    case 'B': if (res && g_mid_byteValue) ctx->stack[ctx->sp].i = (*ctx->env)->CallByteMethod(ctx->env, res, g_mid_byteValue); else ctx->stack[ctx->sp].i = 0; break;
     case 'V': break; /* void call site: no value pushed */
     default:  ctx->stack[ctx->sp].ptr = res; break;
     }
@@ -1018,19 +1340,59 @@ HANDLER(BASTORE){jbyte v=(jbyte)ctx->stack[--ctx->sp].i;int ix=ctx->stack[--ctx-
 HANDLER(CASTORE){jchar v=(jchar)ctx->stack[--ctx->sp].i;int ix=ctx->stack[--ctx->sp].i;jobject a=(jobject)ctx->stack[--ctx->sp].ptr;(*ctx->env)->SetCharArrayRegion(ctx->env,a,ix,1,&v);}
 HANDLER(SASTORE){jshort v=(jshort)ctx->stack[--ctx->sp].i;int ix=ctx->stack[--ctx->sp].i;jobject a=(jobject)ctx->stack[--ctx->sp].ptr;(*ctx->env)->SetShortArrayRegion(ctx->env,a,ix,1,&v);}
 
-HANDLER(ATHROW)  { ctx->sp--; jobject ex=(jobject)ctx->stack[ctx->sp].ptr; (*ctx->env)->Throw(ctx->env,(jthrowable)ex); ctx->retval.i=0; ctx->returned=1; }
-HANDLER(CHECKCAST){ FETCH_S16(ctx); /* trust bytecode */ }
+HANDLER(ATHROW)  { ctx->sp--; jobject ex=(jobject)ctx->stack[ctx->sp].ptr; (*ctx->env)->Throw(ctx->env,(jthrowable)ex); ctx->retval.i=0; /* do NOT set returned: the loop's exception dispatch may still catch this locally */ }
+HANDLER(CHECKCAST) {
+    /* JVMS 6.5 checkcast: pop the reference, then push it back unchanged
+     * (the JVM keeps the objectref on the stack in both the success and the
+     * failure case — an exception merely unwinds it via the dispatch loop).
+     * Null always passes; a non-assignable reference throws a descriptive
+     * ClassCastException. */
+    int16_t idx = FETCH_S16(ctx);
+    ctx->sp--;
+    jobject obj = (jobject)ctx->stack[ctx->sp].ptr;
+    jclass cls = (idx >= 0 && idx < ctx->cp_cls_n) ? ctx->cp_cls[idx] : NULL;
+    if (obj != NULL && cls != NULL && !(*ctx->env)->IsInstanceOf(ctx->env, obj, cls)) {
+        jclass cce = (*ctx->env)->FindClass(ctx->env, "java/lang/ClassCastException");
+        if (cce != NULL) {
+            jclass clsCls = (*ctx->env)->FindClass(ctx->env, "java/lang/Class");
+            jmethodID getName = (clsCls != NULL)
+                ? (*ctx->env)->GetMethodID(ctx->env, clsCls, "getName", "()Ljava/lang/String;")
+                : NULL;
+            jstring objName = NULL, clsName = NULL;
+            if (getName != NULL) {
+                jclass oc = (*ctx->env)->GetObjectClass(ctx->env, obj);
+                objName = (jstring)(*ctx->env)->CallObjectMethod(ctx->env, oc, getName);
+                clsName = (jstring)(*ctx->env)->CallObjectMethod(ctx->env, cls, getName);
+                (*ctx->env)->DeleteLocalRef(ctx->env, oc);
+            }
+            const char* oc = objName ? (*ctx->env)->GetStringUTFChars(ctx->env, objName, NULL) : "?";
+            const char* cc = clsName ? (*ctx->env)->GetStringUTFChars(ctx->env, clsName, NULL) : "?";
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s cannot be cast to %s", oc ? oc : "?", cc ? cc : "?");
+            if (objName) (*ctx->env)->ReleaseStringUTFChars(ctx->env, objName, oc);
+            if (clsName) (*ctx->env)->ReleaseStringUTFChars(ctx->env, clsName, cc);
+            (*ctx->env)->DeleteLocalRef(ctx->env, objName);
+            (*ctx->env)->DeleteLocalRef(ctx->env, clsName);
+            jstring msg = (*ctx->env)->NewStringUTF(ctx->env, buf);
+            jmethodID ctor = (*ctx->env)->GetMethodID(ctx->env, cce, "<init>", "(Ljava/lang/String;)V");
+            jthrowable ex = (ctor != NULL)
+                ? (jthrowable)(*ctx->env)->NewObject(ctx->env, cce, ctor, msg) : NULL;
+            if (ex != NULL) (*ctx->env)->Throw(ctx->env, ex);
+            (*ctx->env)->DeleteLocalRef(ctx->env, msg);
+            (*ctx->env)->DeleteLocalRef(ctx->env, ex);
+            (*ctx->env)->DeleteLocalRef(ctx->env, clsCls);
+        }
+        (*ctx->env)->DeleteLocalRef(ctx->env, cce);
+    }
+    ctx->stack[ctx->sp].ptr = obj;
+    ctx->sp++;
+}
 HANDLER(INSTANCEOF) {
     int16_t idx = FETCH_S16(ctx);
     jclass cls = (idx < ctx->cp_cls_n) ? ctx->cp_cls[idx] : NULL;
     ctx->sp--;
     jobject obj = (jobject)ctx->stack[ctx->sp].ptr;
     jboolean isInst = (*ctx->env)->IsInstanceOf(ctx->env, obj, cls);
-    if (getenv("KBOX_JNIC_DBG")) {
-        const char* cn = cls ? getClassName(ctx->env, cls) : "(null)";
-        const char* on = obj ? getClassName(ctx->env, (*ctx->env)->GetObjectClass(ctx->env, obj)) : "(null)";
-        fprintf(stderr, "[JNIC] INSTANCEOF obj=%s cls=%s -> %d\n", on, cn, (int)isInst);
-    }
     ctx->stack[ctx->sp].i = isInst ? 1 : 0;
     ctx->sp++;
 }
@@ -1095,12 +1457,41 @@ static void fn_IFNONNULL2(kbox_ctx_t* ctx) {
     if (r != NULL) ctx->pc += (int16_t)(off - 3);
 }
 
-/* ===== DUP2_X1/DUP2_X2 stubs ===== */
+/* ===== DUP_X2 / DUP2_X1 / DUP2_X2 ===== */
 /* FALOAD/FASTORE: see fn_FALOAD2/fn_FASTORE2 below */
 /* DALOAD/DASTORE: see fn_DALOAD2/fn_DASTORE2 below */
-/* DUP2_X1/DUP2_X2 stubs */
-HANDLER(DUP2_X1) { /* placeholder: 4-slot stack operation */ }
-HANDLER(DUP2_X2) { /* placeholder: 4-slot stack operation */ }
+
+/* DUP_X2 (JVMS 6.5): ..., v3, v2, v1 -> ..., v1, v3, v2, v1
+ * (single-slot model: every value, including long/double, is one slot). */
+HANDLER(DUP_X2) {
+    kbox_slot_t v1 = ctx->stack[ctx->sp-1], v2 = ctx->stack[ctx->sp-2], v3 = ctx->stack[ctx->sp-3];
+    ctx->stack[ctx->sp-3] = v1;
+    ctx->stack[ctx->sp-2] = v3;
+    ctx->stack[ctx->sp-1] = v2;
+    ctx->stack[ctx->sp]   = v1;
+    ctx->sp++;
+}
+/* DUP2_X1 (JVMS 6.5): ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1 */
+HANDLER(DUP2_X1) {
+    kbox_slot_t v1 = ctx->stack[ctx->sp-1], v2 = ctx->stack[ctx->sp-2], v3 = ctx->stack[ctx->sp-3];
+    ctx->stack[ctx->sp-3] = v2;
+    ctx->stack[ctx->sp-2] = v1;
+    ctx->stack[ctx->sp-1] = v3;
+    ctx->stack[ctx->sp]   = v2;
+    ctx->stack[ctx->sp+1] = v1;
+    ctx->sp += 2;
+}
+/* DUP2_X2 (JVMS 6.5): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1 */
+HANDLER(DUP2_X2) {
+    kbox_slot_t v1 = ctx->stack[ctx->sp-1], v2 = ctx->stack[ctx->sp-2], v3 = ctx->stack[ctx->sp-3], v4 = ctx->stack[ctx->sp-4];
+    ctx->stack[ctx->sp-4] = v2;
+    ctx->stack[ctx->sp-3] = v1;
+    ctx->stack[ctx->sp-2] = v4;
+    ctx->stack[ctx->sp-1] = v3;
+    ctx->stack[ctx->sp]   = v2;
+    ctx->stack[ctx->sp+1] = v1;
+    ctx->sp += 2;
+}
 HANDLER(LALOAD) {
     int ix=ctx->stack[--ctx->sp].i;jobject a=(jobject)ctx->stack[--ctx->sp].ptr;
     jlong b;(*ctx->env)->GetLongArrayRegion(ctx->env,a,ix,1,&b);
@@ -1174,6 +1565,7 @@ static void kbox_init_table(void) {
     g_insn_table[K_BIPUSH]        = (kbox_handler_t)fn_BIPUSH;
     g_insn_table[K_SIPUSH]        = (kbox_handler_t)fn_SIPUSH;
     g_insn_table[K_LDC]           = (kbox_handler_t)fn_LDC;
+    g_insn_table[K_LDC2_W]        = (kbox_handler_t)fn_LDC2_W;
     g_insn_table[K_ILOAD]         = (kbox_handler_t)fn_ILOAD;
     g_insn_table[K_LLOAD]         = (kbox_handler_t)fn_LLOAD;
     g_insn_table[K_FLOAD]         = (kbox_handler_t)fn_FLOAD;
@@ -1244,7 +1636,7 @@ static void kbox_init_table(void) {
     g_insn_table[K_POP2]          = (kbox_handler_t)fn_POP2;
     g_insn_table[K_DUP]           = (kbox_handler_t)fn_DUP;
     g_insn_table[K_DUP_X1]        = (kbox_handler_t)fn_DUP_X1;
-    g_insn_table[K_DUP_X2]        = (kbox_handler_t)fn_DUP_X1;
+    g_insn_table[K_DUP_X2]        = (kbox_handler_t)fn_DUP_X2;
     g_insn_table[K_DUP2]          = (kbox_handler_t)fn_DUP2;
     g_insn_table[K_DUP2_X1]       = (kbox_handler_t)fn_DUP2_X1;
     g_insn_table[K_DUP2_X2]       = (kbox_handler_t)fn_DUP2_X2;
@@ -1342,6 +1734,9 @@ static void kbox_init_table(void) {
     g_insn_table[K_ATHROW]        = (kbox_handler_t)fn_ATHROW;
     g_insn_table[K_CHECKCAST]     = (kbox_handler_t)fn_CHECKCAST;
     g_insn_table[K_INSTANCEOF]    = (kbox_handler_t)fn_INSTANCEOF;
+    g_insn_table[K_MONITORENTER]  = (kbox_handler_t)fn_MONITORENTER;
+    g_insn_table[K_MONITOREXIT]   = (kbox_handler_t)fn_MONITOREXIT;
+    g_insn_table[K_WIDE]          = (kbox_handler_t)fn_WIDE;
     g_insn_table[K_IFNULL]        = (kbox_handler_t)fn_IFNULL2;
     g_insn_table[K_IFNONNULL]     = (kbox_handler_t)fn_IFNONNULL2;
     g_insn_table[K_TABLESWITCH]   = (kbox_handler_t)fn_TABLESWITCH;
@@ -1353,6 +1748,44 @@ static void kbox_init_table(void) {
 }
 
 /* ===== Main interpreter loop (function-pointer dispatch) ===== */
+
+/*
+ * Consult the method's exception table after a handler surfaced a JNI
+ * exception. If the throwing pc is covered by a matching catch clause, empty
+ * the operand stack, push the (unwrapped) exception, jump to the handler pc
+ * and resume dispatch. Returns 1 when handled; 0 when the caller must
+ * propagate the pending exception. Mirrors JVM exception dispatch (JVMS 6.5
+ * athrow): at the catch-clause entry the operand stack contains exactly one
+ * element — the thrown exception — and nothing else (see the stack-map frame
+ * required for every handler, which has a single stack entry).
+ */
+static int kbox_try_dispatch(kbox_ctx_t* ctx, uint32_t insnPc) {
+    JNIEnv* env = ctx->env;
+    if (ctx->ex_n <= 0 || ctx->ex_table == NULL) return 0;
+    jthrowable exc = (*env)->ExceptionOccurred(env);
+    if (exc == NULL) return 0;
+    (*env)->ExceptionClear(env);
+    jclass excCls = (*env)->GetObjectClass(env, exc);
+    const kbox_ex_handler_t* tab = ctx->ex_table;
+    for (int i = 0; i < ctx->ex_n; i++) {
+        if (insnPc < tab[i].start_pc || insnPc >= tab[i].end_pc) continue;
+        if (tab[i].catch_type != KBOX_CATCH_ALL) {
+            if (tab[i].catch_type >= (uint32_t)ctx->cp_cls_n) continue;
+            jclass cc = ctx->cp_cls[tab[i].catch_type];
+            if (cc == NULL || !(*env)->IsAssignableFrom(env, excCls, cc)) continue;
+        }
+        /* match: empty the operand stack, push the exception, jump to handler */
+        ctx->sp = 0;
+        ctx->stack[ctx->sp++].ptr = exc;   /* raw local ref, valid for this native call */
+        ctx->pc = tab[i].handler_pc;
+        (*env)->DeleteLocalRef(env, excCls);
+        return 1;
+    }
+    (*env)->DeleteLocalRef(env, excCls);
+    (*env)->Throw(env, exc);   /* no local handler: re-raise for the caller */
+    (*env)->DeleteLocalRef(env, exc);
+    return 0;
+}
 
 /*
  * Execute the bytecode program using indirect calls through g_insn_table.
@@ -1373,6 +1806,7 @@ static void kbox_interp_run(kbox_ctx_t* ctx) {
             }
         }
 
+        uint32_t insnPc = ctx->pc;   /* pc of the opcode about to execute */
         uint8_t op = FETCH(ctx);
         kbox_handler_t handler = g_insn_table[op];
 
@@ -1394,6 +1828,16 @@ static void kbox_interp_run(kbox_ctx_t* ctx) {
 
         /* Indirect call — the compiler cannot devirtualize this */
         ((ctx_handler_t)handler)(ctx);
+
+        /* Exception dispatch: a handler surfaced a JNI exception (an invoked
+         * callee threw, GETFIELD on null, ATHROW, a coercing helper, ...).
+         * Consult this method's exception table; if covered, resume at the
+         * handler with the exception on the stack. Otherwise leave the
+         * exception pending and unwind — the JVM propagates it to the caller. */
+        if ((*ctx->env)->ExceptionCheck(ctx->env)) {
+            if (kbox_try_dispatch(ctx, insnPc)) continue;
+            return;   /* unhandled: pending JNI exception is rethrown by the JVM */
+        }
     }
 }
 
@@ -1532,11 +1976,19 @@ kbox_value_t kbox_jvm_interp_v3(JNIEnv* env, jobject receiver,
     ctx->cp_indy_argc_n=(int)(intptr_t)args[25];
     ctx->cp_indy_ret  = (const char*)args[26];
     ctx->cp_indy_ret_n= (int)(intptr_t)args[27];
+    ctx->cp_long      = (const jlong*)args[28];
+    ctx->cp_long_n    = (int)(intptr_t)args[29];
+    ctx->cp_double    = (const jdouble*)args[30];
+    ctx->cp_double_n  = (int)(intptr_t)args[31];
+    ctx->cp_float     = (const jfloat*)args[32];
+    ctx->cp_float_n   = (int)(intptr_t)args[33];
+    ctx->ex_table     = (const kbox_ex_handler_t*)args[34];
+    ctx->ex_n         = (int)(intptr_t)args[35];
     KBOX_DBG("[KBOX-INTERP] v3 after cp_unpack\n"); fflush(stderr);
 
-    /* args[28] = key_seed (uint32_t*), args[29..] = Java args */
-    uint32_t* key_seed_ptr = (uint32_t*)args[28];
-    void** real_args = &args[29];
+    /* args[36] = key_seed (uint32_t*), args[37..] = Java args */
+    uint32_t* key_seed_ptr = (uint32_t*)args[36];
+    void** real_args = &args[37];
 
     ctx->env         = env;
     ctx->code        = bytecode;
@@ -1561,16 +2013,6 @@ kbox_value_t kbox_jvm_interp_v3(JNIEnv* env, jobject receiver,
     KBOX_DBG("[KBOX-INTERP] v3 locals done, slot=%d\n", slot); fflush(stderr);
 
     KBOX_DBG("[KBOX-INTERP] v3 before interp_run, env=%p\n", (void*)ctx->env); fflush(stderr);
-    if (getenv("KBOX_JNIC_DBG")) {
-        fprintf(stderr, "[KBOX-INTERP] decoded[");
-        int lim = bc_len < 16 ? bc_len : 16;
-        for (int i = 0; i < lim; i++) {
-            unsigned char p = bytecode[i];
-            if (ctx->key_seed) p = (unsigned char)(p ^ kbox_key_byte(ctx->key_seed, i));
-            fprintf(stderr, "%02x ", p);
-        }
-        fprintf(stderr, "]\n"); fflush(stderr);
-    }
     kbox_interp_run(ctx);
     KBOX_DBG("[KBOX-INTERP] v3 after interp_run\n"); fflush(stderr);
     kbox_value_t ret = ctx->retval;

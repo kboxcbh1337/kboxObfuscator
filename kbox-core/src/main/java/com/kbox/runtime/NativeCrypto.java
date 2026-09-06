@@ -29,8 +29,6 @@ public final class NativeCrypto {
     /** Blob resource written by the packager (NativePacker format). */
     private static final String BLOB_PATH = "META-INF/kbox/native-crypto.bin";
 
-    private static final byte[] MAGIC = {'K', 'B', 'N', 'L'};
-
     private NativeCrypto() {}
 
     private static volatile boolean available = false;
@@ -47,39 +45,63 @@ public final class NativeCrypto {
         tried = true;
         try {
             byte[] blob = loadResource(BLOB_PATH);
-            if (blob == null) { if (dbg()) System.err.println("[NATIVECRYPTO] blob not found"); return; }
+            if (blob == null) return;
             byte[] lib = unpack(blob);
-            if (lib == null || lib.length == 0) { if (dbg()) System.err.println("[NATIVECRYPTO] unpack failed blob=" + (blob==null?-1:blob.length)); return; }
+            if (lib == null || lib.length == 0) return;
             java.nio.file.Path tmp = writeToTemp(lib);
-            if (tmp == null) { if (dbg()) System.err.println("[NATIVECRYPTO] temp write failed"); return; }
-            if (dbg()) System.err.println("[NATIVECRYPTO] loading " + tmp + " (" + lib.length + "B)");
-            System.load(tmp.toAbsolutePath().toString());
-            // If binding failed (wrong arch / partial load), the JVM would have
-            // thrown UnsatisfiedLinkError. Probe availability with a trivial call.
-            if (probe()) available = true;
+            if (tmp == null) return;
+            try {
+                System.load(tmp.toAbsolutePath().toString());
+                // Probe availability with a trivial call.
+                if (probe()) available = true;
+            } finally {
+                purgeTemp(tmp);
+            }
         } catch (Throwable t) {
-            if (System.getProperty("kbox.native.dbg") != null)
-                System.err.println("[NATIVECRYPTO] load failed: " + t);
             available = false;
         }
     }
 
-    private static boolean dbg() {
-        return System.getProperty("kbox.native.dbg") != null;
+    /** Removes the mapped PE from disk. Windows refuses to delete a file while
+     *  its image section is mapped (delete returns ACCESS_DENIED), so on that
+     *  path the module is renamed to a random hidden name — the one operation
+     *  the OS permits on a mapped image — via the resident decoder's
+     *  {@link BfSecureLoader#purgeSelf}, and the renamed path is scheduled for
+     *  deletion at exit. Falls back to a Java-side rename when the resident
+     *  decoder is unavailable (non-BF pipeline). */
+    private static void purgeTemp(java.nio.file.Path tmp) {
+        nukeTemp(tmp);   // zero-fill the plaintext PE before removal (disk-capture closure)
+        try {
+            if (java.nio.file.Files.deleteIfExists(tmp)) return;
+        } catch (Throwable ignored) {
+            // mapped image: plain delete is refused on Windows
+        }
+        try {
+            String renamed = BfSecureLoader.purgeSelf(tmp.toAbsolutePath().toString());
+            if (renamed == null) return; // fully removed
+            final java.nio.file.Path rp = java.nio.file.Paths.get(renamed);
+            rp.toFile().deleteOnExit();
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { java.nio.file.Files.deleteIfExists(rp); } catch (Throwable ignored2) {}
+            }));
+        } catch (Throwable t) {
+            // Resident decoder unavailable (non-BF): rename via Java.
+            try {
+                java.nio.file.Path rp = java.nio.file.Files.move(tmp,
+                        tmp.resolveSibling(".kboxnc~"
+                                + Integer.toHexString(System.identityHashCode(tmp)) + ".tmp"),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                rp.toFile().deleteOnExit();
+            } catch (Throwable ignored2) {}
+        }
     }
 
     /** Trivial self-check: HKDF of a known vector must be non-trivial. */
     private static boolean probe() {
         try {
             byte[] r = hkdfSha2560(new byte[]{1, 2, 3}, new byte[1], new byte[0], 16);
-            if (System.getProperty("kbox.native.dbg") != null)
-                System.err.println("[NATIVECRYPTO] probe returned len=" + (r == null ? -1 : r.length));
             return r != null && r.length == 16;
         } catch (Throwable t) {
-            if (System.getProperty("kbox.native.dbg") != null) {
-                System.err.println("[NATIVECRYPTO] probe native threw: " + t);
-                t.printStackTrace();
-            }
             return false;
         }
     }
@@ -137,20 +159,23 @@ public final class NativeCrypto {
     }
 
     private static byte[] unpack(byte[] blob) {
-        if (blob.length < 64 || blob[0] != MAGIC[0] || blob[1] != MAGIC[1]
-                || blob[2] != MAGIC[2] || blob[3] != MAGIC[3]) {
+        if (blob.length < 68 || !KbnlKey.isKbnl(blob, 0)) {
             return null;
         }
-        byte[] key = new byte[32];
+        // magic[4] | blobSalt[32] | nonce[12] | counter[8] | compLen[4] | rawLen[4] |
+        //   domainTag[4] | cipher
+        byte[] blobSalt = new byte[32];
         byte[] nonce = new byte[12];
-        System.arraycopy(blob, 4, key, 0, 32);
+        System.arraycopy(blob, 4, blobSalt, 0, 32);
         System.arraycopy(blob, 36, nonce, 0, 12);
         int compLen = readIntLE(blob, 56);
         int rawLen = readIntLE(blob, 60);
-        if (compLen < 0 || rawLen < 0 || compLen + 64 > blob.length) return null;
+        if (compLen < 0 || rawLen < 0 || compLen + 68 > blob.length) return null;
+        int domainTag = readIntLE(blob, 64);
         byte[] cipher = new byte[compLen];
-        System.arraycopy(blob, 64, cipher, 0, compLen);
+        System.arraycopy(blob, 68, cipher, 0, compLen);
         try {
+            byte[] key = KbnlKey.derive(domainTag, blobSalt);
             byte[] compressed = ChaCha20.process(key, nonce, 0L, cipher);
             java.util.zip.Inflater inf = new java.util.zip.Inflater(true);
             inf.setInput(compressed);
@@ -166,8 +191,11 @@ public final class NativeCrypto {
                 off += r;
             }
             inf.end();
-            return off == out.length ? out : java.util.Arrays.copyOf(out, off);
+            byte[] lib = off == out.length ? out : java.util.Arrays.copyOf(out, off);
+            KbnlKey.noteBlobOpened(domainTag);   // A3: bind this blob to the session
+            return lib;
         } catch (Throwable t) {
+            KbnlKey.noteBadDecrypt();   // A2: enumeration/wrong-tag burst fuse
             return null;
         }
     }
@@ -184,6 +212,28 @@ public final class NativeCrypto {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /** Best-effort zero-fill of the on-disk plaintext PE before its directory
+     *  entry is removed — blocks uncrypted forensic recovery of the laid-on
+     *  shared library. Silently no-ops if the image is still mapped (Windows
+     *  sharing violation); the caller's delete/rename still removes the entry. */
+    private static void nukeTemp(java.nio.file.Path tmp) {
+        try {
+            long size = java.nio.file.Files.size(tmp);
+            if (size <= 0) return;
+            byte[] zeros = new byte[(int) Math.min(size, 1 << 20)];
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(tmp.toFile(), "rw")) {
+                long done = 0;
+                while (done < size) {
+                    int n = (int) Math.min(zeros.length, size - done);
+                    raf.write(zeros, 0, n);
+                    done += n;
+                }
+                raf.setLength(0);
+                raf.getFD().sync();
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static int readIntLE(byte[] b, int off) {

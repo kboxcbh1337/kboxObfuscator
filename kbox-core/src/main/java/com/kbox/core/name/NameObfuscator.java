@@ -57,6 +57,9 @@ public final class NameObfuscator {
     }
 
     public Mapping compute() {
+        // Z9 incremental: pre-load class renames from a previous build's
+        // mapping file (if configured) so they're reused below.
+        MappingLoader.loadInto(mapping, cfg.getUseMapping());
         buildUnionFind();
         renameClasses();
         renameMethods();
@@ -83,6 +86,37 @@ public final class NameObfuscator {
      * Mixin classes, etc.).
      */
     private void renameClasses() {
+        if (!cfg.isRenameIdentifiers()) return;   // rename=false: 类/方法/字段均不重命名
+        // Deterministic package map when renamePackages is on: every class of
+        // an ORIGINAL package (including nested '$' classes, which share the
+        // enclosing class's package) must land in the SAME new package, and a
+        // package that contains a kept or library class keeps its original
+        // name. Otherwise package-private access breaks (e.g. a package-private
+        // enum used by its enclosing class ends up in a different package ->
+        // IllegalAccessError at runtime).
+        Map<String, String> newPkgs = null;
+        if (cfg.isRenamePackages()) {
+            newPkgs = new HashMap<>();
+            Map<String, Boolean> pkgSpecial = new HashMap<>();
+            for (String internal : graph.getClasses().keySet()) {
+                int slash = internal.lastIndexOf('/');
+                if (slash < 0) continue;
+                String pkg = internal.substring(0, slash);
+                boolean special = decision.keepClass(internal)
+                        || !cfg.shouldTransformClass(internal);
+                pkgSpecial.merge(pkg, special, Boolean::logicalOr);
+            }
+            for (String internal : graph.getClasses().keySet()) {
+                int slash = internal.lastIndexOf('/');
+                if (slash < 0) continue;
+                String pkg = internal.substring(0, slash);
+                if (Boolean.TRUE.equals(pkgSpecial.get(pkg))) {
+                    newPkgs.put(pkg, pkg);
+                } else {
+                    newPkgs.computeIfAbsent(pkg, k -> randomPackageName(k));
+                }
+            }
+        }
         for (String internal : graph.getClasses().keySet()) {
             if (decision.keepClass(internal)) continue;
             // Library classes are never renamed (single canonical decision via
@@ -90,12 +124,23 @@ public final class NameObfuscator {
             if (!cfg.shouldTransformClass(internal)) continue;
             int slash = internal.lastIndexOf('/');
             String newName;
-            if (cfg.isRenamePackages()) {
+            // Z9 incremental reuse: if the old mapping already renamed this
+            // class (loaded via MappingLoader.loadInto), reuse that exact name
+            // so the class keeps the same obfuscated identity across versions.
+            // Only honoured when the mapped name is not itself already taken by
+            // a different current class (safe collision guard).
+            String oldMapped = mapping.getClassMap().get(internal);
+            if (oldMapped != null && !oldMapped.equals(internal)
+                    && !graph.getClasses().containsKey(oldMapped)) {
+                newName = oldMapped;
+            } else if (cfg.isRenamePackages()) {
                 // Folder/package randomization: replace the whole package path
                 // with a freshly generated one of the same depth. This makes
                 // the decompiled directory structure meaningless while keeping
                 // the same nesting depth (preserves tooling assumptions).
-                newName = randomPackage(internal) + mapping.newName();
+                String pkg = slash >= 0 ? internal.substring(0, slash) : "";
+                String newPkg = pkg.isEmpty() ? "" : newPkgs.get(pkg);
+                newName = newPkg.isEmpty() ? mapping.newName() : newPkg + "/" + mapping.newName();
             } else {
                 String pkg = slash >= 0 ? internal.substring(0, slash + 1) : "";
                 newName = pkg + mapping.newName();
@@ -109,10 +154,7 @@ public final class NameObfuscator {
      * segment is a short random identifier. The first segment is short (1-2
      * chars) to keep the layout compact; deeper segments use longer names.
      */
-    private String randomPackage(String internal) {
-        int slash = internal.lastIndexOf('/');
-        if (slash < 0) return ""; // default package: no package to randomize
-        String pkg = internal.substring(0, slash); // without trailing '/'
+    private String randomPackageName(String pkg) {
         String[] segs = pkg.split("/");
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < segs.length; i++) {
@@ -122,7 +164,6 @@ public final class NameObfuscator {
             // class-name generator's pool.
             sb.append(mapping.newName());
         }
-        sb.append('/');
         return sb.toString();
     }
 
@@ -130,6 +171,7 @@ public final class NameObfuscator {
 
     @SuppressWarnings("unchecked")
     private void renameMethods() {
+        if (!cfg.isRenameIdentifiers()) return;   // rename=false: 跳过
         // 1. Index every declared method by (name#desc) -> list of owners.
         Map<String, List<String>> byNameDesc = new HashMap<>();
         for (ClassNode cn : graph.getClasses().values()) {
@@ -176,6 +218,7 @@ public final class NameObfuscator {
 
     @SuppressWarnings("unchecked")
     private void renameFields() {
+        if (!cfg.isRenameIdentifiers()) return;   // rename=false: 跳过
         // Fields don't have override semantics, but a field hidden by a same-named
         // field in a subclass is independent; rename each declaration independently.
         for (ClassNode cn : graph.getClasses().values()) {

@@ -24,20 +24,21 @@ import java.util.zip.Inflater;
  *       callers.</li>
  *   <li><b>ChaCha20 keystream encryption</b> with a fresh random 256-bit key and
  *       96-bit nonce. The native code is never stored in plaintext.</li>
- *   <li>A 60-byte header is prepended:
+ *   <li>A 68-byte header is prepended:
  *       <pre>
- *         magic     4B  "KBNL" (KBox Native Library)
- *         key      32B  ChaCha20 key
- *         nonce    12B  ChaCha20 nonce
- *         counter   8B  initial counter (always 0)
- *         compLen   4B  compressed length (post-encryption = ciphertext length)
- *         rawLen    4B  uncompressed length (for Inflater allocation)
+ *         magic      4B  "KBNL" (KBox Native Library)
+ *         blobSalt  32B  per-blob random salt (mixed into the derived key)
+ *         nonce     12B  ChaCha20 nonce
+ *         counter    8B  initial counter (always 0)
+ *         compLen    4B  compressed length (post-encryption = ciphertext length)
+ *         rawLen     4B  uncompressed length (for Inflater allocation)
+ *         domainTag  4B  per-build random domain tag (A1 de-staticization)
  *       </pre>
- *       The key/nonce are embedded in the blob itself — the security here is not
- *       key secrecy (the blob is self-contained) but the fact that the native
- *       code is not directly extractable by static analysis tools that don't run
- *       the KBox {@link com.kbox.runtime.NativeLoader}. An attacker must
- *       reverse-engineer the format and re-implement ChaCha20 + Inflater.</li>
+ *       The ChaCha20 key is never embedded in the blob — it is derived at run
+ *       time from the blobSalt + the per-build random domainTag + hardware factor
+ *       ({@link com.kbox.runtime.KbnlKey}). An attacker must reverse-engineer
+ *       the derivation and re-implement ChaCha20 + Inflater, and the domain is
+ *       not a static enumerable constant shared across builds.</li>
  * </ol>
  *
  * <p>The resulting blob is written to {@code META-INF/kbox/native.bin} inside
@@ -47,7 +48,6 @@ import java.util.zip.Inflater;
 public final class NativePacker {
 
     private static final String TAG = "jnic-pack";
-    private static final byte[] MAGIC = {'K', 'B', 'N', 'L'};
 
     private NativePacker() {}
 
@@ -61,36 +61,53 @@ public final class NativePacker {
         }
     }
 
-    /** Compresses + encrypts the native library at {@code libPath}. */
+    /** Compresses + encrypts the native library at {@code libPath}, deriving the
+     *  container key from a fresh per-build random domain tag (A1 de-staticization). */
     public static Packed pack(Path libPath) throws IOException {
-        byte[] raw = Files.readAllBytes(libPath);
-        return pack(raw);
+        return pack(Files.readAllBytes(libPath));
     }
 
     public static Packed pack(byte[] raw) {
         byte[] compressed = compress(raw);
         SecureRandom rng = new SecureRandom();
-        byte[] key = new byte[32];
+        byte[] blobSalt = new byte[32];
         byte[] nonce = new byte[12];
-        rng.nextBytes(key);
+        rng.nextBytes(blobSalt);
         rng.nextBytes(nonce);
+        // A1: the domain is no longer a static enumerable constant (0..3). Each
+        // blob gets its own CSPRNG-drawn random tag, embedded below and read back
+        // at run time, so build↔run agree and domain enumeration cannot transfer
+        // across builds. Different blobs get different random tags, preserving
+        // cross-blob dispersion.
+        int domainTag = com.kbox.runtime.KbnlKey.newDomainTag();
+        // Key is NOT stored in the blob; it is derived at run time from the
+        // random blobSalt + tag + hardware factor (KbnlKey.derive). A static scan
+        // of the jar cannot extract a clean key alongside the PE.
+        byte[] key = com.kbox.runtime.KbnlKey.derive(domainTag, blobSalt);
         byte[] cipher = com.kbox.runtime.ChaCha20.process(key, nonce, 0L, compressed);
-        // Header layout (64 bytes):
-        //   magic[4] | key[32] | nonce[12] | counter[8] | compLen[4] | rawLen[4] | ciphertext
-        byte[] blob = new byte[64 + cipher.length];
+        // Header layout (68 bytes):
+        //   magic[4] | blobSalt[32] | nonce[12] | counter[8] | compLen[4] |
+        //   rawLen[4] | domainTag[4] | ciphertext
+        byte[] blob = new byte[68 + cipher.length];
         int p = 0;
-        blob[p++] = MAGIC[0]; blob[p++] = MAGIC[1]; blob[p++] = MAGIC[2]; blob[p++] = MAGIC[3];
-        System.arraycopy(key, 0, blob, p, 32); p += 32;
+        // Masked magic (NOT the ASCII "KBNL") — see KbnlKey.isKbnl, so the header
+        // bytes can't be fingerprint-grepped; readers use the same masked bytes.
+        blob[p++] = com.kbox.runtime.KbnlKey.kbnlMagicByte(0);
+        blob[p++] = com.kbox.runtime.KbnlKey.kbnlMagicByte(1);
+        blob[p++] = com.kbox.runtime.KbnlKey.kbnlMagicByte(2);
+        blob[p++] = com.kbox.runtime.KbnlKey.kbnlMagicByte(3);
+        System.arraycopy(blobSalt, 0, blob, p, 32); p += 32;
         System.arraycopy(nonce, 0, blob, p, 12); p += 12;
         // counter (8 bytes, little-endian) = 0
         for (int i = 0; i < 8; i++) blob[p++] = 0;
         writeIntLE(blob, p, compressed.length); p += 4;
         writeIntLE(blob, p, raw.length); p += 4;
+        writeIntLE(blob, p, domainTag); p += 4;
         System.arraycopy(cipher, 0, blob, p, cipher.length);
         KBoxLog.info(TAG, "Packed native lib: raw=" + raw.length
                 + " compressed=" + compressed.length + " (ratio "
                 + String.format("%.0f%%", 100.0 * compressed.length / Math.max(1, raw.length))
-                + ") encrypted=" + blob.length);
+                + ") encrypted=" + blob.length + " domainTag=" + domainTag);
         return new Packed(blob, raw.length, compressed.length);
     }
 

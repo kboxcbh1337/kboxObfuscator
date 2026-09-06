@@ -21,7 +21,7 @@ public final class KBoxRuntime {
 
     /** Strength-1 (rolling-XOR) decryptor. Layout: 4-byte key + payload. */
     public static String d(byte[] b) {
-        if (AntiDebug.isTampered()) return corrupt(b);
+        if (TamperShield.isTampered()) return corrupt(b);
         int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                 | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
         byte[] data = new byte[b.length - 4];
@@ -42,7 +42,7 @@ public final class KBoxRuntime {
      * strings — there is no single static decryption pattern.
      */
     public static String e(byte[] b) {
-        if (AntiDebug.isTampered()) return corrupt(b);
+        if (TamperShield.isTampered()) return corrupt(b);
         int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                 | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
         byte[] data = new byte[b.length - 4];
@@ -59,7 +59,7 @@ public final class KBoxRuntime {
      * ({@code i % 5}). Different from {@link #d} and {@link #e}.
      */
     public static String f(byte[] b) {
-        if (AntiDebug.isTampered()) return corrupt(b);
+        if (TamperShield.isTampered()) return corrupt(b);
         int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                 | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
         byte[] data = new byte[b.length - 4];
@@ -76,7 +76,7 @@ public final class KBoxRuntime {
      * key. Defeats pattern-based XOR key recovery.
      */
     public static String g(byte[] b) {
-        if (AntiDebug.isTampered()) return corrupt(b);
+        if (TamperShield.isTampered()) return corrupt(b);
         int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                 | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
         byte[] data = new byte[b.length - 4];
@@ -93,7 +93,7 @@ public final class KBoxRuntime {
      * Uses two running key states mixed via XOR and rotate.
      */
     public static String h(byte[] b) {
-        if (AntiDebug.isTampered()) return corrupt(b);
+        if (TamperShield.isTampered()) return corrupt(b);
         int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                 | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
         byte[] data = new byte[b.length - 4];
@@ -109,7 +109,7 @@ public final class KBoxRuntime {
 
     /** Strength-2 (AES/CBC) decryptor. Layout: 4-byte key + 16-byte IV + ciphertext. */
     public static String a(byte[] b) {
-        if (AntiDebug.isTampered()) return corrypt(b);
+        if (TamperShield.isTampered()) return corrypt(b);
         try {
             int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
                     | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);

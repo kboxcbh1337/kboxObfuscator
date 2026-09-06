@@ -77,7 +77,7 @@ public final class VmpTranslator {
     /** Returns true if every opcode in {@code mn} is supported. */
     public static boolean isSupported(MethodNode mn) {
         try {
-            translate(mn);
+            translate(mn, 0);
             return true;
         } catch (UnsupportedOpcodeException e) {
             return false;
@@ -87,6 +87,18 @@ public final class VmpTranslator {
     }
 
     public static Result translate(MethodNode mn) {
+        return translate(mn, 0);
+    }
+
+    /**
+     * Translates {@code mn}; when {@code interleaveStrength > 0}, {@code NOP}
+     * micro-ops are injected after real instructions (VortexVM/L2 VM interleave).
+     * The two emission passes share the exact same per-instruction sequence counter,
+     * so the running {@code pc} that resolves label/branch/exception targets already
+     * accounts for the injected NOP filler — branch offsets stay correct by
+     * construction, with no post-pass fix-up required.
+     */
+    public static Result translate(MethodNode mn, int interleaveStrength) {
         ConstantPool cp = new ConstantPool();
         // 1. Pre-scan: assign offsets to labels so we can emit them as ints.
         Map<LabelNode, Integer> labelPc = new HashMap<>();
@@ -108,8 +120,12 @@ public final class VmpTranslator {
             labelIdx.put(e.getKey(), lidx++);
         }
 
-        // Pass 1: compute pc of each label.
+        // Pass 1: compute pc of each label. The shared `seq` counter (incremented once
+        // per *emitted* instruction, never at label/LineNumber/Frame nodes) reproduces the
+        // identical NOP filler footprint per instruction, so pass-1 label pcs line up with
+        // pass-2 emitted bytes.
         int pc = 0;
+        long seq = 0;
         for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
             if (n instanceof LabelNode) {
                 resolvedPc.put((LabelNode) n, pc);
@@ -122,9 +138,11 @@ public final class VmpTranslator {
             int len = emittedLength(n);
             if (len < 0) throw new UnsupportedOpcodeException(n.getOpcode());
             pc += len;
+            pc += interleaveStrength <= 0 ? 0 : fillerNops(seq++, interleaveStrength);
         }
 
-        // Pass 2: emit bytes.
+        // Pass 2: emit bytes (re-increment seq in lockstep with pass 1).
+        seq = 0;
         for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
             if (n instanceof LabelNode) continue;
             if (n instanceof org.objectweb.asm.tree.LineNumberNode
@@ -132,6 +150,8 @@ public final class VmpTranslator {
                 continue;
             }
             emit(out, n, cp, resolvedPc);
+            int filler = interleaveStrength <= 0 ? 0 : fillerNops(seq++, interleaveStrength);
+            while (filler-- > 0) out.write(VmpOp.NOP & 0xFF);
         }
         out.write(VmpOp.END & 0xFF);
 
@@ -263,6 +283,12 @@ public final class VmpTranslator {
                 case Opcodes.CASTORE: out.write(VmpOp.CASTORE & 0xFF); return;
                 case Opcodes.SALOAD: out.write(VmpOp.SALOAD & 0xFF); return;
                 case Opcodes.SASTORE: out.write(VmpOp.SASTORE & 0xFF); return;
+                case Opcodes.LALOAD: out.write(VmpOp.LALOAD & 0xFF); return;
+                case Opcodes.FALOAD: out.write(VmpOp.FALOAD & 0xFF); return;
+                case Opcodes.DALOAD: out.write(VmpOp.DALOAD & 0xFF); return;
+                case Opcodes.LASTORE: out.write(VmpOp.LASTORE & 0xFF); return;
+                case Opcodes.FASTORE: out.write(VmpOp.FASTORE & 0xFF); return;
+                case Opcodes.DASTORE: out.write(VmpOp.DASTORE & 0xFF); return;
 
                 case Opcodes.MONITORENTER: out.write(VmpOp.MONITORENTER & 0xFF); return;
                 case Opcodes.MONITOREXIT: out.write(VmpOp.MONITOREXIT & 0xFF); return;
@@ -407,6 +433,8 @@ public final class VmpTranslator {
                 case Opcodes.BALOAD: case Opcodes.BASTORE:
                 case Opcodes.CALOAD: case Opcodes.CASTORE:
                 case Opcodes.SALOAD: case Opcodes.SASTORE:
+                case Opcodes.LALOAD: case Opcodes.FALOAD: case Opcodes.DALOAD:
+                case Opcodes.LASTORE: case Opcodes.FASTORE: case Opcodes.DASTORE:
                 case Opcodes.MONITORENTER: case Opcodes.MONITOREXIT: case Opcodes.ATHROW:
                 case Opcodes.IRETURN: case Opcodes.LRETURN: case Opcodes.FRETURN:
                 case Opcodes.DRETURN: case Opcodes.ARETURN: case Opcodes.RETURN:
@@ -457,6 +485,21 @@ public final class VmpTranslator {
         if (n instanceof MethodInsnNode) return 1 + 4;
         if (n instanceof TypeInsnNode) return 1 + 4;
         return -1;
+    }
+
+    /**
+     * Deterministic number of {@code NOP} micro-ops injected after the instruction at
+     * sequence index {@code seq}, for a given interleave strength. Pseudo-random (hashed
+     * from {@code seq}) so the pattern is irregular and not trivially stripped, but fully
+     * reproducible between the two emission passes.
+     */
+    private static int fillerNops(long seq, int interleaveStrength) {
+        long h = seq * 0x9E3779B97F4A7C15L + interleaveStrength;
+        h ^= h >>> 33; h *= 0xFF51AFD7ED558CCDL;
+        h ^= h >>> 33; h *= 0xC4CEB9FE1A85EC53L;
+        h ^= h >>> 33;
+        int max = Math.min(interleaveStrength, 4);
+        return (int) (Math.floorMod(h, max + 1L));
     }
 
     private static void writeOp(ByteArrayOutputStream out, byte vop, int operand) {

@@ -3,6 +3,7 @@ package com.kbox.runtime;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
@@ -48,9 +49,19 @@ public final class VmpInterpreter {
     /** True if the self-check fired (interpreter class missing or tampered). */
     static boolean isSelfTampered() { return selfTampered; }
 
-    /** Raised when a per-method ciphertext integrity probe fails (silent). */
-    private static final java.util.concurrent.atomic.AtomicBoolean KBOX_TAMPER =
+    /** Raised when a per-method ciphertext integrity probe fails (silent).
+     *  Field name intentionally generic — a recognizable Utf8 entry would
+     *  re-leak the format tag into the JVM's metaspace. */
+    private static final java.util.concurrent.atomic.AtomicBoolean _T1 =
             new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Union accessor so string decryption and other sinks can also poison when
+     * the VM self-check / watchdog fires, not just when the debugger canary does.
+     * Deliberately a public static so {@link TamperShield} can consult it without
+     * depending on the interpreter's internal state shape.
+     */
+    public static boolean isTampered() { return _T1.get() || selfTampered; }
 
     // ------------------------------------------------------------------
     // Rolling-window integrity watchdog.
@@ -99,7 +110,7 @@ public final class VmpInterpreter {
                     int w = (int) ((tick + m.windowSalt()) % wc);
                     if (m.watchTampered()) continue;                 // already poisoned
                     if (!m.windowOk(w)) {
-                        KBOX_TAMPER.set(true);
+                        _T1.set(true);
                         m.poison();                                  // poison in-flight decode
                         break;
                     }
@@ -134,8 +145,11 @@ public final class VmpInterpreter {
         private final byte[] cipher;
         /** Per-run resident: {@code cipher ^ ksStatic ^ ksEph}. This is what actually
          *  lives in memory during execution, so a dump sees different bytes on every
-         *  launch while {@code b()} still recovers the exact plaintext. */
-        private final byte[] resident;
+         *  launch while {@code b()} still recovers the exact plaintext.
+         *  <p>Held in an OFF-HEAP {@link java.nio.ByteBuffer} (never a Java heap
+         *  {@code byte[]}) so the per-run wave never materialises as a heap array:
+         *  heap scanners / dumps cannot anchor onto a contiguous ciphertext wave. */
+        private final java.nio.ByteBuffer resident;
         private final int cipherLen;
         /** FNV-1a of the full decrypted plaintext, computed transiently at construction. */
         private final int constructionHash;
@@ -143,10 +157,54 @@ public final class VmpInterpreter {
         private final ChaCha20.Keystream ksStatic;
         /** Per-run ChaCha20 keystream (derived from eph = HKDF(master, perLaunch, "kbox.run")). */
         private final ChaCha20.Keystream ksEph;
+        /**
+         * The 32-byte per-run ephemeral key that seeded {@link #ksEph}. Exposed so the
+         * optional native interpreter ({@link VmpInterpreterNative}) can re-derive the
+         * per-position keystream byte-identically and execute the same resident stream
+         * without ever holding a full plaintext window. All zeros under noise mode.
+         */
+        private final byte[] ephKey;
         /** Per-method opcode twin derived from K: {@code (st1 ^ st2)} -> real opcode. */
         private final int twin;
+        /**
+         * Per-method inverse opcode permutation derived from K. The stored stream
+         * holds {@code perm[real] ^ twin}; dispatch recovers the real VmpOp via
+         * {@code invPerm[(st1 ^ st2) ^ raw]}. Identity under noise mode.
+         */
+        private final int[] invPerm;
+        /**
+         * Per-method micro-operation permutation derived from K (independent domain
+         * from {@link #invPerm}). The data-driven dispatch maps the stored opcode to
+         * its handler SLOT via {@code composite[twin ^ raw]} — the real VmpOp is never
+         * materialized in a register, so the instruction set is re-laid-out per method
+         * per build and static analysis of the dispatch loop cannot recover semantics.
+         */
+        private final int[] microPerm;
+        /**
+         * Composite dispatch permutation {@code microPerm[invPerm[t]]}. Slot for the
+         * stored byte value {@code (st1 ^ st2) ^ raw} == returned handler slot, all in
+         * opaque data (nothing in the code). Built at construction.
+         */
+        private final int[] composite;
+        /**
+         * Per-method data-driven handler table keyed by micro-SLOT:
+         * {@code handlers[micro[op]] = OP_HANDLER[op]}. The dispatch loop looks up
+         * {@code handlers[composite[twin ^ raw]]} and runs it — the real opcode and
+         * the interpreter's instruction set are nowhere recoverable statically.
+         */
+        private final Handler[] handlers;
         /** True when the hardware-bound key unwrap failed (wrong machine / tamper). */
         private final boolean noise;
+        /**
+         * VortexVM/L2 runtime handler re-permutation: a monotonic per-method sequence
+         * that, folded into a fresh per-run {@code R} permutation, re-lays the handler
+         * table on every {@literal execute()}. Subsequent executions of the same method
+         * (and, via the per-launch {@link #ephKey}, every launch) observe a moving
+         * slot{@literal ->}handler mapping, so a static or runtime dump of the handler
+         * table is useless — the dispatch value and the table both shift each run.
+         */
+        private final java.util.concurrent.atomic.AtomicLong runSeq =
+                new java.util.concurrent.atomic.AtomicLong(0L);
 
         private static int opcodeTwin(byte[] K) {
             int t = (K != null && K.length > 0) ? (K[0] & 0xFF) : 0;
@@ -163,6 +221,68 @@ public final class VmpInterpreter {
             byte[] kb = (K == null) ? new byte[0] : K;
             for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
             for (int i = n - 1; i > 0; i--) {
+                s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+                int j = (int) (Long.remainderUnsigned(s, i + 1L));
+                int t = p[i]; p[i] = p[j]; p[j] = t;
+            }
+            return p;
+        }
+
+        /** Deterministic 256-entry opcode permutation from K (MUST match VmpMethodInjector.opcodePerm). */
+        private static int[] opcodePerm(byte[] K) {
+            int[] p = new int[256];
+            for (int i = 0; i < 256; i++) p[i] = i;
+            long s = 0x243F6A8885A308D3L;   // distinct domain constant from slotPerm
+            byte[] kb = (K == null) ? new byte[0] : K;
+            for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+            for (int i = 255; i > 0; i--) {
+                s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+                int j = (int) (Long.remainderUnsigned(s, i + 1L));
+                int t = p[i]; p[i] = p[j]; p[j] = t;
+            }
+            return p;
+        }
+
+        /** Inverse of {@link #opcodePerm} — maps the stored (twin-masked) opcode back to the real VmpOp. */
+        private static int[] inversePerm(int[] perm) {
+            int[] inv = new int[perm.length];
+            for (int i = 0; i < perm.length; i++) inv[perm[i]] = i;
+            return inv;
+        }
+
+        /** Deterministic 256-entry micro-operation permutation from K (MUST match VmpMethodInjector.microPerm). */
+        private static int[] microPerm(byte[] K) {
+            int[] p = new int[256];
+            for (int i = 0; i < 256; i++) p[i] = i;
+            long s = 0xA4093822299F31D0L;   // distinct domain constant from slotPerm/opcodePerm
+            byte[] kb = (K == null) ? new byte[0] : K;
+            for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+            for (int i = 255; i > 0; i--) {
+                s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+                int j = (int) (Long.remainderUnsigned(s, i + 1L));
+                int t = p[i]; p[i] = p[j]; p[j] = t;
+            }
+            return p;
+        }
+
+        /**
+         * VortexVM/L2 per-run handler permutation {@code R}. Seeded by the per-launch
+         * ephemeral key ({@link #ephKey}) AND a fresh per-execution sequence value, so
+         * the permutation changes both across launches and across consecutive executions
+         * of the same method. {@code R} is applied purely on the dispatch INDIRECTION
+         * (slot{@literal ->}handler table re-lay), never to the instruction stream, so it
+         * is fully runtime-self-consistent and needs no build-side counterpart.
+         */
+        int[] runPerm() {
+            long s = 0x13198A2E03707344L;          // distinct domain constant for R
+            byte[] kb = ephKey;
+            for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+            long seq = runSeq.incrementAndGet();
+            s ^= seq * 0x9E3779B97F4A7C15L;
+            s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+            int[] p = new int[256];
+            for (int i = 0; i < 256; i++) p[i] = i;
+            for (int i = 255; i > 0; i--) {
                 s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
                 int j = (int) (Long.remainderUnsigned(s, i + 1L));
                 int t = p[i]; p[i] = p[j]; p[j] = t;
@@ -212,8 +332,9 @@ public final class VmpInterpreter {
          */
         public VmpMethod(byte[] encCode, Object[] encCpRaw, byte[] wrappedK,
                          int maxLocals, int maxStack, int argCount, int retSort, int[][] exceptions) {
-            this.cipher = encCode == null ? new byte[0] : encCode;
-            this.cipherLen = this.cipher.length;
+            // BrainfuckShield 二次虚拟化：静态字段存的是「磁带程序」（KBFT）而非直存密文。
+            // 在密钥 unwrap 之后统一由 BfInterpreter 回放解码回 encVmp（见下方分支）。
+            byte[] tape = encCode == null ? new byte[0] : encCode;
             this.maxLocals = maxLocals;
             this.maxStack = maxStack;
             this.argCount = argCount;
@@ -222,19 +343,28 @@ public final class VmpInterpreter {
 
             byte[] K = null;
             try {
-                byte[] master = HardwareKeyRing.vmpMaster();
-                K = HardwareKeyRing.aesGcmDecrypt(master, wrappedK);
-            } catch (Throwable ignored) {
+                K = HardwareKeyRing.aesGcmDecrypt(HardwareKeyRing.vmpMaster(), wrappedK);
+            } catch (Throwable decErr) {
                 K = null;
             }
             if (K == null || K.length == 0) {
                 // Wrong machine / tampered wrapped key -> noise method.
                 this.noise = true;
                 this.twin = 0xB1;
+                this.invPerm = new int[256];
+                for (int i = 0; i < 256; i++) this.invPerm[i] = i;   // identity under noise
+                this.microPerm = new int[256];
+                for (int i = 0; i < 256; i++) this.microPerm[i] = i; // identity under noise
+                this.composite = new int[256];
+                for (int i = 0; i < 256; i++) this.composite[i] = i; // identity under noise
+                this.handlers = identityHandlers();                  // identity under noise
                 byte[] zero = new byte[32];
                 this.ksStatic = new ChaCha20.Keystream(zero);
                 this.ksEph = new ChaCha20.Keystream(zero);
-                this.resident = this.cipher;
+                this.ephKey = zero;
+                this.cipher = tape;
+                this.cipherLen = tape.length;
+                this.resident = toOffHeap(this.cipher);
                 this.cp = new Object[0];
                 this.cpRaw = encCpRaw;
                 this.cpRes = encCpRaw;
@@ -243,6 +373,34 @@ public final class VmpInterpreter {
             } else {
                 this.noise = false;
                 this.twin = opcodeTwin(K);
+                // BrainfuckShield（二次虚拟化）: 静态字段存的是「磁带程序」（KBFT）而非直存密文。
+                // 用 K 逐格回放解码回 VMP 密文流 encVmp。解码失败（trailer 校验不过 =
+                // 磁带被静态补丁 / 插桩改动）时回退到原始磁带字节作为噪声流 fail-closed，
+                // 不给出任何检测信号（见 BfInterpreter 设计）。
+                byte[] decryptedCode = BfInterpreter.decodeIfTape(tape, K);
+                this.cipher = decryptedCode == null ? tape : decryptedCode;
+                this.cipherLen = this.cipher.length;
+                int[] opPerm = opcodePerm(K);
+                int[] inv = inversePerm(opPerm);
+                this.invPerm = inv;
+                // Data-driven L2 dispatch: the interpreter maps the stored opcode byte
+                // through composite[twin ^ raw] to its handler SLOT; the real VmpOp is
+                // never materialized. Per-method, per-build re-keying makes every build's
+                // handler layout different.
+                int[] micro = microPerm(K);
+                this.microPerm = micro;
+                int[] comp = new int[256];
+                for (int t = 0; t < 256; t++) comp[t] = micro[inv[t]];
+                this.composite = comp;
+                // Lay the handler table out in this method's micro-slot order: slot
+                // micro[op] holds the handler for the real opcode `op`. Every method &
+                // build permutes these 256 pointers differently.
+                Handler[] hs = new Handler[256];
+                for (int op = 0; op < 256; op++) {
+                    Handler h = OP_HANDLER[op];
+                    if (h != null) hs[micro[op]] = h;
+                }
+                this.handlers = hs;
                 this.ksStatic = new ChaCha20.Keystream(K);
                 byte[] eph = new byte[32];
                 try {
@@ -253,6 +411,7 @@ public final class VmpInterpreter {
                     new java.security.SecureRandom().nextBytes(eph);
                 }
                 this.ksEph = new ChaCha20.Keystream(eph);
+                this.ephKey = eph;
                 // Transiently recover the plaintext and re-encrypt it under the per-run
                 // stream into `resident`. No full plaintext is retained.
                 byte[] res = new byte[cipherLen];
@@ -262,7 +421,7 @@ public final class VmpInterpreter {
                     res[i] = (byte) (pl ^ ksEph.atMasked(i));
                     ch ^= pl; ch *= 0x01000193;
                 }
-                this.resident = res;
+                this.resident = toOffHeap(res);
                 this.constructionHash = ch;
                 // Constant-pool keying: keep the constant specs as CIPHERTEXT. Build a
                 // per-run re-keyed resident (enc ^ eph) and a deterministic slot
@@ -305,7 +464,7 @@ public final class VmpInterpreter {
                 int end = Math.min(n, base + seg);
                 int wH = 0x811c9dc5;
                 for (int i = base; i < end; i++) {
-                    int p = (resident[i] & 0xFF)
+                    int p = (resident.get(i) & 0xFF)
                             ^ ksWatch.atMasked(i)
                             ^ ksWatchEph.atMasked(i);
                     wH ^= p; wH *= 0x01000193;
@@ -341,7 +500,7 @@ public final class VmpInterpreter {
             int end = Math.min(cipherLen, base + seg);
             int h = 0x811c9dc5;
             for (int i = base; i < end; i++) {
-                int x = (resident[i] & 0xFF)
+                int x = (resident.get(i) & 0xFF)
                         ^ (ksWatch.atMasked(i) & 0xFF)
                         ^ (ksWatchEph.atMasked(i) & 0xFF);
                 h ^= x; h *= 0x01000193;
@@ -353,9 +512,21 @@ public final class VmpInterpreter {
         void poison() {
             if (tamperedWatch) return;
             tamperedWatch = true;
-            byte[] r = resident;
-            if (r != null && r.length > 0) r[0] ^= (byte) 0xFF;   // garbage opcode
-            else if (r != null && r.length > 1) r[1] ^= (byte) 0xFF;
+            java.nio.ByteBuffer r = resident;
+            if (r != null && r.hasRemaining()) {
+                r.put(0, (byte) (r.get(0) ^ 0xFF));   // garbage opcode
+            }
+        }
+
+        /** Copies a transient build-time array into an OFF-HEAP direct buffer so the
+         *  per-run resident wave never lives in the Java heap. The source is a short-lived
+         *  construction local and is collectible immediately after return. */
+        private static java.nio.ByteBuffer toOffHeap(byte[] src) {
+            if (src == null) return null;
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocateDirect(src.length);
+            bb.put(src);
+            bb.rewind();
+            return bb;
         }
 
         // --- rolling-window watchdog state (task 4) ---
@@ -390,7 +561,7 @@ public final class VmpInterpreter {
          */
         final int b(int pos) {
             return pos >= 0 && pos < cipherLen
-                    ? (resident[pos] & 0xFF) ^ ksEph.atMasked(pos)
+                    ? (resident.get(pos) & 0xFF) ^ ksEph.atMasked(pos)
                     : 0;
         }
 
@@ -413,12 +584,288 @@ public final class VmpInterpreter {
                 int x = b(i);
                 h ^= x; h *= 0x01000193;
             }
-            if (h != constructionHash) KBOX_TAMPER.set(true);
+            if (h != constructionHash) _T1.set(true);
         }
     }
 
-    /** Verifies the interpreter class is present and readable. */
+    /**
+     * A single VMP micro-operation handler. The data-driven dispatch loop runs the
+     * handler whose index equals {@code composite[twin ^ raw]} for the current
+     * program counter — the real opcode that decided WHICH handler to run is never
+     * materialized as a value, so the instruction set and its mapping to semantics
+     * are only recoverable from per-method opaque permutation data.
+     *
+     * @return {@code true} if the method should unwind (a *RETURN / END was executed);
+     *         the result is in {@link Ctx#retValue}.
+     */
+    @FunctionalInterface
+    private interface Handler {
+        /** Executes one micro-operation. {@code true} unwinds (a *RETURN / END ran);
+         *  the result is in {@link Ctx#retValue}. Throwables propagate to execute(). */
+        boolean run(Ctx c) throws Throwable;
+    }
+
+    /** Mutable execution context shared by every micro-operation handler. */
+    private static final class Ctx {
+        VmpMethod m;
+        Object[] cp;
+        Object[] stack;
+        Object[] locals;
+        int sp;
+        int pc;
+        Object retValue;
+    }
+
+    /**
+     * Static semantic table: index by the REAL VmpOp, value is the handler that
+     * implements its semantics. Each {@link VmpMethod} folds this through its
+     * per-method {@code microPerm} into a differently-ordered {@code handlers}
+     * array, so no two methods/builds share a byte-identical dispatch layout.
+     */
+    private static final Handler[] OP_HANDLER = new Handler[256];
+    static {
+        OP_HANDLER[0x01] = c -> { c.stack[c.sp++] = null; return false; };                         // ACONST_NULL
+        OP_HANDLER[0x02] = c -> { c.stack[c.sp++] = c.m.i4(c.pc); c.pc += 4; return false; };      // ICONST
+        OP_HANDLER[0x03] = c -> {
+            long v = ((long) c.m.i4(c.pc) << 32) | (c.m.i4(c.pc + 4) & 0xFFFFFFFFL);
+            c.stack[c.sp++] = v; c.pc += 8; return false; };                                        // LCONST
+        OP_HANDLER[0x04] = c -> { c.stack[c.sp++] = Float.intBitsToFloat(c.m.i4(c.pc)); c.pc += 4; return false; };
+        OP_HANDLER[0x05] = c -> {
+            long bits = ((long) c.m.i4(c.pc) << 32) | (c.m.i4(c.pc + 4) & 0xFFFFFFFFL);
+            c.stack[c.sp++] = Double.longBitsToDouble(bits); c.pc += 8; return false; };
+        OP_HANDLER[0x06] = c -> { c.stack[c.sp++] = resolveString(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4; return false; };
+        OP_HANDLER[0x07] = c -> { c.stack[c.sp++] = resolveClass(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4; return false; };
+
+        OP_HANDLER[0x10] = c -> { c.stack[c.sp++] = c.locals[c.m.u2(c.pc)]; c.pc += 2; return false; };  // ILOAD
+        OP_HANDLER[0x11] = c -> { c.stack[c.sp++] = c.locals[c.m.u2(c.pc)]; c.pc += 2; return false; };  // LLOAD
+        OP_HANDLER[0x12] = c -> { c.stack[c.sp++] = c.locals[c.m.u2(c.pc)]; c.pc += 2; return false; };  // FLOAD
+        OP_HANDLER[0x13] = c -> { c.stack[c.sp++] = c.locals[c.m.u2(c.pc)]; c.pc += 2; return false; };  // DLOAD
+        OP_HANDLER[0x14] = c -> { c.stack[c.sp++] = c.locals[c.m.u2(c.pc)]; c.pc += 2; return false; };  // ALOAD
+
+        OP_HANDLER[0x18] = c -> { c.locals[c.m.u2(c.pc)] = c.stack[--c.sp]; c.pc += 2; return false; };  // ISTORE
+        OP_HANDLER[0x19] = c -> { c.locals[c.m.u2(c.pc)] = c.stack[--c.sp]; c.pc += 2; return false; };  // LSTORE
+        OP_HANDLER[0x1A] = c -> { c.locals[c.m.u2(c.pc)] = c.stack[--c.sp]; c.pc += 2; return false; };  // FSTORE
+        OP_HANDLER[0x1B] = c -> { c.locals[c.m.u2(c.pc)] = c.stack[--c.sp]; c.pc += 2; return false; };  // DSTORE
+        OP_HANDLER[0x1C] = c -> { c.locals[c.m.u2(c.pc)] = c.stack[--c.sp]; c.pc += 2; return false; };  // ASTORE
+
+        OP_HANDLER[0x20] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a + b; return false; }; // IADD
+        OP_HANDLER[0x21] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a - b; return false; }; // ISUB
+        OP_HANDLER[0x22] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a * b; return false; }; // IMUL
+        OP_HANDLER[0x23] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a / b; return false; }; // IDIV
+        OP_HANDLER[0x24] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a % b; return false; }; // IREM
+        OP_HANDLER[0x25] = c -> { int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = -a; return false; }; // INEG
+        OP_HANDLER[0x26] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a << b; return false; }; // ISHL
+        OP_HANDLER[0x27] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a >> b; return false; }; // ISHR
+        OP_HANDLER[0x28] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a >>> b; return false; }; // IUSHR
+        OP_HANDLER[0x29] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a & b; return false; }; // IAND
+        OP_HANDLER[0x2A] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a | b; return false; }; // IOR
+        OP_HANDLER[0x2B] = c -> { int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); c.stack[c.sp++] = a ^ b; return false; }; // IXOR
+        OP_HANDLER[0x2C] = c -> {
+            int v = c.m.u2(c.pc); int d = c.m.i4(c.pc + 2);
+            c.locals[v] = toInt(c.locals[v]) + d; c.pc += 6; return false; };                        // IINC
+
+        OP_HANDLER[0x2D] = c -> { c.stack[c.sp - 1] = (long) toInt(c.stack[c.sp - 1]); return false; }; // I2L
+        OP_HANDLER[0x2E] = c -> { c.stack[c.sp - 1] = (float) toInt(c.stack[c.sp - 1]); return false; };// I2F
+        OP_HANDLER[0x2F] = c -> { c.stack[c.sp - 1] = (double) toInt(c.stack[c.sp - 1]); return false; };// I2D
+        OP_HANDLER[0xA0] = c -> { c.stack[c.sp - 1] = (int) toLong(c.stack[c.sp - 1]); return false; };  // L2I
+        OP_HANDLER[0xA1] = c -> { c.stack[c.sp - 1] = (float) toLong(c.stack[c.sp - 1]); return false; };// L2F
+        OP_HANDLER[0xA2] = c -> { c.stack[c.sp - 1] = (double) toLong(c.stack[c.sp - 1]); return false; };// L2D
+        OP_HANDLER[0xA3] = c -> { c.stack[c.sp - 1] = (int) toFloat(c.stack[c.sp - 1]); return false; }; // F2I
+        OP_HANDLER[0xA4] = c -> { c.stack[c.sp - 1] = (long) toFloat(c.stack[c.sp - 1]); return false; }; // F2L
+        OP_HANDLER[0xA5] = c -> { c.stack[c.sp - 1] = (double) toFloat(c.stack[c.sp - 1]); return false; };// F2D
+        OP_HANDLER[0xA6] = c -> { c.stack[c.sp - 1] = (int) toDouble(c.stack[c.sp - 1]); return false; }; // D2I
+        OP_HANDLER[0xA7] = c -> { c.stack[c.sp - 1] = (long) toDouble(c.stack[c.sp - 1]); return false; };// D2L
+        OP_HANDLER[0xA8] = c -> { c.stack[c.sp - 1] = (float) toDouble(c.stack[c.sp - 1]); return false; };// D2F
+        OP_HANDLER[0xA9] = c -> { c.stack[c.sp - 1] = (byte) toInt(c.stack[c.sp - 1]); return false; }; // I2B
+        OP_HANDLER[0xAA] = c -> { c.stack[c.sp - 1] = (char) toInt(c.stack[c.sp - 1]); return false; }; // I2C
+        OP_HANDLER[0xAB] = c -> { c.stack[c.sp - 1] = (short) toInt(c.stack[c.sp - 1]); return false; };// I2S
+
+        OP_HANDLER[0xAC] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = (a == b ? 0 : (a < b ? -1 : 1)); return false; }; // LCMP
+        OP_HANDLER[0xAD] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a + b; return false; }; // LADD
+        OP_HANDLER[0xAE] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a - b; return false; }; // LSUB
+        OP_HANDLER[0xAF] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a * b; return false; }; // LMUL
+        OP_HANDLER[0xB0] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a / b; return false; }; // LDIV
+        OP_HANDLER[0xB1] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a % b; return false; }; // LREM
+        OP_HANDLER[0xB2] = c -> { long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = -a; return false; };// LNEG
+        OP_HANDLER[0xB3] = c -> { int b = toInt(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a << b; return false; }; // LSHL
+        OP_HANDLER[0xB4] = c -> { int b = toInt(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a >> b; return false; }; // LSHR
+        OP_HANDLER[0xB5] = c -> { int b = toInt(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a >>> b; return false; }; // LUSHR
+        OP_HANDLER[0xB6] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a & b; return false; }; // LAND
+        OP_HANDLER[0xB7] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a | b; return false; }; // LOR
+        OP_HANDLER[0xB8] = c -> { long b = toLong(c.stack[--c.sp]); long a = toLong(c.stack[--c.sp]); c.stack[c.sp++] = a ^ b; return false; }; // LXOR
+
+        OP_HANDLER[0xB9] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = a + b; return false; }; // FADD
+        OP_HANDLER[0xBA] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = a - b; return false; }; // FSUB
+        OP_HANDLER[0xBB] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = a * b; return false; }; // FMUL
+        OP_HANDLER[0xBC] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = a / b; return false; }; // FDIV
+        OP_HANDLER[0xBD] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = a % b; return false; }; // FREM
+        OP_HANDLER[0xBE] = c -> { float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = -a; return false; }; // FNEG
+        OP_HANDLER[0xBF] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = a + b; return false; }; // DADD
+        OP_HANDLER[0xC0] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = a - b; return false; }; // DSUB
+        OP_HANDLER[0xC1] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = a * b; return false; }; // DMUL
+        OP_HANDLER[0xC2] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = a / b; return false; }; // DDIV
+        OP_HANDLER[0xC3] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = a % b; return false; }; // DREM
+        OP_HANDLER[0xC4] = c -> { double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = -a; return false; }; // DNEG
+        OP_HANDLER[0xC5] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = (Float.isNaN(a) || Float.isNaN(b) ? -1 : (a > b ? 1 : (a < b ? -1 : 0))); return false; }; // FCMPL
+        OP_HANDLER[0xC6] = c -> { float b = toFloat(c.stack[--c.sp]); float a = toFloat(c.stack[--c.sp]); c.stack[c.sp++] = (a > b ? 1 : (a < b ? -1 : (Float.isNaN(a) || Float.isNaN(b) ? 1 : 0))); return false; }; // FCMPG
+        OP_HANDLER[0xC7] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = (Double.isNaN(a) || Double.isNaN(b) ? -1 : (a > b ? 1 : (a < b ? -1 : 0))); return false; }; // DCMPL
+        OP_HANDLER[0xC8] = c -> { double b = toDouble(c.stack[--c.sp]); double a = toDouble(c.stack[--c.sp]); c.stack[c.sp++] = (a > b ? 1 : (a < b ? -1 : (Double.isNaN(a) || Double.isNaN(b) ? 1 : 0))); return false; }; // DCMPG
+
+        OP_HANDLER[0x30] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) == 0) c.pc = t; return false; }; // IFEQ
+        OP_HANDLER[0x31] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) != 0) c.pc = t; return false; }; // IFNE
+        OP_HANDLER[0x32] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) <  0) c.pc = t; return false; }; // IFLT
+        OP_HANDLER[0x33] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) >= 0) c.pc = t; return false; }; // IFGE
+        OP_HANDLER[0x34] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) >  0) c.pc = t; return false; }; // IFGT
+        OP_HANDLER[0x35] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (toInt(c.stack[--c.sp]) <= 0) c.pc = t; return false; }; // IFLE
+        OP_HANDLER[0x36] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a == b) c.pc = t; return false; };
+        OP_HANDLER[0x37] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a != b) c.pc = t; return false; };
+        OP_HANDLER[0x38] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a <  b) c.pc = t; return false; };
+        OP_HANDLER[0x39] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a >= b) c.pc = t; return false; };
+        OP_HANDLER[0x3A] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a >  b) c.pc = t; return false; };
+        OP_HANDLER[0x3B] = c -> { int t = c.m.i4(c.pc); c.pc += 4; int b = toInt(c.stack[--c.sp]); int a = toInt(c.stack[--c.sp]); if (a <= b) c.pc = t; return false; };
+        OP_HANDLER[0x3C] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (c.stack[--c.sp] == null) c.pc = t; return false; }; // IFNULL
+        OP_HANDLER[0x3D] = c -> { int t = c.m.i4(c.pc); c.pc += 4; if (c.stack[--c.sp] != null) c.pc = t; return false; }; // IFNONNULL
+        OP_HANDLER[0x3E] = c -> { c.pc = c.m.i4(c.pc); return false; };                                    // GOTO
+        OP_HANDLER[0x3F] = c -> { int t = c.m.i4(c.pc); c.pc += 4; Object b = c.stack[--c.sp]; Object a = c.stack[--c.sp]; if (a == b) c.pc = t; return false; }; // IF_ACMPEQ
+        OP_HANDLER[0xC9] = c -> { int t = c.m.i4(c.pc); c.pc += 4; Object b = c.stack[--c.sp]; Object a = c.stack[--c.sp]; if (a != b) c.pc = t; return false; }; // IF_ACMPNE
+
+        OP_HANDLER[0x45] = c -> { return false; };                                               // NOP (VortexVM/L2 interleave filler)
+        OP_HANDLER[0x40] = c -> { --c.sp; return false; };                                              // POP
+        OP_HANDLER[0x41] = c -> { c.sp -= 2; return false; };                                           // POP2
+        OP_HANDLER[0x42] = c -> { c.stack[c.sp] = c.stack[c.sp - 1]; c.sp++; return false; };           // DUP
+        OP_HANDLER[0x43] = c -> { Object v = c.stack[c.sp - 1]; c.stack[c.sp] = v; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = v; c.sp++; return false; }; // DUP_X1
+        OP_HANDLER[0xCA] = c -> { Object v = c.stack[c.sp - 1]; c.stack[c.sp] = v; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = c.stack[c.sp - 3]; c.stack[c.sp - 3] = v; c.sp++; return false; }; // DUP_X2
+        OP_HANDLER[0xCB] = c -> { c.stack[c.sp] = c.stack[c.sp - 1]; c.stack[c.sp + 1] = c.stack[c.sp - 2]; c.sp += 2; return false; }; // DUP2
+        OP_HANDLER[0xCC] = c -> { Object v1 = c.stack[c.sp - 1]; Object v2 = c.stack[c.sp - 2]; c.stack[c.sp] = v1; c.stack[c.sp + 1] = v2; c.stack[c.sp - 1] = c.stack[c.sp - 3]; c.stack[c.sp - 2] = v1; c.stack[c.sp - 3] = v2; c.sp += 2; return false; }; // DUP2_X1
+        /* DUP2_X2 (JVMS 6.5): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1.
+         * Single-slot model collapses all four forms to this 4-slot rotation. */
+        OP_HANDLER[0xCD] = c -> { Object v1 = c.stack[c.sp - 1]; Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3]; Object v4 = c.stack[c.sp - 4]; c.stack[c.sp - 4] = v2; c.stack[c.sp - 3] = v1; c.stack[c.sp - 2] = v4; c.stack[c.sp - 1] = v3; c.stack[c.sp] = v2; c.stack[c.sp + 1] = v1; c.sp += 2; return false; }; // DUP2_X2
+        OP_HANDLER[0x44] = c -> { Object t = c.stack[c.sp - 1]; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = t; return false; }; // SWAP
+
+        OP_HANDLER[0x50] = c -> {
+            Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), true);
+            initClass(f.getDeclaringClass());
+            Object gv = f.get(null);
+            c.stack[c.sp++] = gv; c.pc += 4; return false; };                                            // GETSTATIC
+        OP_HANDLER[0x51] = c -> {
+            Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), true);
+            initClass(f.getDeclaringClass());
+            f.set(null, c.stack[--c.sp]); c.pc += 4; return false; };                                    // PUTSTATIC
+        OP_HANDLER[0x52] = c -> {
+            Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), false);
+            Object o = c.stack[--c.sp]; c.stack[c.sp++] = f.get(o); c.pc += 4; return false; };          // GETFIELD
+        OP_HANDLER[0x53] = c -> {
+            Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), false);
+            Object v = c.stack[--c.sp]; Object o = c.stack[--c.sp]; f.set(o, v); c.pc += 4; return false; }; // PUTFIELD
+
+        OP_HANDLER[0x60] = c -> {                                                                        // INVOKEVIRTUAL
+            int idx = c.m.i4(c.pc); c.pc += 4;
+            Method me = resolveMethod(c.m, c.cp, idx, false);
+            Object[] args2 = popArgs(me.getParameterTypes(), c.stack, c.sp);
+            c.sp -= args2.length;
+            Object recv = c.stack[--c.sp];
+            Object r = safeInvoke(me, recv, args2);
+            if (me.getReturnType() != void.class) c.stack[c.sp++] = r;
+            return false;
+        };
+        OP_HANDLER[0x61] = c -> {                                                                        // INVOKESPECIAL
+            int idx = c.m.i4(c.pc); c.pc += 4;
+            Object spec = c.m.specAt(idx);
+            if (spec instanceof String && ((String) spec).contains("#<init>#")) {
+                Constructor<?> ctor = resolveCtor(c.m, c.cp, idx);
+                Object[] args2 = popArgs(ctor.getParameterTypes(), c.stack, c.sp);
+                c.sp -= args2.length;
+                Object marker = c.stack[c.sp - 1];
+                boolean duped = c.sp >= 2 && c.stack[c.sp - 2] == marker;
+                c.stack[duped ? c.sp - 2 : c.sp - 1] = ctor.newInstance(coerceArgs(ctor.getParameterTypes(), args2));
+                c.sp--;
+            } else {
+                Method me = resolveMethod(c.m, c.cp, idx, false);
+                Object[] args2 = popArgs(me.getParameterTypes(), c.stack, c.sp);
+                c.sp -= args2.length;
+                Object recv = c.stack[--c.sp];
+                Object r = safeInvoke(me, recv, args2);
+                if (me.getReturnType() != void.class) c.stack[c.sp++] = r;
+            }
+            return false;
+        };
+        OP_HANDLER[0x62] = c -> {                                                                        // INVOKESTATIC
+            int idx = c.m.i4(c.pc); c.pc += 4;
+            Method me = resolveMethod(c.m, c.cp, idx, true);
+            Object[] args2 = popArgs(me.getParameterTypes(), c.stack, c.sp);
+            c.sp -= args2.length;
+            Object r = safeInvoke(me, null, args2);
+            if (me.getReturnType() != void.class) c.stack[c.sp++] = r;
+            return false;
+        };
+        OP_HANDLER[0x63] = c -> {                                                                        // INVOKEINTERFACE
+            int idx = c.m.i4(c.pc); c.pc += 4;
+            Method me = resolveMethod(c.m, c.cp, idx, false);
+            Object[] args2 = popArgs(me.getParameterTypes(), c.stack, c.sp);
+            c.sp -= args2.length;
+            Object recv = c.stack[--c.sp];
+            Object r = safeInvoke(me, recv, args2);
+            if (me.getReturnType() != void.class) c.stack[c.sp++] = r;
+            return false;
+        };
+        OP_HANDLER[0x70] = c -> { Class<?> cc = resolveClass(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4;
+            c.stack[c.sp++] = cc; return false; };                                                       // NEW (push class marker)
+        OP_HANDLER[0x71] = c -> { int at = c.m.i4(c.pc); c.pc += 4; Class<?> elem = arrayType(at);
+            int len = toInt(c.stack[--c.sp]); c.stack[c.sp++] = Array.newInstance(elem, len); return false; }; // NEWARRAY
+        OP_HANDLER[0x72] = c -> { Class<?> cc = resolveClass(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4;
+            int len = toInt(c.stack[--c.sp]); c.stack[c.sp++] = Array.newInstance(cc, len); return false; }; // ANEWARRAY
+        OP_HANDLER[0x73] = c -> { int arrDepth = c.sp - 1; Object alArr = c.stack[arrDepth];
+            c.stack[arrDepth] = Array.getLength(alArr); return false; };                                 // ARRAYLENGTH
+        OP_HANDLER[0x74] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.get(a, i); return false; }; // AALOAD
+        OP_HANDLER[0x75] = c -> { Object v = c.stack[--c.sp]; int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.set(a, i, v); return false; }; // AASTORE
+        OP_HANDLER[0x76] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getInt(a, i); return false; }; // IALOAD
+        OP_HANDLER[0x77] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setInt(a, i, v); return false; }; // IASTORE
+        OP_HANDLER[0x7A] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getByte(a, i); return false; }; // BALOAD
+        OP_HANDLER[0x7B] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setByte(a, i, (byte) v); return false; }; // BASTORE
+        OP_HANDLER[0x7C] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getChar(a, i); return false; }; // CALOAD
+        OP_HANDLER[0x7D] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setChar(a, i, (char) v); return false; }; // CASTORE
+        OP_HANDLER[0x7E] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getShort(a, i); return false; }; // SALOAD
+        OP_HANDLER[0x7F] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setShort(a, i, (short) v); return false; }; // SASTORE
+        OP_HANDLER[0x83] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getLong(a, i); return false; }; // LALOAD
+        OP_HANDLER[0x84] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getFloat(a, i); return false; }; // FALOAD
+        OP_HANDLER[0x85] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getDouble(a, i); return false; }; // DALOAD
+        OP_HANDLER[0x86] = c -> { long v = toLong(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setLong(a, i, v); return false; }; // LASTORE
+        OP_HANDLER[0x87] = c -> { float v = toFloat(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setFloat(a, i, v); return false; }; // FASTORE
+        OP_HANDLER[0x88] = c -> { double v = toDouble(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setDouble(a, i, v); return false; }; // DASTORE
+        OP_HANDLER[0x78] = c -> { Class<?> cc = resolveClass(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4;
+            c.stack[c.sp - 1] = cc.cast(c.stack[c.sp - 1]); return false; };                             // CHECKCAST
+        OP_HANDLER[0x79] = c -> { Class<?> cc = resolveClass(c.m, c.cp, c.m.i4(c.pc)); c.pc += 4;
+            c.stack[c.sp - 1] = cc.isInstance(c.stack[c.sp - 1]); return false; };                      // INSTANCEOF
+
+        OP_HANDLER[0x80] = c -> { Object o = c.stack[c.sp - 1]; enterMonitor(o); return false; };       // MONITORENTER
+        OP_HANDLER[0x81] = c -> { Object o = c.stack[--c.sp]; exitMonitor(o); return false; };          // MONITOREXIT
+
+        OP_HANDLER[0x82] = c -> { throw (Throwable) c.stack[--c.sp]; };                                  // ATHROW
+
+        OP_HANDLER[0x90] = c -> { int iv = toInt(c.stack[--c.sp]); c.retValue = boxIntReturn(c.m, iv); return true; }; // IRETURN
+        OP_HANDLER[0x91] = c -> { c.retValue = c.stack[--c.sp]; return true; };                          // LRETURN
+        OP_HANDLER[0x92] = c -> { c.retValue = c.stack[--c.sp]; return true; };                          // FRETURN
+        OP_HANDLER[0x93] = c -> { c.retValue = c.stack[--c.sp]; return true; };                          // DRETURN
+        OP_HANDLER[0x94] = c -> { c.retValue = c.stack[--c.sp]; return true; };                          // ARETURN
+        OP_HANDLER[0x95] = c -> { return true; };                                                       // RETURN
+        OP_HANDLER[0xFF] = c -> { return true; };                                                       // END
+    }
+
+    /** Identity handler table (used when the wrapped key unwrap fails → noise). */
+    private static Handler[] identityHandlers() {
+        Handler[] h = new Handler[256];
+        for (int i = 0; i < 256; i++) h[i] = OP_HANDLER[i];
+        return h;
+    }
+
+    /** Verifies the interpreter class is present and readable. In Brainfuck mode
+     *  the check runs inside native code (BfSecureLoader.probeClassFromBF), which
+     *  decodes VmpInterpreter transiently in native secure memory and NEVER copies
+     *  the plaintext class bytes into a Java byte[] — so a native memory scanner
+     *  cannot find this class resting in the heap. Outside BF mode (the class file
+     *  is on disk in the jar anyway) the classic resource read is used. */
     private static void verifySelf() {
+        if (probeSelfViaNative()) return;
         try {
             java.io.InputStream in = VmpInterpreter.class.getClassLoader()
                     .getResourceAsStream("com/kbox/runtime/VmpInterpreter.class");
@@ -433,11 +880,51 @@ public final class VmpInterpreter {
         }
     }
 
+    /** BF-mode self-probe via reflection (keeps this class free of a hard link to
+     *  BfSecureLoader, which is only present in Brainfuck-protected jars). Returns
+     *  true when the probe ran; false when BfSecureLoader is absent (non-BF mode),
+     *  in which case the caller falls back to the resource read. */
+    private static boolean probeSelfViaNative() {
+        try {
+            Class<?> loader = Class.forName("com.kbox.runtime.BfSecureLoader",
+                    false, VmpInterpreter.class.getClassLoader());
+            java.lang.reflect.Method m = loader.getDeclaredMethod(
+                    "probeClassFromBF", String.class);
+            m.setAccessible(true);
+            Object r = m.invoke(null, "com/kbox/runtime/VmpInterpreter.class");
+            selfTampered = !Boolean.TRUE.equals(r);
+            return true;
+        } catch (Throwable t) {
+            return false; // not BF mode (or probe unavailable) -> fall back
+        }
+    }
+
     static {
         verifySelf();
     }
 
     public static Object execute(VmpMethod m, Object instance, Object[] args) throws Throwable {
+        // Optional VM原生化: run the interpreter body in native code when the packed
+        // VMP library is present. On any unavailability the seam returns NOT_NATIVE and
+        // we fall through to the identical Java interpreter below (no behavioral change).
+        //
+        // If the native interpreter THROWS, that is either (a) the semantics-faithful
+        // outcome of the interpreted method itself, or (b) a native-interpreter fault
+        // (e.g. an operand typed wrongly on the C stack for some randomized build's
+        // translation). The two are indistinguishable from the seam, but the Java
+        // interpreter below is byte-identical to the native one, so replaying the
+        // method on the Java path is always safe: a genuine exception re-surfaces
+        // identically (slightly slower), a native fault is silently corrected.
+        try {
+            Object nat = VmpInterpreterNative.tryExecute(m, instance, args);
+            if (nat != VmpInterpreterNative.NOT_NATIVE) return nat;
+        } catch (Throwable t) {
+            if (t instanceof ThreadDeath || t instanceof VirtualMachineError) throw t;
+            String s = String.valueOf(t);
+            if (s.length() > 240) s = s.substring(0, 240);
+            System.err.println("[KBOX-VMP] native interpreter fault, replaying on Java interpreter: " + s);
+        }
+
         // Generous headroom for the VMP pass pipeline: flatten/substitute/bogus are net-0 on the
         // stack, but defensive margin avoids ArrayIndexOutOfBounds if a future transform ever deepens it.
         Object[] stack = new Object[m.maxStack + 16];
@@ -460,305 +947,106 @@ public final class VmpInterpreter {
         Object[] cp = m.cp;
         int ppc = 0;
         long watchdogCtr = 0;
-        try {
-            boolean trace = System.getProperty("kbox.vmp.trace") != null;
-            if (trace) {
-                StringBuilder sb = new StringBuilder("[VMPTRACE] code(maxLocals=" + m.maxLocals
-                        + ",maxStack=" + m.maxStack + ",argCount=" + m.argCount + "):");
-                for (int i = 0; i < m.cipherLen; i++) sb.append(String.format(" %02x", m.b(i)));
-                System.err.println(sb);
-                if (m.cpRaw != null) {
-                    for (int i = 0; i < m.cpRaw.length; i++) {
-                        System.err.println("[VMPTRACE]   cp[" + i + "]=" + m.cpRaw[i]);
-                    }
-                }
-            }
+        // VortexVM/L2 per-run handler re-layout: derive a fresh R permutation for THIS
+        // execution and re-lay the handler table through it. R only moves the dispatch
+        // INDIRECTION, so the stream semantics are untouched — but the in-memory handler
+        // table differs on every execute and every launch, defeating handler-table dumps.
+        int[] R = m.runPerm();
+        Handler[] runHandlers = new Handler[256];
+        {
+            Handler[] base = m.handlers;
+            for (int s = 0; s < 256; s++) runHandlers[R[s]] = base[s];
+        }
+        // Execution context shared by the data-driven micro-op handlers. The dispatch
+        // loop only ever reads/writes ctx.* — the operand stack, locals and pc live here.
+        Ctx ctx = new Ctx();
+        ctx.m = m;
+        ctx.cp = cp;
+        ctx.stack = stack;
+        ctx.locals = locals;
+        ctx.sp = sp;
+        ctx.pc = pc;
+        // Exception handling: if an exception is raised and THIS method's exception
+        // table has a matching handler, we re-enter the dispatch loop at the handler
+        // pc (resumeDispatch). Otherwise it propagates out to the invoking context.
+        boolean resumeDispatch = false;
+        do {
+            resumeDispatch = false;
+            try {
             while (true) {
-                // Two-state XOR dispatch: (st1 ^ st2) == m.twin, resolving the
-                // twin-masked opcode byte back to the real VmpOp for the switch.
-                // st1/st2 both evolve per-pc using the per-run ephemeral layer, so
-                // the dispatch value is opaque to static analysis while provably
-                // correct (the ephemeral byte cancels in st1 ^ st2 == twin).
-                int raw = m.b(pc);
-                int kb = m.ksEph.atMasked(pc);
+                // Two-state XOR dispatch: st1/st2 both evolve per-pc using the per-run
+                // ephemeral layer, so the dispatch value is opaque to static analysis
+                // while provably correct (the ephemeral byte cancels: st1 ^ st2 == twin).
+                // Data-driven micro-op dispatch: the composite permutation maps the
+                // stored ciphertext byte directly onto a handler SLOT. Neither the real
+                // VmpOp nor any dispatch value is ever materialized:
+                //   slot = composite[twin ^ raw] = micro[inv[perm[real] ^ twin ^ twin]] = micro[real]
+                //   handlers[micro[real]] is the semantic handler for that build+method.
+                int raw = m.b(ctx.pc);
+                int kb = m.ksEph.atMasked(ctx.pc);
                 int st1 = m.twin ^ kb;   // twin = st1 ^ st2
                 int st2 = kb;
-                int op = (st1 ^ st2) ^ raw;
-                ppc = pc;
-                pc++; // advance past opcode; operand readers advance further
-                if (trace) {
-                    System.err.println("[VMPTRACE] pc=" + ppc + " op=0x" + Integer.toHexString(op)
-                            + " sp=" + sp + " (locals=" + m.maxLocals + ")");
-                }
+                int slot = m.composite[(st1 ^ st2) ^ raw];
+                ppc = ctx.pc;
+                ctx.pc++; // advance past opcode; operand readers advance further
                 // Periodically surface a watchdog-poisoned method. The poison also
                 // corrupts the opcode stream, but this explicit probe makes the
                 // tamper response immediate instead of waiting for a corrupted
                 // instruction to be decoded. ~1 check per 1024 dispatches is ~free.
                 if ((++watchdogCtr & 0x3FFL) == 0 && m.watchTampered()) {
-                    throw new RuntimeException("VMP: integrity watchdog fired (tamper) @ " + ppc);
+                    // Closed state machine: never surface a pc/state-hinting message.
+                    throw new RuntimeException("KBox");
                 }
-                switch (op) {
-                    case 0x01: stack[sp++] = null; break;                              // ACONST_NULL
-                    case 0x02: stack[sp++] = m.i4(pc); pc += 4; break;          // ICONST
-                    case 0x03: { long v = ((long) m.i4(pc) << 32)
-                                        | (m.i4(pc + 4) & 0xFFFFFFFFL);
-                                 stack[sp++] = v; pc += 8; } break;                     // LCONST
-                    case 0x04: stack[sp++] = Float.intBitsToFloat(m.i4(pc)); pc += 4; break;
-                    case 0x05: { long bits = ((long) m.i4(pc) << 32)
-                                        | (m.i4(pc + 4) & 0xFFFFFFFFL);
-                                 stack[sp++] = Double.longBitsToDouble(bits); pc += 8; } break;
-                    case 0x06: stack[sp++] = resolveString(m, cp, m.i4(pc)); pc += 4; break;
-                    case 0x07: stack[sp++] = resolveClass(m, cp, m.i4(pc)); pc += 4; break;
-
-                    case 0x10: case 0x14: stack[sp++] = locals[m.u2(pc)]; pc += 2; break; // ILOAD / ALOAD
-                    case 0x11: case 0x13: stack[sp++] = locals[m.u2(pc)]; pc += 2; break; // LLOAD / DLOAD
-                    case 0x12: stack[sp++] = locals[m.u2(pc)]; pc += 2; break;            // FLOAD
-
-                    case 0x18: case 0x1C: locals[m.u2(pc)] = stack[--sp]; pc += 2; break;  // ISTORE / ASTORE
-                    case 0x19: case 0x1B: locals[m.u2(pc)] = stack[--sp]; pc += 2; break;  // LSTORE / DSTORE
-                    case 0x1A: locals[m.u2(pc)] = stack[--sp]; pc += 2; break;              // FSTORE
-
-                    case 0x20: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a + b; break; } // IADD
-                    case 0x21: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a - b; break; } // ISUB
-                    case 0x22: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a * b; break; } // IMUL
-                    case 0x23: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a / b; break; } // IDIV
-                    case 0x24: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a % b; break; } // IREM
-                    case 0x25: { int a = toInt(stack[--sp]); stack[sp++] = -a; break; } // INEG
-                    case 0x26: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a << b; break; } // ISHL
-                    case 0x27: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a >> b; break; } // ISHR
-                    case 0x28: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a >>> b; break; } // IUSHR
-                    case 0x29: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a & b; break; } // IAND
-                    case 0x2A: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a | b; break; } // IOR
-                    case 0x2B: { int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); stack[sp++] = a ^ b; break; } // IXOR
-                    case 0x2C: { int v = m.u2(pc); int d = m.i4(pc + 2);
-                                 locals[v] = toInt(locals[v]) + d; pc += 6; break; }              // IINC
-
-                    // --- Type conversions ---
-                    case 0x2D: stack[sp - 1] = (long) toInt(stack[sp - 1]); break;                   // I2L
-                    case 0x2E: stack[sp - 1] = (float) toInt(stack[sp - 1]); break;                  // I2F
-                    case 0x2F: stack[sp - 1] = (double) toInt(stack[sp - 1]); break;                // I2D
-                    case 0xA0: stack[sp - 1] = (int) toLong(stack[sp - 1]); break;                   // L2I
-                    case 0xA1: stack[sp - 1] = (float) toLong(stack[sp - 1]); break;                 // L2F
-                    case 0xA2: stack[sp - 1] = (double) toLong(stack[sp - 1]); break;                // L2D
-                    case 0xA3: stack[sp - 1] = (int) toFloat(stack[sp - 1]); break;                  // F2I
-                    case 0xA4: stack[sp - 1] = (long) toFloat(stack[sp - 1]); break;                 // F2L
-                    case 0xA5: stack[sp - 1] = (double) toFloat(stack[sp - 1]); break;                // F2D
-                    case 0xA6: stack[sp - 1] = (int) toDouble(stack[sp - 1]); break;                 // D2I
-                    case 0xA7: stack[sp - 1] = (long) toDouble(stack[sp - 1]); break;                // D2L
-                    case 0xA8: stack[sp - 1] = (float) toDouble(stack[sp - 1]); break;                // D2F
-                    case 0xA9: stack[sp - 1] = (byte) toInt(stack[sp - 1]); break;                   // I2B
-                    case 0xAA: stack[sp - 1] = (char) toInt(stack[sp - 1]); break;                    // I2C
-                    case 0xAB: stack[sp - 1] = (short) toInt(stack[sp - 1]); break;                  // I2S
-
-                    // --- Long arithmetic ---
-                    case 0xAC: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = (a == b ? 0 : (a < b ? -1 : 1)); break; } // LCMP
-                    case 0xAD: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a + b; break; } // LADD
-                    case 0xAE: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a - b; break; } // LSUB
-                    case 0xAF: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a * b; break; } // LMUL
-                    case 0xB0: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a / b; break; } // LDIV
-                    case 0xB1: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a % b; break; } // LREM
-                    case 0xB2: { long a = toLong(stack[--sp]); stack[sp++] = -a; break; }            // LNEG
-                    case 0xB3: { int b = toInt(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a << b; break; } // LSHL
-                    case 0xB4: { int b = toInt(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a >> b; break; } // LSHR
-                    case 0xB5: { int b = toInt(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a >>> b; break; } // LUSHR
-                    case 0xB6: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a & b; break; } // LAND
-                    case 0xB7: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a | b; break; } // LOR
-                    case 0xB8: { long b = toLong(stack[--sp]); long a = toLong(stack[--sp]); stack[sp++] = a ^ b; break; } // LXOR
-
-                    // --- Float/double arithmetic ---
-                    case 0xB9: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = a + b; break; } // FADD
-                    case 0xBA: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = a - b; break; } // FSUB
-                    case 0xBB: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = a * b; break; } // FMUL
-                    case 0xBC: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = a / b; break; } // FDIV
-                    case 0xBD: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = a % b; break; } // FREM
-                    case 0xBE: { float a = toFloat(stack[--sp]); stack[sp++] = -a; break; }           // FNEG
-                    case 0xBF: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = a + b; break; } // DADD
-                    case 0xC0: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = a - b; break; } // DSUB
-                    case 0xC1: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = a * b; break; } // DMUL
-                    case 0xC2: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = a / b; break; } // DDIV
-                    case 0xC3: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = a % b; break; } // DREM
-                    case 0xC4: { double a = toDouble(stack[--sp]); stack[sp++] = -a; break; }         // DNEG
-                    case 0xC5: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = Float.compare(a, b); break; } // FCMPL
-                    case 0xC6: { float b = toFloat(stack[--sp]); float a = toFloat(stack[--sp]); stack[sp++] = (a > b ? 1 : (a < b ? -1 : (Float.isNaN(a) || Float.isNaN(b) ? 1 : 0))); break; } // FCMPG
-                    case 0xC7: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = Double.compare(a, b); break; } // DCMPL
-                    case 0xC8: { double b = toDouble(stack[--sp]); double a = toDouble(stack[--sp]); stack[sp++] = (a > b ? 1 : (a < b ? -1 : (Double.isNaN(a) || Double.isNaN(b) ? 1 : 0))); break; } // DCMPG
-
-                    case 0x30: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) == 0) pc = t; break; } // IFEQ
-                    case 0x31: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) != 0) pc = t; break; } // IFNE
-                    case 0x32: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) <  0) pc = t; break; } // IFLT
-                    case 0x33: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) >= 0) pc = t; break; } // IFGE
-                    case 0x34: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) >  0) pc = t; break; } // IFGT
-                    case 0x35: { int t = m.i4(pc); pc += 4; if (toInt(stack[--sp]) <= 0) pc = t; break; } // IFLE
-                    case 0x36: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a == b) pc = t; break; }
-                    case 0x37: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a != b) pc = t; break; }
-                    case 0x38: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a <  b) pc = t; break; }
-                    case 0x39: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a >= b) pc = t; break; }
-                    case 0x3A: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a >  b) pc = t; break; }
-                    case 0x3B: { int t = m.i4(pc); pc += 4; int b = toInt(stack[--sp]); int a = toInt(stack[--sp]); if (a <= b) pc = t; break; }
-                    case 0x3C: { int t = m.i4(pc); pc += 4; if (stack[--sp] == null) pc = t; break; }
-                    case 0x3D: { int t = m.i4(pc); pc += 4; if (stack[--sp] != null) pc = t; break; }
-                    case 0x3F: { int t = m.i4(pc); pc += 4; Object b = stack[--sp]; Object a = stack[--sp]; if (a == b) pc = t; break; } // IF_ACMPEQ
-                    case 0xC9: { int t = m.i4(pc); pc += 4; Object b = stack[--sp]; Object a = stack[--sp]; if (a != b) pc = t; break; } // IF_ACMPNE
-                    case 0x3E: { int t = m.i4(pc); pc = t; break; }                         // GOTO
-
-                    case 0x40: --sp; break;                                                          // POP
-                    case 0x41: sp -= 2; break;                                                       // POP2
-                    case 0x42: stack[sp] = stack[sp - 1]; sp++; break;                              // DUP
-                    case 0x43: { Object v = stack[sp - 1]; stack[sp] = v; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = v; sp++; break; } // DUP_X1
-                    case 0xCA: { Object v = stack[sp - 1]; stack[sp] = v; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = stack[sp - 3]; stack[sp - 3] = v; sp++; break; } // DUP_X2
-                    case 0xCB: { stack[sp] = stack[sp - 1]; stack[sp + 1] = stack[sp - 2]; sp += 2; break; } // DUP2 (category 1: duplicate top two)
-                    case 0xCC: { Object v1 = stack[sp - 1]; Object v2 = stack[sp - 2]; stack[sp] = v1; stack[sp + 1] = v2; stack[sp - 1] = stack[sp - 3]; stack[sp - 2] = v1; stack[sp - 3] = v2; sp += 2; break; } // DUP2_X1
-                    case 0xCD: { Object v1 = stack[sp - 1]; Object v2 = stack[sp - 2]; stack[sp + 1] = v1; stack[sp] = v2; stack[sp - 1] = stack[sp - 3]; stack[sp - 2] = stack[sp - 4]; stack[sp - 3] = v2; stack[sp - 4] = v1; sp += 2; break; } // DUP2_X2
-                    case 0x44: { Object t = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = t; break; } // SWAP
-
-                    case 0x50: { Field f = resolveField(m, cp, m.i4(pc), true);
-                                 initClass(f.getDeclaringClass()); // GETSTATIC must initialize the class
-                                 Object gv = f.get(null);
-                                 if (System.getProperty("kbox.vmp.dbg") != null)
-                                     System.err.println("[VMPDBG] pc=" + ppc + " GETSTATIC " + f.getDeclaringClass().getSimpleName()
-                                             + "." + f.getName() + " = " + (gv == null ? "NULL" : gv.getClass().getName()));
-                                 stack[sp++] = gv; pc += 4; break; }                                 // GETSTATIC
-                    case 0x51: { Field f = resolveField(m, cp, m.i4(pc), true);
-                                 initClass(f.getDeclaringClass()); // PUTSTATIC must initialize the class
-                                 f.set(null, stack[--sp]); pc += 4; break; }                         // PUTSTATIC
-                    case 0x52: { Field f = resolveField(m, cp, m.i4(pc), false);
-                                 Object o = stack[--sp]; stack[sp++] = f.get(o); pc += 4; break; }    // GETFIELD
-                    case 0x53: { Field f = resolveField(m, cp, m.i4(pc), false);
-                                 Object v = stack[--sp]; Object o = stack[--sp]; f.set(o, v); pc += 4; break; } // PUTFIELD
-
-                    case 0x60: { // INVOKEVIRTUAL
-                        int idx = m.i4(pc); pc += 4;
-                        Method me = resolveMethod(m, cp, idx, false);
-                        Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
-                        sp -= args2.length;
-                        Object recv = stack[--sp];
-                        Object r = safeInvoke(me, recv, args2);
-                        if (me.getReturnType() != void.class) stack[sp++] = r;
-                        break;
-                    }
-                    case 0x61: { // INVOKESPECIAL (private / super / ctor)
-                        int idx = m.i4(pc); pc += 4;
-                        // Distinguish constructor vs private method via cp spec.
-                        Object spec = m.specAt(idx);
-                        if (spec instanceof String && ((String) spec).contains("#<init>#")) {
-                            Constructor<?> c = resolveCtor(m, cp, idx);
-                            Object[] args2 = popArgs(c.getParameterTypes(), stack, sp);
-                            sp -= args2.length;
-                            // The receiver is the Class marker pushed by NEW (javac/Kotlin
-                            // emit NEW;DUP;INVOKESPECIAL <init>). NEW pushed one marker and DUP
-                            // copied it, so the stack holds [.., marker0, marker1] where
-                            // marker1 (top) is the receiver. Discard the receiver and replace
-                            // the NEW slot (marker0) with the real instance, so the stack ends
-                            // up with exactly one object reference (matching JVM semantics).
-                            Object marker = stack[sp - 1];
-                            boolean duped = sp >= 2 && stack[sp - 2] == marker;
-                            stack[duped ? sp - 2 : sp - 1] = c.newInstance(coerceArgs(c.getParameterTypes(), args2));
-                            sp--; // pop the receiver
-                        } else {
-                            Method me = resolveMethod(m, cp, idx, false);
-                            Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
-                            sp -= args2.length;
-                            Object recv = stack[--sp];
-                            Object r = safeInvoke(me, recv, args2);
-                            if (me.getReturnType() != void.class) stack[sp++] = r;
-                        }
-                        break;
-                    }
-                    case 0x62: { // INVOKESTATIC
-                        int idx = m.i4(pc); pc += 4;
-                        Method me = resolveMethod(m, cp, idx, true);
-                        Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
-                        sp -= args2.length;
-                        Object r = safeInvoke(me, null, args2);
-                        if (me.getReturnType() != void.class) stack[sp++] = r;
-                        break;
-                    }
-                    case 0x63: { // INVOKEINTERFACE
-                        int idx = m.i4(pc); pc += 4;
-                        Method me = resolveMethod(m, cp, idx, false);
-                        Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
-                        sp -= args2.length;
-                        Object recv = stack[--sp];
-                        Object r = safeInvoke(me, recv, args2);
-                        if (me.getReturnType() != void.class) stack[sp++] = r;
-                        break;
-                    }
-                    case 0x70: { Class<?> c = resolveClass(m, cp, m.i4(pc)); pc += 4;
-                                 // NEW must NOT run a constructor: the old code called c.newInstance()
-                                 // here AND again in the INVOKESPECIAL <init> handler, constructing the
-                                 // object twice (and crashing when no no-arg ctor exists). Push a Class
-                                 // marker that the matching <init> consumes and replaces with the real
-                                 // instance. javac/Kotlin always emit NEW;DUP;INVOKESPECIAL <init>, so the
-                                 // marker is only ever consumed by <init>.
-                                 stack[sp++] = c; break; }                                          // NEW (push class marker)
-                    case 0x71: { int at = m.i4(pc); pc += 4;
-                                 Class<?> elem = arrayType(at); int len = toInt(stack[--sp]);
-                                 stack[sp++] = Array.newInstance(elem, len); break; }              // NEWARRAY
-                    case 0x72: { Class<?> c = resolveClass(m, cp, m.i4(pc)); pc += 4;
-                                 int len = toInt(stack[--sp]); stack[sp++] = Array.newInstance(c, len); break; } // ANEWARRAY
-                    case 0x73: { int arrDepth = sp - 1;
-                                 Object alArr = stack[arrDepth];
-                                 if (System.getProperty("kbox.vmp.dbg") != null)
-                                     System.err.println("[VMPDBG] pc=" + ppc + " ARRAYLENGTH arr="
-                                             + (alArr == null ? "NULL" : alArr.getClass().getName())
-                                             + " sp=" + sp + " locals4=" + (m.maxLocals > 4 ? locals[4] : "x")
-                                             + " locals5=" + (m.maxLocals > 5 ? locals[5] : "x"));
-                                 stack[arrDepth] = Array.getLength(alArr); break; }                  // ARRAYLENGTH (pop then push)
-                    case 0x74: { int i = toInt(stack[--sp]); Object a = stack[--sp]; stack[sp++] = Array.get(a, i); break; } // AALOAD
-                    case 0x75: { int i = toInt(stack[--sp]); Object v = stack[--sp]; Object a = stack[--sp]; Array.set(a, i, v); break; } // AASTORE
-                    case 0x76: { int i = toInt(stack[--sp]); Object a = stack[--sp]; stack[sp++] = Array.getInt(a, i); break; } // IALOAD
-                    case 0x77: { int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp]; Array.setInt(a, i, v); break; } // IASTORE
-                    case 0x7A: { int i = toInt(stack[--sp]); Object a = stack[--sp]; stack[sp++] = Array.getByte(a, i); break; } // BALOAD
-                    case 0x7B: { int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp]; Array.setByte(a, i, (byte) v); break; } // BASTORE
-                    case 0x7C: { int i = toInt(stack[--sp]); Object a = stack[--sp]; stack[sp++] = Array.getChar(a, i); break; } // CALOAD
-                    case 0x7D: { int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp]; Array.setChar(a, i, (char) v); break; } // CASTORE
-                    case 0x7E: { int i = toInt(stack[--sp]); Object a = stack[--sp]; stack[sp++] = Array.getShort(a, i); break; } // SALOAD
-                    case 0x7F: { int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp]; Array.setShort(a, i, (short) v); break; } // SASTORE
-                    case 0x78: { Class<?> c = resolveClass(m, cp, m.i4(pc)); pc += 4;
-                                 stack[sp - 1] = c.cast(stack[sp - 1]); break; }                     // CHECKCAST
-                    case 0x79: { Class<?> c = resolveClass(m, cp, m.i4(pc)); pc += 4;
-                                 stack[sp - 1] = c.isInstance(stack[sp - 1]); break; }              // INSTANCEOF
-
-                    case 0x80: { Object o = stack[sp - 1]; enterMonitor(o); break; }                // MONITORENTER
-                    case 0x81: { Object o = stack[--sp]; exitMonitor(o); break; }                   // MONITOREXIT
-
-                    case 0x82: throw (Throwable) stack[--sp];                                       // ATHROW
-
-                    case 0x90: { int iv = toInt(stack[--sp]); return boxIntReturn(m, iv); }   // IRETURN
-                    case 0x91: return stack[--sp];                                                   // LRETURN
-                    case 0x92: return stack[--sp];                                                   // FRETURN
-                    case 0x93: return stack[--sp];                                                   // DRETURN
-                    case 0x94: return stack[--sp];                                                   // ARETURN
-                    case 0x95: return null;                                                          // RETURN
-
-                    case 0xFF: return null;                                                          // END
-                    default:
-                        throw new RuntimeException("VMP: unknown opcode 0x"
-                                + Integer.toHexString(op) + " @ " + ppc);
+                Handler h = runHandlers[R[slot]];
+                if (h == null) {
+                    // Slot is unassigned → the stored byte decodes to an unknown opcode.
+                    // In a closed state machine this is identity-independent: we neither
+                    // reconstruct nor display the real VmpOp.
+                    throw new RuntimeException("KBox");
                 }
+                if (h.run(ctx)) {
+                    return ctx.retValue;   // *RETURN / END
+                }
+                continue;
+                // (The old static switch is superseded; semantics now live in OP_HANDLER.)
             }
-        } catch (Throwable t) {
+            } catch (Throwable t) {
+            // A method invoked via the interpreter (INVOKE*/safeInvoke reflection) surfaces
+            // checked exceptions wrapped in InvocationTargetException. The caller's exception
+            // table matches against the REAL thrown type (e.g. IllegalArgumentException), so
+            // unwrap the reflection wrapper before matching — this is exactly the semantics a
+            // direct, non-reflective call would have produced.
+            Throwable unwrapped = t;
+            while (unwrapped instanceof InvocationTargetException && unwrapped.getCause() != null) {
+                unwrapped = unwrapped.getCause();
+            }
             // Consult the exception table.
+            boolean excHandled = false;
             if (m.exceptions != null) {
                 for (int[] row : m.exceptions) {
                     if (ppc >= row[0] && ppc < row[1]) {
                         Class<?> catchType = row[3] >= 0
                                 ? resolveClass(m, cp, row[3]) : Throwable.class;
-                        if (catchType.isInstance(t)) {
-                            // Clear operand stack, push the exception, jump.
-                            sp = 0;
-                            stack[sp++] = t;
-                            pc = row[2];
-                            continue;
+                        if (catchType.isInstance(unwrapped)) {
+                            // Clear operand stack, push the exception, jump to handler
+                            // and re-enter the dispatch loop THERE.
+                            ctx.sp = 0;
+                            ctx.stack[ctx.sp++] = unwrapped;
+                            ctx.pc = row[2];
+                            excHandled = true;
+                            break;
                         }
                     }
                 }
             }
-            throw t;
-        } finally {
+            if (excHandled) { resumeDispatch = true; }
+            else throw unwrapped;
+            } finally {
             // VortexVM/L1 rolling-window: nothing to wipe — no full plaintext
             // buffer was ever created; only the intact ciphertext remains.
-        }
+            }
+        } while (resumeDispatch);
+        return null;          // unreachable: while (true) above always returns; satisfies definite-return
     }
 
     // --- helpers ---
@@ -1035,10 +1323,24 @@ public final class VmpInterpreter {
         try {
             return me.invoke(recv, coerceArgs(me.getParameterTypes(), args));
         } catch (IllegalArgumentException e) {
-            System.err.println("[VMPDBG] safeInvoke failed: " + me + " recv="
-                    + (recv == null ? "null" : recv.getClass().getName())
-                    + " declaringClass=" + me.getDeclaringClass().getName());
-            throw e;
+            // Diagnostic for native-interpreter faults: name the exact method and
+            // the declared-vs-actual type of every argument so a "argument type
+            // mismatch" can be pinned to one operand without a debugger.
+            StringBuilder sb = new StringBuilder("VMP: invoke type mismatch on ")
+                    .append(me.getDeclaringClass().getName()).append('#')
+                    .append(me.getName()).append(me.toGenericString());
+            sb.append(" recv=").append(recv == null ? "null" : recv.getClass().getName());
+            Class<?>[] pts = me.getParameterTypes();
+            for (int i = 0; i < args.length; i++) {
+                sb.append(" arg").append(i).append("[decl=")
+                        .append(i < pts.length ? pts[i].getName() : "?")
+                        .append(",got=")
+                        .append(args[i] == null ? "null" : args[i].getClass().getName())
+                        .append(']');
+            }
+            RuntimeException diag = new RuntimeException(sb.toString(), e);
+            diag.setStackTrace(e.getStackTrace());
+            throw diag;
         }
     }
 
@@ -1168,5 +1470,284 @@ public final class VmpInterpreter {
             case 11: return long.class;
             default: throw new RuntimeException("VMP: bad newarray code " + code);
         }
+    }
+
+    /* =====================================================================
+     * Native interpreter bridge (VM原生化 / Layer 4).
+     *
+     * These <code>nl*</code> helpers are invoked from the optional C-native
+     * VMP interpreter (kbox_vmp_core.c) via ordinary JNI static calls. They
+     * reproduce the EXACT bodies of the object-model micro-op handlers above,
+     * so the native path observes byte-identical semantics to the Java
+     * interpreter. Each helper:
+     *   - reads pc/sp from the shared <code>long[] cpu</code> ({cpu[0],cpu[1]}),
+     *   - reads operands from the resident stream via m.i4(pc)/m.u2(pc),
+     *   - mutates the shared Object[] operand stack (and locals, where used),
+     *   - writes back cpu[0]=pc, cpu[1]=sp, and sets cpu[2]=1 when the method
+     *     must unwind (a *RETURN ran).
+     * Exceptions propagate to the C side (ExceptionCheck after each
+     * CallStatic*Method), which unwinds and lets the Java seam fall back to the
+     * byte-identical Java interpreter. Return convention: 0 = continue, and any
+     * thrown Throwable aborts the native frame (safe degradation).
+     * ===================================================================== */
+
+    /** GETSTATIC: resolve static field, init owning class, push value. */
+    static int nlGetStatic(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        Field f = resolveField(m, m.cp, m.i4(pc), true);
+        initClass(f.getDeclaringClass());
+        Object gv = f.get(null);
+        stack[sp++] = gv; pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** PUTSTATIC: resolve static field, init owning class, store popped value. */
+    static int nlPutStatic(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        Field f = resolveField(m, m.cp, m.i4(pc), true);
+        initClass(f.getDeclaringClass());
+        f.set(null, coerceFieldValue(f, stack[--sp])); pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** GETFIELD: pop objectref, push f.get(objref). */
+    static int nlGetField(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        Field f = resolveField(m, m.cp, m.i4(pc), false);
+        Object o = stack[--sp];
+        stack[sp++] = f.get(o); pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** PUTFIELD: pop objectref,value; f.set(objref,value). */
+    static int nlPutField(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        Field f = resolveField(m, m.cp, m.i4(pc), false);
+        Object v = stack[--sp]; Object o = stack[--sp];
+        f.set(o, coerceFieldValue(f, v)); pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /**
+     * Coerces a boxed stack value to the field's declared type before
+     * {@code Field.set}. The JVM executes boolean/byte/char/short field writes
+     * with int-typed stack values (0/1, or the raw byte/char/short), which the
+     * interpreter boxes as {@code Integer}; passing that Integer straight to
+     * {@code Field.set} on a non-int field throws IllegalArgumentException
+     * ("Can not set boolean field X to java.lang.Integer"). Boolean fields also
+     * arrive as {@code Boolean} when the producer was itself a boolean-typed
+     * read, so each primitive type accepts both its own box and the int/Number
+     * form. Reference values pass through untouched.
+     */
+    private static Object coerceFieldValue(Field f, Object v) {
+        Class<?> t = f.getType();
+        if (v == null) return null;
+        if (t == boolean.class) {
+            return v instanceof Boolean ? v : Boolean.valueOf(((Number) v).intValue() != 0);
+        }
+        if (t == byte.class) {
+            return v instanceof Byte ? v : (byte) ((Number) v).intValue();
+        }
+        if (t == char.class) {
+            return v instanceof Character ? v : (char) ((Number) v).intValue();
+        }
+        if (t == short.class) {
+            return v instanceof Short ? v : (short) ((Number) v).intValue();
+        }
+        if (t == int.class) {
+            return v instanceof Integer ? v : ((Number) v).intValue();
+        }
+        if (t == long.class) {
+            return v instanceof Long ? v : ((Number) v).longValue();
+        }
+        if (t == float.class) {
+            return v instanceof Float ? v : ((Number) v).floatValue();
+        }
+        if (t == double.class) {
+            return v instanceof Double ? v : ((Number) v).doubleValue();
+        }
+        return v;
+    }
+
+    /** INVOKE* kind: 0=virtual,1=special,2=static,3=interface. */
+    static int nlInvoke(VmpMethod m, Object[] stack, Object[] locals, long[] cpu, int kind) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        int idx = m.i4(pc); pc += 4;
+        if (kind == 1) {                                     // INVOKESPECIAL (ctor or super)
+            Object spec = m.specAt(idx);
+            if (spec instanceof String && ((String) spec).contains("#<init>#")) {
+                Constructor<?> ctor = resolveCtor(m, m.cp, idx);
+                Object[] args2 = popArgs(ctor.getParameterTypes(), stack, sp);
+                sp -= args2.length;
+                Object marker = stack[sp - 1];
+                boolean duped = sp >= 2 && stack[sp - 2] == marker;
+                stack[duped ? sp - 2 : sp - 1] =
+                        ctor.newInstance(coerceArgs(ctor.getParameterTypes(), args2));
+                sp--;
+            } else {
+                Method me = resolveMethod(m, m.cp, idx, false);
+                Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
+                sp -= args2.length;
+                Object recv = stack[--sp];
+                Object r = safeInvoke(me, recv, args2);
+                if (me.getReturnType() != void.class) stack[sp++] = r;
+            }
+        } else {
+            boolean isStatic = (kind == 2);
+            Method me = resolveMethod(m, m.cp, idx, isStatic);
+            int nArgs = me.getParameterTypes().length;
+            int needed = nArgs + (isStatic ? 0 : 1);
+            if (sp < needed) {
+                throw new RuntimeException("VMP: nlInvoke operand stack underflow (kind="
+                        + kind + " pc=" + pc + " sp=" + sp + " needed=" + needed + ")");
+            }
+            Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
+            sp -= args2.length;
+            Object recv = isStatic ? null : stack[--sp];
+            Object r = safeInvoke(me, recv, args2);
+            if (me.getReturnType() != void.class) stack[sp++] = r;
+        }
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** NEW: push class marker (allocation happens at the matching #<init># invoke). */
+    static int nlNew(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        stack[sp++] = resolveClass(m, m.cp, m.i4(pc)); pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** NEWARRAY mode=1 (prim array-code), ANEWARRAY mode=0 (ref type cp idx). */
+    static int nlNewArray(VmpMethod m, Object[] stack, Object[] locals, long[] cpu, int mode) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        Class<?> el = (mode == 1) ? arrayType(m.i4(pc)) : resolveClass(m, m.cp, m.i4(pc));
+        pc += 4;
+        int len = toInt(stack[--sp]);
+        stack[sp++] = Array.newInstance(el, len);
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** Array micro-ops. gs: 0=load,1=store. op: 0=arraylength,1=ref,2=int,3=byte,4=char,5=short. */
+    static int nlArrayIndex(VmpMethod m, Object[] stack, long[] cpu, int gs, int op) throws Throwable {
+        int sp = (int) cpu[1];
+        if (op == 0) {                                       // ARRAYLENGTH
+            stack[sp - 1] = Array.getLength(stack[sp - 1]);
+            cpu[1] = sp; return 0;
+        }
+        if (gs == 0) {                                       // xALOAD
+            int i = toInt(stack[--sp]); Object a = stack[--sp];
+            Object r;
+            if (op == 1) r = Array.get(a, i);
+            else if (op == 2) r = Array.getInt(a, i);
+            else if (op == 3) r = Array.getByte(a, i);
+            else if (op == 4) r = Array.getChar(a, i);
+            else r = Array.getShort(a, i);
+            stack[sp++] = r;
+        } else {                                             // xASTORE
+            if (op == 1) {
+                Object v = stack[--sp]; int i = toInt(stack[--sp]); Object a = stack[--sp];
+                Array.set(a, i, v);
+            } else if (op == 2) {
+                int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp];
+                Array.setInt(a, i, v);
+            } else if (op == 3) {
+                int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp];
+                Array.setByte(a, i, (byte) v);
+            } else if (op == 4) {
+                int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp];
+                Array.setChar(a, i, (char) v);
+            } else {
+                int v = toInt(stack[--sp]); int i = toInt(stack[--sp]); Object a = stack[--sp];
+                Array.setShort(a, i, (short) v);
+            }
+        }
+        cpu[1] = sp; return 0;
+    }
+
+    /** CHECKCAST: resolve class, cast top of stack (ClassCastException on failure). */
+    static int nlCheckCast(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0];
+        Class<?> cc = resolveClass(m, m.cp, m.i4(pc)); pc += 4;
+        int sp = (int) cpu[1];
+        stack[sp - 1] = cc.cast(stack[sp - 1]);
+        cpu[0] = pc; return 0;
+    }
+
+    /** INSTANCEOF: resolve class, replace top with boolean. */
+    static int nlInstanceOf(VmpMethod m, Object[] stack, Object[] locals, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0];
+        Class<?> cc = resolveClass(m, m.cp, m.i4(pc)); pc += 4;
+        int sp = (int) cpu[1];
+        stack[sp - 1] = cc.isInstance(stack[sp - 1]);
+        cpu[0] = pc; return 0;
+    }
+
+    /** LDC string (real op 0x06) / class (real op 0x07). Reconstructs the real
+     *  opcode from twin ^ resident (same machinery as the Java dispatch error path). */
+    static int nlResolve(VmpMethod m, Object[] stack, long[] cpu) throws Throwable {
+        int pc = (int) cpu[0], sp = (int) cpu[1];
+        int raw = m.b(pc - 1);
+        int op = m.invPerm[(m.twin ^ raw) & 0xFF];
+        if (op == 0x07) stack[sp++] = resolveClass(m, m.cp, m.i4(pc));
+        else            stack[sp++] = resolveString(m, m.cp, m.i4(pc));
+        pc += 4;
+        cpu[0] = pc; cpu[1] = sp; return 0;
+    }
+
+    /** MONITOR: kind 0=enter,1=exit,2=ATHROW (throws). */
+    static int nlMonitor(VmpMethod m, Object[] stack, Object[] locals, long[] cpu, int kind) throws Throwable {
+        int sp = (int) cpu[1];
+        if (kind == 2) throw (Throwable) stack[--sp];        // ATHROW
+        if (kind == 1) exitMonitor(stack[--sp]);              // MONITOREXIT
+        else           enterMonitor(stack[sp - 1]);           // MONITORENTER (no pop)
+        cpu[1] = sp; return 0;
+    }
+
+    /** Native-interpreter exception dispatch. Called by kbox_vmp_core.c when a
+     *  helper surfaces a pending JNI exception: consults THIS method's exception
+     *  table for a handler covering {@code opcodePc}. On a hit it clears the
+     *  operand stack, pushes the (unwrapped) exception and jumps to the handler,
+     *  returning 1 so the C loop resumes dispatch there. On a miss it returns 0
+     *  so the C loop re-raises the original exception for the invoking context.
+     *  Mirrors the Java-fallback interpreter's post-dispatch catch (which unwraps
+     *  InvocationTargetException) so native execution honors try/catch exactly. */
+    static int nlTryCatch(VmpMethod m, Object[] stack, long[] cpu, Object exc, int opcodePc) {
+        Throwable t = unwrapException(exc);
+        if (m.exceptions != null) {
+            for (int[] row : m.exceptions) {
+                if (opcodePc >= row[0] && opcodePc < row[1]) {
+                    Class<?> catchType = row[3] >= 0
+                            ? resolveClass(m, m.cp, row[3]) : Throwable.class;
+                    if (catchType.isInstance(t)) {
+                        stack[0] = t;                       // push exception at sp=0
+                        cpu[0] = row[2];                    // jump to handler pc
+                        cpu[1] = 1;                         // clear operand stack
+                        return 1;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    /** Strips reflection wrappers to reveal the exception the caller's table binds to. */
+    private static Throwable unwrapException(Object exc) {
+        Throwable t = (exc instanceof Throwable) ? (Throwable) exc : new RuntimeException("KBox");
+        while (t instanceof InvocationTargetException && t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t;
+    }
+
+    /** *RETURN: kind 0=I,1=L,2=F,3=D,4=A,5=void. Leaves the (boxed) result at the
+     *  top of the operand stack and sets cpu[2]=1 (unwind) so the C epilogue,
+     *  which reads stack[cpu[1]-1], recovers it. IRETURN re-boxes per retSort. */
+    static int nlReturn(VmpMethod m, Object[] stack, Object[] locals, long[] cpu, int kind) {
+        int sp = (int) cpu[1];
+        if (kind == 0) {                                     // IRETURN: re-box sub-int types
+            stack[sp - 1] = boxIntReturn(m, toInt(stack[sp - 1]));
+        }
+        cpu[2] = 1;
+        return 0;
     }
 }

@@ -4,6 +4,7 @@ import com.kbox.core.KBoxException;
 import com.kbox.core.analysis.ClassGraph;
 import com.kbox.core.config.ProtectionConfig;
 import com.kbox.core.log.KBoxLog;
+import com.kbox.runtime.KbnlKey;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -110,6 +111,22 @@ public final class AesStringEncryptor {
     private final AtomicInteger nextId = new AtomicInteger();
     private final AtomicInteger encrypted = new AtomicInteger();
 
+    // ---- S7: 字符串密钥 KBNL 会话绑定 ----
+    // 现状：256 字节表 T 以 static final byte[] 明文落 holder 的 <clinit>，
+    // 反编译器/静态扫描可直接读出密钥材料。
+    // 修复：构建期用 KbnlKey.derive(D, S)（硬件指纹绑定的确定性派生，与 KBNL
+    // blob 密钥同源、同机部署模型）把 T 盲化为 T'(i)=T(i)^K(i mod 32) 落 holder；
+    // 运行期 holder <clinit> 先 derive(D,S) 重建 K，再 XOR 还原 T。静态拿到 holder
+    // 只看到盲化字节和常数，无法不经 KbnlKey 直接恢复密钥。
+    //
+    // 硬约束遵守：不混入 sessionEpoch/perRun 因子（那些只进 ephemeralKey），
+    // derive() 是确定性稳定键（build↔run 同机一致）；一处独立 domain tag 只
+    // 消耗 A8 K_USE_CAP(16) 中的 1 次，合法进程不越线。
+    /** Dedicated KbnlKey domain tag for the string-key material (gorge from blobs). */
+    private int strDomainTag;
+    /** Random 16-byte salt bound with the string-key domain tag. */
+    private byte[] strSalt;
+
     public AesStringEncryptor(ClassGraph graph, ProtectionConfig cfg) {
         this.graph = graph;
         this.cfg = cfg;
@@ -128,6 +145,12 @@ public final class AesStringEncryptor {
         decMethods = new String[variants];
         for (int i = 0; i < variants; i++) decMethods[i] = "z" + randomName(9);
         table = randomPermutation();
+        // S7: allocate a dedicated KBNL domain tag + salt for the string-key
+        // material, so the holder blinds T behind KbnlKey.derive(D,S) instead of
+        // embedding the 256-byte table in plaintext.
+        strDomainTag = KbnlKey.newDomainTag();
+        strSalt = new byte[16];
+        rng.get().nextBytes(strSalt);
         // Derive the build-time AES key = SHA-256(T); matches the holder <clinit>.
         buildKey = new SecretKeySpec(sha256(table), KEY_ALGO);
         // Pre-scan to size the per-string cache (upper bound: empty strings are
@@ -512,6 +535,13 @@ public final class AesStringEncryptor {
     @SuppressWarnings("unchecked")
     private void ensureHolder() {
         if (graph.getClasses().containsKey(holder)) return;
+        // S7 fix: derive the build-side blinding key ONCE here. The holder's
+        // <clinit> re-derives the SAME KbnlKey.derive(D,S) at run time and XORs
+        // it back out, so the embedded table must be ALREADY blinded
+        // (T'(i)=table[i]^K[i%32]). Writing the raw table here and XOR-ing at
+        // <clinit> would yield table^K at run time — never equal to the build
+        // key SHA-256(table) — and every decrypted string would be garbage.
+        byte[] kbuild = KbnlKey.derive(strDomainTag, strSalt);
         ClassNode cn = new ClassNode();
         cn.version = Opcodes.V1_8;
         cn.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
@@ -528,29 +558,64 @@ public final class AesStringEncryptor {
         cn.methods.add(ctor);
 
         // --- fields ---
-        // static final byte[] T  — 256-byte permutation (the key material).
+        // static final byte[] T  — 256-byte permutation, BLINDED by KbnlKey.derive(D,S)
+        //   (T'(i)=T(i)^K(i%32)). Not recoverable statically without KbnlKey.
         cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
                 "T", "[B", null, null));
+        // S7 domain tag + salt for KbnlKey.derive(,) unblinding.
+        cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+                "D", "I", null, null));
+        cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+                "S", "[B", null, null));
         // static SecretKeySpec _key — derived in <clinit>.
         cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                 "_key", "Ljavax/crypto/spec/SecretKeySpec;", null, null));
         // static volatile boolean _init — set true once <clinit> completes.
         cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_VOLATILE,
                 "_init", "Z", null, null));
-        // static String[] _cache — per-string-id lazy decrypt cache.
+        // static WeakReference<String>[] _cache — per-string-id lazy decrypt cache.
+        // Weak references + in-decryptor plaintext wipe (L6): a decrypted string is
+        // only weakly held, so it does NOT reside strongly in memory once the caller
+        // drops it; the GC reclaims it, and the intermediate plaintext byte[] is
+        // zeroed before returning. No full plaintext set persists.
         cn.fields.add(new FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
-                "_cache", "[Ljava/lang/String;", null, null));
+                "_cache", "[Ljava/lang/ref/WeakReference;", null, null));
 
-        // --- <clinit>: fill T, derive _key = SecretKeySpec(SHA-256(T)), alloc _cache ---
+        // --- <clinit>: D=tag; S=salt; K=KbnlKey.derive(D,S); T(i)=T'(i)^K(i%32);
+        //               derive _key=SecretKeySpec(SHA-256(T)); alloc _cache ---
         MethodNode clinit = new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
         InsnList cl = clinit.instructions;
-        // T = new byte[256]; T[i] = table[i]
+        // D = strDomainTag
+        pushInt(cl, strDomainTag);
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "D", "I"));
+        // S = strSalt
+        pushInt(cl, strSalt.length);
+        cl.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
+        for (int i = 0; i < strSalt.length; i++) {
+            cl.add(new InsnNode(Opcodes.DUP));
+            pushInt(cl, i);
+            pushByte(cl, strSalt[i]);
+            cl.add(new InsnNode(Opcodes.BASTORE));
+        }
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "S", "[B"));
+        // K = KbnlKey.derive(D, S)   -> local0 (byte[32], deterministic hardware-bound)
+        cl.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "D", "I"));
+        cl.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "S", "[B"));
+        cl.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "com/kbox/runtime/KbnlKey",
+                "derive", "(I[B)[B", false));
+        cl.add(new VarInsnNode(Opcodes.ASTORE, 0));
+        // T = new byte[256]; T[i] = table[i] ^ K[i % 32]   (data already blinded)
         pushInt(cl, 256);
         cl.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
         for (int i = 0; i < 256; i++) {
             cl.add(new InsnNode(Opcodes.DUP));
             pushInt(cl, i);
-            pushByte(cl, table[i]);
+            pushByte(cl, (byte) (table[i] ^ kbuild[i % 32]));   // blinded at build time
+            // K[i % 32]
+            cl.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            pushInt(cl, i % 32);
+            cl.add(new InsnNode(Opcodes.BALOAD));
+            cl.add(new InsnNode(Opcodes.IXOR));
             cl.add(new InsnNode(Opcodes.BASTORE));
         }
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "T", "[B"));
@@ -571,16 +636,16 @@ public final class AesStringEncryptor {
         cl.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
                 "javax/crypto/spec/SecretKeySpec", "<init>", "([BLjava/lang/String;)V", false));
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_key", "Ljavax/crypto/spec/SecretKeySpec;"));
-        // _cache = new String[cacheSize]
+        // _cache = new WeakReference[cacheSize]
         pushInt(cl, cacheSize);
-        cl.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/String"));
-        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_cache", "[Ljava/lang/String;"));
+        cl.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/ref/WeakReference"));
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_cache", "[Ljava/lang/ref/WeakReference;"));
         // _init = true
         cl.add(new InsnNode(Opcodes.ICONST_1));
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_init", "Z"));
         cl.add(new InsnNode(Opcodes.RETURN));
-        clinit.maxStack = 4;
-        clinit.maxLocals = 1;
+        clinit.maxStack = 6;
+        clinit.maxLocals = 2;
         cn.methods.add(clinit);
 
         // --- decryptor variants ---
@@ -609,17 +674,26 @@ public final class AesStringEncryptor {
         MethodNode dec = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                 decName, DEC_DESC, null, null);
         InsnList d = new InsnList();
-        // locals: 0=enc, 1=id, 2=cached, 3=iv, 4=cipher, 5=pt, 6=result, 7=exc
+        // locals: 0=enc, 1=id, 2=wr, 3=iv, 4=cipher, 5=pt, 6=result, 7=exc, 8=cached
+        String CACHE = "[Ljava/lang/ref/WeakReference;";
 
-        // === cache check: if (_cache[id] != null) return _cache[id] ===
-        d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_cache", "[Ljava/lang/String;"));
+        // === cache check (weak): wr = _cache[id]; if (wr != null) { cached=(String)wr.get();
+        //       if (cached != null) return cached; }  — a reclaimed entry simply re-decrypts ===
+        d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_cache", CACHE));
         d.add(new VarInsnNode(Opcodes.ILOAD, 1));
         d.add(new InsnNode(Opcodes.AALOAD));
-        d.add(new VarInsnNode(Opcodes.ASTORE, 2));       // cached = _cache[id]
-        d.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        d.add(new VarInsnNode(Opcodes.ASTORE, 2));       // wr = _cache[id]
         LabelNode notCached = new LabelNode();
+        d.add(new VarInsnNode(Opcodes.ALOAD, 2));
         d.add(new JumpInsnNode(Opcodes.IFNULL, notCached));
         d.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        d.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/ref/WeakReference", "get",
+                "()Ljava/lang/Object;", false));
+        d.add(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/String"));
+        d.add(new VarInsnNode(Opcodes.ASTORE, 8));       // cached
+        d.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        d.add(new JumpInsnNode(Opcodes.IFNULL, notCached));
+        d.add(new VarInsnNode(Opcodes.ALOAD, 8));
         d.add(new InsnNode(Opcodes.ARETURN));            // return cached
 
         d.add(notCached);
@@ -687,11 +761,22 @@ public final class AesStringEncryptor {
                 "<init>", "([BLjava/nio/charset/Charset;)V", false));
         d.add(new VarInsnNode(Opcodes.ASTORE, 6));         // result
 
-        // _cache[id] = result
-        d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_cache", "[Ljava/lang/String;"));
+        // _cache[id] = new WeakReference(result)
+        d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_cache", CACHE));
         d.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        d.add(new TypeInsnNode(Opcodes.NEW, "java/lang/ref/WeakReference"));
+        d.add(new InsnNode(Opcodes.DUP));
         d.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        d.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/ref/WeakReference",
+                "<init>", "(Ljava/lang/Object;)V", false));
         d.add(new InsnNode(Opcodes.AASTORE));
+
+        // === L6 wipe: Arrays.fill(pt, (byte)0) — zero the plaintext source BEFORE the
+        //     String escapes, so the byte-level plaintext never persists after use. ===
+        d.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        d.add(new InsnNode(Opcodes.ICONST_0));
+        d.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Arrays", "fill",
+                "([BB)V", false));
 
         // return result
         d.add(new VarInsnNode(Opcodes.ALOAD, 6));
@@ -721,7 +806,8 @@ public final class AesStringEncryptor {
 
         dec.instructions = d;
         dec.maxStack = 6;
-        dec.maxLocals = 8;
+        // locals 0..8 (incl. weak-ref cached slot); 9 total.
+        dec.maxLocals = 9;
         // Catch-all handler covering the decrypt body: any Throwable -> noise.
         dec.tryCatchBlocks.add(new TryCatchBlockNode(tryStart, tryEnd, handler, null));
         return dec;

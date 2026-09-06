@@ -51,7 +51,8 @@ public final class NativeCryptoBuilder {
         try {
             Path cDir = workDir.resolve("kbox-ncrypto-src");
             Files.createDirectories(cDir);
-            Path cSrc = NativeCompiler.writeSource(cDir, "kbox_vmp_crypto", readResource(C_RESOURCE));
+            Path cSrc = NativeCompiler.writeSource(cDir, "kbox_vmp_crypto",
+                    com.kbox.core.nativeshell.NativeShellGuard.guardSource(readResource(C_RESOURCE)));
             NativeCompiler.Result cres = new NativeCompiler(cfg.getCc()).compile(cSrc, cDir, LIB_NAME);
             if (!cres.success) {
                 KBoxLog.warn(TAG, "native crypto build skipped (compiler unavailable/failed), "

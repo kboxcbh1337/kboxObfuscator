@@ -7,18 +7,19 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
-import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LineNumberNode;
+import org.objectweb.asm.tree.LookupSwitchInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
-import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -93,8 +94,10 @@ public final class MethodObfuscator {
                 AbstractInsnNode next = ins.getNext();
                 if (ins instanceof MethodInsnNode) {
                     MethodInsnNode mi = (MethodInsnNode) ins;
-                    // Only same-class, non-constructor calls.
-                    if (!mi.owner.equals(cn.name) || mi.name.equals("<init>")) {
+                    // Only same-class, non-constructor, static calls: instance
+                    // inlining would need receiver stack re-arrangement.
+                    if (mi.getOpcode() != Opcodes.INVOKESTATIC
+                            || !mi.owner.equals(cn.name) || mi.name.equals("<init>")) {
                         ins = next; continue;
                     }
                     MethodNode callee = byKey.get(mi.name + mi.desc);
@@ -111,47 +114,50 @@ public final class MethodObfuscator {
         return count;
     }
 
-    /** A method is inlinable if it has no try/catch, no <this> use, no sync,
-     *  and a body under the size limit with a single return. */
+    /** A method is inlinable only if it is straight-line: no branches, no
+     *  switches, no try/catch, no synchronized, no allocations, no nested
+     *  calls, and a single return. This guarantees the inlined copy is a
+     *  linear argument→operation→return sequence with no label/jump to remap
+     *  and no local-variable-dependent control flow. */
     private static boolean isTrivial(MethodNode m) {
         if (m.instructions == null || m.instructions.size() == 0) return false;
         if (m.tryCatchBlocks != null && !m.tryCatchBlocks.isEmpty()) return false;
         if ((m.access & Opcodes.ACC_SYNCHRONIZED) != 0) return false;
         if (m.instructions.size() > MAX_INLINE_BYTECODE) return false;
-        // Must not allocate, not call other methods, not use arrays, etc.
         int returns = 0;
+        int labels = 0;
         for (AbstractInsnNode ins : m.instructions) {
             int op = ins.getOpcode();
             if (op == Opcodes.NEW || op == Opcodes.NEWARRAY
                     || op == Opcodes.ANEWARRAY || op == Opcodes.MULTIANEWARRAY) return false;
             if (ins instanceof MethodInsnNode) return false; // no nested calls
             if (op == Opcodes.ATHROW) return false;
-            if (op == Opcodes.ALOAD || op == Opcodes.ILOAD
-                    || op == Opcodes.LLOAD || op == Opcodes.FLOAD || op == Opcodes.DLOAD) {
-                // Loading 'this' (slot 0) is allowed only for instance methods.
-                VarInsnNode v = (VarInsnNode) ins;
-                if ((m.access & Opcodes.ACC_STATIC) == 0 && v.var == 0) {
-                    // this usage — allowed (we remap to the caller's receiver)
-                }
-            }
+            if (ins instanceof JumpInsnNode
+                    || ins instanceof TableSwitchInsnNode
+                    || ins instanceof LookupSwitchInsnNode) return false;
+            if (ins instanceof LabelNode) labels++;
+            if (labels > 1) return false; // only the method-entry label allowed
             if (op >= Opcodes.IRETURN && op <= Opcodes.RETURN) returns++;
         }
         return returns == 1;
     }
 
     /**
-     * Inlines the trivial callee body into the caller at the call site.
-     * Remaps callee parameter/local slots onto fresh caller slots, and
-     * rewrites the return as a store into a fresh result slot + jump.
+     * Inlines the straight-line callee body into the caller at the call site.
+     * The call-site arguments are popped off the stack into fresh caller
+     * locals; every callee local (parameters and body temporaries) is remapped
+     * onto fresh caller slots so the caller's own locals are never clobbered;
+     * the return value is stored at the callee return then reloaded at the
+     * join point so the stack height the caller expects is preserved.
      */
     private boolean tryInline(MethodNode caller, MethodInsnNode call,
                               MethodNode callee) {
         try {
             Type[] args = Type.getArgumentTypes(call.desc);
             Type ret = Type.getReturnType(call.desc);
-            boolean isStatic = call.getOpcode() == Opcodes.INVOKESTATIC;
+            boolean hasResult = ret.getSort() != Type.VOID;
 
-            // Fresh local slots for parameters + result.
+            // Fresh caller slots for the callee's parameters.
             int base = caller.maxLocals;
             int[] paramSlots = new int[args.length];
             int slot = base;
@@ -159,55 +165,50 @@ public final class MethodObfuscator {
                 paramSlots[i] = slot;
                 slot += args[i].getSize();
             }
-            boolean hasResult = ret.getSort() != Type.VOID;
             int resultSlot = hasResult ? slot : -1;
             if (hasResult) slot += ret.getSize();
-            caller.maxLocals = slot;
+
+            // Map every callee local slot (params + body temporaries) onto
+            // fresh caller slots, so the inlined body cannot clobber the
+            // caller's own locals.
+            Map<Integer, Integer> varMap = new HashMap<>();
+            for (int i = 0; i < args.length; i++) {
+                varMap.put(calleeParamSlot(callee, i), paramSlots[i]);
+            }
+            for (AbstractInsnNode ins : callee.instructions) {
+                if (ins instanceof VarInsnNode) {
+                    int v = ((VarInsnNode) ins).var;
+                    if (!varMap.containsKey(v)) {
+                        varMap.put(v, slot++);
+                    }
+                }
+            }
+            caller.maxLocals = Math.max(caller.maxLocals, slot);
 
             // Build a remapped copy of the callee body.
             InsnList body = new InsnList();
             LabelNode join = new LabelNode();
-            // Map callee var index -> caller var index.
-            Map<Integer, Integer> varMap = new HashMap<>();
-            // For instance methods, callee slot 0 = this -> we don't inline
-            // instance methods that use 'this' heavily; simplest: only inline
-            // static zero-arg-independent or instance methods that don't touch slot 0.
-            // We'll allow slot 0 (this) to map to a fresh caller ref slot.
-            if (!isStatic) {
-                // We need the receiver. The call site has the receiver on the
-                // stack. We store it to a temp slot before the handler.
-                int thisSlot = slot++;
-                caller.maxLocals = thisSlot + 1;
-                // We cannot easily move the receiver that's already on the stack
-                // into a local in the middle; instead we require static callees
-                // for the safe path. For instance callees that don't reference
-                // this (slot 0) at all, inlining is still safe.
-                boolean usesThis = usesSlot(callee, 0);
-                if (usesThis) return false;
-                varMap.put(0, thisSlot); // unused but mapped
+
+            // The real call-site arguments are still on the JVM stack (they
+            // were pushed before the call instruction we are about to remove).
+            // Store them into the fresh locals in reverse order (top of stack
+            // is the LAST argument) before the body runs.
+            for (int ai = args.length - 1; ai >= 0; ai--) {
+                body.add(new VarInsnNode(slotToStore(args[ai]), paramSlots[ai]));
             }
 
-            // Callee param slots map to fresh slots.
-            Type[] calleeArgs = Type.getArgumentTypes(callee.desc);
-            int calleeSlot = (callee.access & Opcodes.ACC_STATIC) != 0 ? 0 : 1;
-            for (int i = 0; i < calleeArgs.length; i++) {
-                varMap.put(calleeSlot, paramSlots[i]);
-                calleeSlot += calleeArgs[i].getSize();
-            }
-
-            // Copy instructions, remapping VarInsn and return.
+            // Copy straight-line instructions with remapping; rewrite the
+            // single return as store + jump to join.
             for (AbstractInsnNode ins : callee.instructions) {
                 if (ins instanceof VarInsnNode) {
                     VarInsnNode v = (VarInsnNode) ins;
                     Integer mapped = varMap.get(v.var);
                     int newVar = mapped != null ? mapped : v.var;
                     body.add(new VarInsnNode(v.getOpcode(), newVar));
-                } else if (ins instanceof LabelNode) {
-                    // skip labels — we only have straight-line code
-                } else if (ins instanceof JumpInsnNode) {
-                    // skip (trivial methods have no meaningful jumps after checks)
-                } else if (ins instanceof MethodInsnNode) {
-                    // skipped earlier (isTrivial rejects nested calls)
+                } else if (ins instanceof LabelNode
+                        || ins instanceof FrameNode
+                        || ins instanceof LineNumberNode) {
+                    // metadata — regenerated by COMPUTE_FRAMES / serialization
                 } else if (ins.getOpcode() >= Opcodes.IRETURN && ins.getOpcode() <= Opcodes.RETURN) {
                     if (hasResult) {
                         body.add(new VarInsnNode(slotToStore(ret), resultSlot));
@@ -218,6 +219,10 @@ public final class MethodObfuscator {
                 }
             }
             body.add(join);
+            // Restore the return value onto the stack for the caller.
+            if (hasResult) {
+                body.add(new VarInsnNode(slotToLoad(ret), resultSlot));
+            }
 
             // Replace the call site with the inlined body.
             caller.instructions.insertBefore(call, body);
@@ -229,11 +234,12 @@ public final class MethodObfuscator {
         }
     }
 
-    private static boolean usesSlot(MethodNode m, int slot) {
-        for (AbstractInsnNode ins : m.instructions) {
-            if (ins instanceof VarInsnNode && ((VarInsnNode) ins).var == slot) return true;
-        }
-        return false;
+    /** Callee slot index of the i-th parameter (static methods start at 0). */
+    private static int calleeParamSlot(MethodNode m, int i) {
+        int s = (m.access & Opcodes.ACC_STATIC) != 0 ? 0 : 1;
+        Type[] ts = Type.getArgumentTypes(m.desc);
+        for (int k = 0; k < i; k++) s += ts[k].getSize();
+        return s;
     }
 
     private static int slotToStore(Type t) {
@@ -244,6 +250,17 @@ public final class MethodObfuscator {
             case Type.BOOLEAN: case Type.CHAR: case Type.BYTE:
             case Type.SHORT: case Type.INT: return Opcodes.ISTORE;
             default: return Opcodes.ASTORE;
+        }
+    }
+
+    private static int slotToLoad(Type t) {
+        switch (t.getSort()) {
+            case Type.LONG: return Opcodes.LLOAD;
+            case Type.FLOAT: return Opcodes.FLOAD;
+            case Type.DOUBLE: return Opcodes.DLOAD;
+            case Type.BOOLEAN: case Type.CHAR: case Type.BYTE:
+            case Type.SHORT: case Type.INT: return Opcodes.ILOAD;
+            default: return Opcodes.ALOAD;
         }
     }
 

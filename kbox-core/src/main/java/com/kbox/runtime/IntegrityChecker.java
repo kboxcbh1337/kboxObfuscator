@@ -62,39 +62,37 @@ public final class IntegrityChecker {
         }
     }
 
-    /** SHA-256 over all non-runtime .class entries AND META-INF entries,
-     *  sorted by name. The integrity.hash file itself is excluded to avoid
-     *  a circular dependency. META-INF entries (manifest, signatures, etc.)
-     *  are included so any tampering with the jar metadata is detected. */
+    /**
+     * SHA-256 over all non-KBox-runtime {@code .class} entries, sorted by name
+     * (name bytes then content bytes per entry).
+     *
+     * <p><b>Signature parity.</b> This must hash EXACTLY the same entry set in the
+     * exact same order/format as the build side
+     * {@code com.kbox.core.packaging.Packager#writeIntegrityHash}, otherwise an
+     * honest (untampered) jar will always look tampered. The build side hashes
+     * <em>only</em> the protected classes (all KBox runtime classes are excluded
+     * on both sides because they are injected verbatim). META-INF resources
+     * (manifest, {@code resources.map}, {@code native-crypto.bin}, {@code lic.pub},
+     * the {@code integrity.hash} file itself, signature files) are deliberately
+     * NOT hashed: they are either injected per-build or would make the digest
+     * brittle to repackaging that the class set itself would catch anyway.
+     */
     private static String hashJar(File jar) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         try (ZipFile zf = new ZipFile(jar)) {
-            // Collect entry names, sort, then hash contents in order.
             java.util.TreeSet<String> names = new java.util.TreeSet<>();
             Enumeration<? extends ZipEntry> en = zf.entries();
             while (en.hasMoreElements()) {
                 ZipEntry ze = en.nextElement();
                 String n = ze.getName();
-                // Skip the hash file itself (circular dependency)
-                if (n.equals("META-INF/kbox/integrity.hash")) continue;
-                // Skip signature files (they change when re-signing)
-                if (n.startsWith("META-INF/") && (n.endsWith(".SF")
-                        || n.endsWith(".RSA") || n.endsWith(".DSA"))) continue;
-                // Include .class files (excluding KBox runtime)
-                if (n.endsWith(".class")) {
-                    if (n.startsWith("com/kbox/runtime/")) continue;
-                    names.add(n);
-                    continue;
-                }
-                // Include META-INF entries (manifest, config, etc.)
-                if (n.startsWith("META-INF/")) {
-                    names.add(n);
-                    continue;
-                }
-                // Include other non-class resources (config files, etc.)
-                if (!n.endsWith("/")) {
-                    names.add(n);
-                }
+                if (!n.endsWith(".class")) continue;          // classes only
+                if (n.startsWith("com/kbox/runtime/")) continue; // runtime excluded
+                // Skip anti-unpack decoy "classes": Packager injects fake .class
+                // entries under META-INF/ (junk decoys) that exist on disk but are
+                // never part of the protected class set — including them would make
+                // the digest permanently mismatch the build side.
+                if (n.contains("/META-INF/")) continue;
+                names.add(n);
             }
             for (String n : names) {
                 md.update(n.getBytes(java.nio.charset.StandardCharsets.UTF_8));

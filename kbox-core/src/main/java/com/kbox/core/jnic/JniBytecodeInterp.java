@@ -22,9 +22,9 @@ public final class JniBytecodeInterp {
 
     /** Resolved constant-pool entries for one method. All use sequential 0-based keys. */
     public static final class ResolvedCP {
-        /** Class refs, keyed by sequential index. */
+        /** Class refs (incl. LDC class literals and catch types), keyed by sequential index. */
         public final Map<Integer, String> classes = new LinkedHashMap<>();
-        /** Field refs: {owner, name, desc} per sequential index. */
+        /** Field refs: {owner, name, desc, isStatic} per sequential index. */
         public final Map<Integer, String[]> fields = new LinkedHashMap<>();
         /** Method refs: {owner, name, desc, isStatic} per sequential index. */
         public final Map<Integer, String[]> methods = new LinkedHashMap<>();
@@ -32,12 +32,19 @@ public final class JniBytecodeInterp {
         public final Map<Integer, String> strings = new LinkedHashMap<>();
         /** Integer constants per sequential index. */
         public final Map<Integer, Integer> integers = new LinkedHashMap<>();
+        /** Long constants per sequential index. */
+        public final Map<Integer, Long> longs = new LinkedHashMap<>();
+        /** Double constants per sequential index. */
+        public final Map<Integer, Double> doubles = new LinkedHashMap<>();
+        /** Float constants per sequential index. */
+        public final Map<Integer, Float> floats = new LinkedHashMap<>();
         /** Invokedynamic site metadata per sequential index (see extractCP). */
         public final Map<Integer, Object[]> indies = new LinkedHashMap<>();
 
         public boolean isEmpty() {
             return classes.isEmpty() && fields.isEmpty()
                     && methods.isEmpty() && strings.isEmpty() && integers.isEmpty()
+                    && longs.isEmpty() && doubles.isEmpty() && floats.isEmpty()
                     && indies.isEmpty();
         }
     }
@@ -52,6 +59,9 @@ public final class JniBytecodeInterp {
         public final Map<String, Integer> midIdx = new LinkedHashMap<>();
         public final Map<String, Integer> strIdx = new LinkedHashMap<>();
         public final Map<Integer, Integer> intIdx = new LinkedHashMap<>();
+        public final Map<Long, Integer> longIdx = new LinkedHashMap<>();
+        public final Map<Double, Integer> doubleIdx = new LinkedHashMap<>();
+        public final Map<Float, Integer> floatIdx = new LinkedHashMap<>();
         public final Map<InvokeDynamicInsnNode, Integer> indyIdx = new LinkedHashMap<>();
     }
 
@@ -75,6 +85,20 @@ public final class JniBytecodeInterp {
     // ---- public entry point ----
 
     private static final SecureRandom RNG = new SecureRandom();
+
+    /* WIDE prefix opcode (0xC4) emitted by the serializer when a local variable
+     * index exceeds 255 or an IINC increment falls outside [-128,127]. The C
+     * interpreter (kbox_jnic_interp_v3.c) reads the widened index/incr directly. */
+    private static final int K_WIDE_OP = 0xC4;
+
+    /* LDC/LDC2_W operand tags (mirror kbox_jnic_interp_v3.c K_LDC_TAG_*). */
+    private static final int K_LDC_TAG_INT    = 0x8000;
+    private static final int K_LDC_TAG_LONG   = 0x4000;
+    private static final int K_LDC_TAG_DOUBLE = 0x2000;
+    private static final int K_LDC_TAG_FLOAT  = 0x1000;
+    private static final int K_LDC_TAG_CLASS  = 0x0800;
+    /* KBOX_CATCH_ALL sentinel for a catch-all block (0xFFFFFFFFu in C). */
+    private static final int KBOX_CATCH_ALL = 0xFFFFFFFF;
 
     /* Field separators for the packed invokedynamic metadata string consumed by
      * com.kbox.runtime.JnicIndy at runtime. Must match that class's constants. */
@@ -130,7 +154,14 @@ public final class JniBytecodeInterp {
     /**
      * Call-site descriptor → {@code { argSlotCodes, returnCode }}.
      * Slot codes mirror how the interpreter stores values on its operand stack:
-     * I (int boolean byte char short), J, F, D, or L for any object/reference.
+     * J, F, D, or L for any object/reference; int-promotable primitives keep
+     * their EXACT descriptor code (I/Z/B/C/S) because the native interpreter
+     * (kbox_jnic_interp_v3.c) must box them to their OWN wrapper for
+     * invokedynamic args — StringConcatFactory sites such as
+     * {@code makeConcatWithConstants:(Z)Ljava/lang/String;} crash with
+     * "Cannot cast java.lang.Integer to java.lang.Boolean" if a boolean arg is
+     * boxed as Integer. The interpreter stores all int-promotables in its int
+     * slot and casts per-code at boxing time, so the exact code is safe.
      */
     private static String[] sideCodes(String desc) {
         StringBuilder args = new StringBuilder();
@@ -140,19 +171,19 @@ public final class JniBytecodeInterp {
             char c = desc.charAt(k);
             if (c == 'L') { while (desc.charAt(k) != ';') k++; args.append('L'); }
             else if (c == '[') { while (desc.charAt(k) == '[') k++; if (desc.charAt(k) == 'L') while (desc.charAt(k) != ';') k++; args.append('L'); }
-            else if (c == 'I' || c == 'Z' || c == 'B' || c == 'C' || c == 'S') args.append('I');
             else if (c == 'J') args.append('J');
             else if (c == 'F') args.append('F');
             else if (c == 'D') args.append('D');
+            else args.append(c); // I / Z / B / C / S stay exact (see Javadoc)
         }
         char ret = 'L';
         if (j + 1 < desc.length()) {
             char r = desc.charAt(j + 1);
             if (r == 'V') ret = 'V';
-            else if (r == 'I' || r == 'Z' || r == 'B' || r == 'C' || r == 'S') ret = 'I';
             else if (r == 'J') ret = 'J';
             else if (r == 'F') ret = 'F';
             else if (r == 'D') ret = 'D';
+            else ret = r; // I / Z / B / C / S stay exact (native handler covers them)
         }
         return new String[]{args.toString(), String.valueOf(ret)};
     }
@@ -186,7 +217,8 @@ public final class JniBytecodeInterp {
         ResolvedCP rcp = extractCP(className, mn, idxMap);
 
         // 2. Serialise bytecode using sequential indices.
-        byte[] raw = serializeBytecode(mn, idxMap);
+        Map<LabelNode, Integer> labelOffsets = computeLabelOffsets(mn);
+        byte[] raw = serializeBytecode(mn, idxMap, labelOffsets);
         if (Boolean.getBoolean("kbox.jnic.dumpserial")) {
             StringBuilder hx = new StringBuilder("SERIAL " + className + " " + mn.name + mn.desc + ": ");
             for (byte b : raw) hx.append(String.format("%02x ", b & 0xff));
@@ -207,13 +239,16 @@ public final class JniBytecodeInterp {
         // Emit key seed as a static variable.
         String keySeedVar = "static const uint32_t " + symbol + "_key = " + keySeed + "U;\n";
 
-        // 3. Build CP arrays (already sequen tial from extractCP).
+        // 3. Build CP arrays (already sequential from extractCP).
         StringBuilder cpDecls = new StringBuilder();
         List<Integer> clsKeys = seqList(rcp.classes.size());
         List<Integer> fldKeys = seqList(rcp.fields.size());
         List<Integer> midKeys = seqList(rcp.methods.size());
         List<Integer> strKeys = seqList(rcp.strings.size());
         List<Integer> intKeys = seqList(rcp.integers.size());
+        List<Integer> longKeys = seqList(rcp.longs.size());
+        List<Integer> doubleKeys = seqList(rcp.doubles.size());
+        List<Integer> floatKeys = seqList(rcp.floats.size());
 
         // Class names.
         if (!clsKeys.isEmpty()) {
@@ -279,7 +314,38 @@ public final class JniBytecodeInterp {
         if (!intKeys.isEmpty()) {
             cpDecls.append("static const jint ").append(symbol).append("_cpint[] = { ");
             for (int i : intKeys)
-                cpDecls.append(rcp.integers.get(i)).append(", ");
+                cpDecls.append(intLit(rcp.integers.get(i))).append(", ");
+            cpDecls.append("};\n");
+        }
+        // Long constants.
+        if (!longKeys.isEmpty()) {
+            cpDecls.append("static const jlong ").append(symbol).append("_cplong[] = { ");
+            for (int i : longKeys)
+                cpDecls.append(longLit(rcp.longs.get(i))).append(", ");
+            cpDecls.append("};\n");
+        }
+        // Double constants (exact hex-float literals so bit patterns round-trip).
+        if (!doubleKeys.isEmpty()) {
+            cpDecls.append("static const jdouble ").append(symbol).append("_cpdouble[] = { ");
+            for (int i : doubleKeys)
+                cpDecls.append(doubleLit(rcp.doubles.get(i))).append(", ");
+            cpDecls.append("};\n");
+        }
+        // Float constants.
+        if (!floatKeys.isEmpty()) {
+            cpDecls.append("static const jfloat ").append(symbol).append("_cpfloat[] = { ");
+            for (int i : floatKeys)
+                cpDecls.append(floatLit(rcp.floats.get(i))).append(", ");
+            cpDecls.append("};\n");
+        }
+        // Exception table: flat 4 x uint32 per handler
+        // {start_pc, end_pc, handler_pc, catch_type}; catch_type is a sequential
+        // cp_cls index or KBOX_CATCH_ALL (0xFFFFFFFFu) for a catch-all block.
+        int[] extab = serializeExTable(mn, idxMap, labelOffsets);
+        if (extab.length > 0) {
+            cpDecls.append("static const uint32_t ").append(symbol).append("_extab[] = { ");
+            for (int v : extab)
+                cpDecls.append(v).append("U, ");
             cpDecls.append("};\n");
         }
         // Invokedynamic sites: per-site packed metadata, arg slot codes and return
@@ -304,6 +370,8 @@ public final class JniBytecodeInterp {
 
         int nc = clsKeys.size(), nf = fldKeys.size(), nm = midKeys.size();
         int ns = strKeys.size(), ni = intKeys.size();
+        int nl = longKeys.size(), nd = doubleKeys.size(), nfl = floatKeys.size();
+        int nx = extab.length / 4;
 
         if (nc > 0) body.append("  static jclass _cpclsR[").append(nc).append("];\n");
         if (nf > 0) body.append("  static jfieldID _cpfldR[").append(nf).append("];\n");
@@ -387,7 +455,12 @@ public final class JniBytecodeInterp {
         appendPtrArg(body, symbol + "_indy_meta", rcp.indies.size());
         appendPtrArg(body, symbol + "_indy_argc", rcp.indies.size());
         appendPtrArg(body, symbol + "_indy_ret", rcp.indies.size());
-        // args[28] = pointer to key_seed (for v3 entry)
+        // args[28..35] = long/double/float constants + exception table (v3 layout)
+        appendPtrArg(body, symbol + "_cplong", nl);
+        appendPtrArg(body, symbol + "_cpdouble", nd);
+        appendPtrArg(body, symbol + "_cpfloat", nfl);
+        appendPtrArg(body, symbol + "_extab", nx);
+        // args[36] = pointer to key_seed (for v3 entry)
         body.append("(void*)&").append(symbol).append("_key, ");
         for (int i = 2; i < cArgs.length; i++)
             body.append("(void*)(intptr_t)").append("_a" + (i - 2)).append(", ");
@@ -462,6 +535,38 @@ public final class JniBytecodeInterp {
                         idxMap.intIdx.put(v, seq);
                         rcp.integers.put(seq, v);
                     }
+                } else if (ldc.cst instanceof Long) {
+                    long v = (Long) ldc.cst;
+                    if (!idxMap.longIdx.containsKey(v)) {
+                        int seq = idxMap.longIdx.size();
+                        idxMap.longIdx.put(v, seq);
+                        rcp.longs.put(seq, v);
+                    }
+                } else if (ldc.cst instanceof Double) {
+                    double v = (Double) ldc.cst;
+                    if (!idxMap.doubleIdx.containsKey(v)) {
+                        int seq = idxMap.doubleIdx.size();
+                        idxMap.doubleIdx.put(v, seq);
+                        rcp.doubles.put(seq, v);
+                    }
+                } else if (ldc.cst instanceof Float) {
+                    float v = (Float) ldc.cst;
+                    if (!idxMap.floatIdx.containsKey(v)) {
+                        int seq = idxMap.floatIdx.size();
+                        idxMap.floatIdx.put(v, seq);
+                        rcp.floats.put(seq, v);
+                    }
+                } else if (ldc.cst instanceof Type) {
+                    // Class literal (Foo.class / int[].class): register the class
+                    // name/descriptor so the native interpreter can FindClass it
+                    // and push the resolved jclass as a reference on the stack.
+                    Type t = (Type) ldc.cst;
+                    String name = t.getSort() == Type.ARRAY ? t.getDescriptor() : t.getInternalName();
+                    if (!idxMap.clsIdx.containsKey(name)) {
+                        int seq = idxMap.clsIdx.size();
+                        idxMap.clsIdx.put(name, seq);
+                        rcp.classes.put(seq, name);
+                    }
                 }
             } else if (insn instanceof TypeInsnNode
                     && (op == Opcodes.NEW || op == Opcodes.ANEWARRAY
@@ -512,16 +617,28 @@ public final class JniBytecodeInterp {
                 }
             }
         }
+        // Catch types referenced by the exception table must be present in the
+        // cp_cls array so the native interpreter can resolve them at dispatch
+        // time (kbox_try_dispatch -> IsAssignableFrom against cp_cls[idx]).
+        if (mn.tryCatchBlocks != null) {
+            for (TryCatchBlockNode t : mn.tryCatchBlocks) {
+                if (t.type == null) continue;
+                if (!idxMap.clsIdx.containsKey(t.type)) {
+                    int seq = idxMap.clsIdx.size();
+                    idxMap.clsIdx.put(t.type, seq);
+                    rcp.classes.put(seq, t.type);
+                }
+            }
+        }
         return rcp;
     }
 
     // ---- bytecode serialisation (uses sequential CP indices) ----
 
-    @SuppressWarnings("unchecked")
-    private static byte[] serializeBytecode(MethodNode mn, CPIdxMap idxMap) {
-        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+    /** Computes the serialised bytecode offset of every LabelNode (shared by the
+     *  bytecode writer and the exception-table serializer so both agree on PCs). */
+    private static Map<LabelNode, Integer> computeLabelOffsets(MethodNode mn) {
         Map<LabelNode, Integer> labelOffsets = new HashMap<>();
-        // Pass 1: compute label offsets.
         int offset = 0;
         for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (insn instanceof LabelNode) {
@@ -530,7 +647,14 @@ public final class JniBytecodeInterp {
                 offset += insnSize(insn);
             }
         }
-        // Pass 2: write opcodes with sequential CP indices.
+        return labelOffsets;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static byte[] serializeBytecode(MethodNode mn, CPIdxMap idxMap,
+                                            Map<LabelNode, Integer> labelOffsets) {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        // Write opcodes with sequential CP indices.
         for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (insn instanceof FrameNode || insn instanceof LineNumberNode) continue;
             if (insn instanceof LabelNode) continue;
@@ -552,16 +676,37 @@ public final class JniBytecodeInterp {
             if (op == Opcodes.BIPUSH) {
                 // BIPUSH: opcode + 1-byte operand (matches C FETCH)
                 bos.write(ii.operand & 0xFF);
+            } else if (op == Opcodes.NEWARRAY) {
+                // NEWARRAY: opcode + 1-byte atype (T_BOOLEAN..T_LONG = 4..11).
+                // The C NEWARRAY handler reads it with a single FETCH, so the
+                // atype must NOT go through the 2-byte SIPUSH path.
+                bos.write(ii.operand & 0xFF);
             } else {
                 // SIPUSH: opcode + 2-byte operand (matches C FETCH_S16)
                 writeShort(bos, (short) ii.operand);
             }
         } else if (insn instanceof VarInsnNode) {
-            bos.write(((VarInsnNode) insn).var);
+            int var = ((VarInsnNode) insn).var;
+            if (var > 0xFF) {
+                // Wide index: emit WIDE prefix + sub-opcode + 2-byte index.
+                bos.write(K_WIDE_OP);
+                bos.write(op);
+                writeShort(bos, (short) var);
+            } else {
+                bos.write(var);
+            }
         } else if (insn instanceof IincInsnNode) {
             IincInsnNode ii = (IincInsnNode) insn;
-            bos.write(ii.var);
-            bos.write(ii.incr);
+            if (ii.var > 0xFF || ii.incr < -128 || ii.incr > 127) {
+                // Wide IINC: WIDE prefix + IINC sub-opcode + 2-byte index + 2-byte incr.
+                bos.write(K_WIDE_OP);
+                bos.write(Opcodes.IINC);
+                writeShort(bos, (short) ii.var);
+                writeShort(bos, (short) ii.incr);
+            } else {
+                bos.write(ii.var);
+                bos.write(ii.incr);
+            }
         } else if (insn instanceof JumpInsnNode) {
             JumpInsnNode j = (JumpInsnNode) insn;
             Integer tgt = labelOffsets.get(j.label);
@@ -588,18 +733,31 @@ public final class JniBytecodeInterp {
             Integer seq = idxMap.midIdx.get(sig);
             writeShort(bos, seq != null ? seq.shortValue() : 0);
         } else if (insn instanceof LdcInsnNode) {
+            // Tagged sequential-CP operand (mirrors the C LDC handler):
+            //   0x8000 int, 0x4000 long, 0x2000 double, 0x1000 float,
+            //   0x0800 class literal, else string. Low 11 bits = seq index.
             LdcInsnNode ldc = (LdcInsnNode) insn;
+            int tag;
+            Integer seq;
             if (ldc.cst instanceof String) {
-                Integer seq = idxMap.strIdx.get((String) ldc.cst);
-                writeShort(bos, seq != null ? seq.shortValue() : 0);
+                tag = 0; seq = idxMap.strIdx.get((String) ldc.cst);
             } else if (ldc.cst instanceof Integer) {
-                Integer seq = idxMap.intIdx.get((Integer) ldc.cst);
-                // Encode int index as: 0x8000 | seq (distinguishes from string idx)
-                int tag = 0x8000 | (seq != null ? seq : 0);
-                writeShort(bos, (short) tag);
+                tag = K_LDC_TAG_INT; seq = idxMap.intIdx.get((Integer) ldc.cst);
+            } else if (ldc.cst instanceof Long) {
+                tag = K_LDC_TAG_LONG; seq = idxMap.longIdx.get((Long) ldc.cst);
+            } else if (ldc.cst instanceof Double) {
+                tag = K_LDC_TAG_DOUBLE; seq = idxMap.doubleIdx.get((Double) ldc.cst);
+            } else if (ldc.cst instanceof Float) {
+                tag = K_LDC_TAG_FLOAT; seq = idxMap.floatIdx.get((Float) ldc.cst);
+            } else if (ldc.cst instanceof Type) {
+                Type t = (Type) ldc.cst;
+                String name = t.getSort() == Type.ARRAY ? t.getDescriptor() : t.getInternalName();
+                tag = K_LDC_TAG_CLASS; seq = idxMap.clsIdx.get(name);
             } else {
-                writeShort(bos, (short) 0);
+                tag = 0; seq = null;
             }
+            int raw = tag | (seq != null ? seq : 0);
+            writeShort(bos, (short) raw);
         } else if (insn instanceof TableSwitchInsnNode) {
             // opcode already written at the top of writeInsn; payload follows.
             // start = position of the opcode byte (rel targets are relative to it).
@@ -647,15 +805,21 @@ public final class JniBytecodeInterp {
 
     private static int insnSize(AbstractInsnNode insn) {
         int op = insn.getOpcode();
-        if (insn instanceof IntInsnNode)
-            return (op == Opcodes.BIPUSH) ? 2 : 3;  // BIPUSH=1-byte, SIPUSH=2-byte operand
-        if (insn instanceof VarInsnNode) return (op == Opcodes.RET) ? 2 : 2;
+        if (insn instanceof IntInsnNode) {
+            if (op == Opcodes.BIPUSH) return 2;     // BIPUSH: 1-byte operand
+            if (op == Opcodes.NEWARRAY) return 2;   // NEWARRAY: 1-byte atype (matches serializer + C FETCH)
+            return 3;                               // SIPUSH: 2-byte operand
+        }
+        if (insn instanceof VarInsnNode) return (((VarInsnNode) insn).var > 0xFF) ? 4 : 2;
         if (insn instanceof TypeInsnNode) return 3;
         if (insn instanceof FieldInsnNode) return 3;
         if (insn instanceof MethodInsnNode) return 3;
         if (insn instanceof JumpInsnNode) return 3;
         if (insn instanceof LdcInsnNode) return 3;  // 1-byte op + 2-byte sequential idx
-        if (insn instanceof IincInsnNode) return 3;
+        if (insn instanceof IincInsnNode) {
+            IincInsnNode ii = (IincInsnNode) insn;
+            return (ii.var > 0xFF || ii.incr < -128 || ii.incr > 127) ? 6 : 3;
+        }
         if (insn instanceof TableSwitchInsnNode) {
             // Padding-free encoding: op + 3x i32 header + (high-low+1) x i32 targets.
             TableSwitchInsnNode ts = (TableSwitchInsnNode) insn;
@@ -728,20 +892,122 @@ public final class JniBytecodeInterp {
         return sb.toString();
     }
 
+    /** Serialises the method's try/catch blocks into a flat uint32_t array with
+     *  4 entries per handler: {start_pc, end_pc, handler_pc, catch_type}. The
+     *  PCs are serialised bytecode offsets of the block's labels (matching the
+     *  instruction stream), and catch_type is a sequential cp_cls index or
+     *  KBOX_CATCH_ALL for a catch-all block. Layout matches the C
+     *  kbox_ex_handler_t consumed by kbox_jnic_interp_v3.c. */
+    private static int[] serializeExTable(MethodNode mn, CPIdxMap idxMap,
+                                          Map<LabelNode, Integer> labelOffsets) {
+        if (mn.tryCatchBlocks == null || mn.tryCatchBlocks.isEmpty()) return new int[0];
+        int[] out = new int[mn.tryCatchBlocks.size() * 4];
+        int k = 0;
+        for (TryCatchBlockNode t : mn.tryCatchBlocks) {
+            int start   = labelOffsets.getOrDefault(t.start, 0);
+            int end     = labelOffsets.getOrDefault(t.end, 0);
+            int handler = labelOffsets.getOrDefault(t.handler, 0);
+            int catchType = KBOX_CATCH_ALL;
+            if (t.type != null) {
+                Integer seq = idxMap.clsIdx.get(t.type);
+                catchType = (seq != null) ? seq : KBOX_CATCH_ALL;
+            }
+            out[k++] = start;
+            out[k++] = end;
+            out[k++] = handler;
+            out[k++] = catchType;
+        }
+        return out;
+    }
+
+    private static String intLit(int v) { return Integer.toString(v); }
+
+    private static String longLit(long v) { return v + "LL"; }
+
+    /** C99 hex-float literal so the exact bit pattern round-trips through the C
+     *  compiler; NaN / +-Inf use the <math.h> macros (added to the stub source). */
+    private static String doubleLit(double v) {
+        if (Double.isNaN(v)) return "NAN";
+        if (v == Double.POSITIVE_INFINITY) return "INFINITY";
+        if (v == Double.NEGATIVE_INFINITY) return "(-INFINITY)";
+        return Double.toHexString(v);
+    }
+
+    private static String floatLit(float v) {
+        if (Float.isNaN(v)) return "NAN";
+        if (v == Float.POSITIVE_INFINITY) return "INFINITY";
+        if (v == Float.NEGATIVE_INFINITY) return "(-INFINITY)";
+        // Double.toHexString is exact for float values (floats are exactly
+        // representable as doubles); the f suffix makes it a float literal.
+        return Double.toHexString(v) + "f";
+    }
+
+    /**
+     * Escapes a Java string for embedding as a C string literal that is later
+     * fed to {@code NewStringUTF} by the native interpreter.
+     *
+     * <p>NewStringUTF expects Modified UTF-8, so we encode the string to its
+     * Modified UTF-8 byte sequence and emit each byte as either a printable
+     * ASCII char or a 3-digit octal escape. Emitting per-CHAR octal of the
+     * UTF-16 code unit is WRONG: chars above U+00FF need 4-6 octal digits
+     * (e.g. U+4F60 = 047540) and C truncates octal escapes to 3 digits,
+     * silently corrupting every non-ASCII literal (observed as garbage
+     * strings in the protected app). Supplementary chars are encoded as two
+     * 3-byte surrogate halves per the Modified UTF-8 spec.
+     */
     private static String escC(String s) {
-        StringBuilder sb = new StringBuilder(s.length() + 8);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '\\') sb.append("\\\\");
-            else if (c == '"') sb.append("\\\"");
-            else if (c == '\n') sb.append("\\n");
-            else if (c == '\r') sb.append("\\r");
-            else if (c == '\t') sb.append("\\t");
-            else if (c == '\f') sb.append("\\f");
-            else if (c == '\b') sb.append("\\b");
-            else if (c >= 0x20 && c <= 0x7E) sb.append(c);
-            else sb.append('\\').append(String.format("%03o", (int) c));
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (byte b : modifiedUtf8(s)) {
+            int c = b & 0xFF;
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '"':  sb.append("\\\""); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\b': sb.append("\\b"); break;
+                default:
+                    if (c >= 0x20 && c <= 0x7E) sb.append((char) c);
+                    else sb.append('\\')
+                            .append((char) ('0' + ((c >> 6) & 7)))
+                            .append((char) ('0' + ((c >> 3) & 7)))
+                            .append((char) ('0' + (c & 7)));
+            }
         }
         return sb.toString();
+    }
+
+    /** Encodes a Java string to Modified UTF-8 bytes (as consumed by NewStringUTF). */
+    private static byte[] modifiedUtf8(String s) {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 0x0001 && c <= 0x007F) {
+                bos.write(c);
+            } else if (c <= 0x07FF) {
+                bos.write(0xC0 | (c >> 6));
+                bos.write(0x80 | (c & 0x3F));
+            } else if (Character.isHighSurrogate(c) && i + 1 < s.length()
+                    && Character.isLowSurrogate(s.charAt(i + 1))) {
+                int cp = Character.toCodePoint(c, s.charAt(++i));
+                // Surrogate pair -> two 3-byte Modified UTF-8 sequences.
+                // NOTE: must subtract 0x10000 before extracting the 10-bit halves
+                // (cp is a code point, not a UTF-16 code unit). Missing this
+                // turned U+1F600 into U+2F600 (0xD87D instead of 0xD83D).
+                int u = cp - 0x10000;
+                writeModUtf8Triple(bos, (u >> 10) + 0xD800);
+                writeModUtf8Triple(bos, (u & 0x3FF) + 0xDC00);
+            } else {
+                writeModUtf8Triple(bos, c); // BMP char (or lone surrogate)
+            }
+        }
+        return bos.toByteArray();
+    }
+
+    private static void writeModUtf8Triple(java.io.ByteArrayOutputStream bos, int c) {
+        bos.write(0xE0 | (c >> 12));
+        bos.write(0x80 | ((c >> 6) & 0x3F));
+        bos.write(0x80 | (c & 0x3F));
     }
 }

@@ -34,6 +34,20 @@ public final class VmpMethodInjector {
     private static final String INTERPRETER_METHOD = "com/kbox/runtime/VmpInterpreter$VmpMethod";
     private static final SecureRandom VMP_RNG = new SecureRandom();
 
+    /** BrainfuckShield 强度（0=off）。>0 时每个 VMP 方法的密文流被重编码成磁带程序。 */
+    private final int bfLevel;
+    /** 每构建随机 buildSalt（与每方法 K 共同派生私有方言）。 */
+    private final int bfBuildSalt;
+
+    public VmpMethodInjector() {
+        this(0, 0);
+    }
+
+    public VmpMethodInjector(int bfLevel, int bfBuildSalt) {
+        this.bfLevel = Math.max(0, Math.min(3, bfLevel));
+        this.bfBuildSalt = bfBuildSalt;
+    }
+
     /**
      * Per-method opcode twin (double-state dispatch mask). Derived from the
      * method's 32-byte key K so both the build (masking) and the runtime
@@ -67,6 +81,84 @@ public final class VmpMethodInjector {
         return p;
     }
 
+    /**
+     * Deterministic per-method 256-entry opcode permutation derived from K. Maps
+     * the REAL opcode to the STORED opcode: {@code stored = perm[real] ^ twin}.
+     * The interpreter inverts it at dispatch time with {@code invPerm[stored ^ twin]}
+     * (= {@code real}). Because K is randomly generated per method per build, every
+     * KBox build gets a different virtual opcode mapping — no two builds share a
+     * byte-identical VMP instruction stream. MUST match VmpInterpreter.opcodePerm.
+     */
+    static int[] opcodePerm(byte[] K) {
+        int[] p = new int[256];
+        for (int i = 0; i < 256; i++) p[i] = i;
+        long s = 0x243F6A8885A308D3L;   // distinct domain constant from slotPerm
+        byte[] kb = (K == null) ? new byte[0] : K;
+        for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+        for (int i = 255; i > 0; i--) {
+            s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+            int j = (int) (Long.remainderUnsigned(s, i + 1L));
+            int t = p[i]; p[i] = p[j]; p[j] = t;
+        }
+        return p;
+    }
+
+    /**
+     * Deterministic per-method 256-entry micro-operation permutation derived from
+     * K. Independent domain from {@link #opcodePerm} (different seed constant).
+     *
+     * <p>The VMP interpreter's DISPATCH is data-driven: after the twin-mask
+     * collapse the stored opcode byte is mapped straight to a micro-operation
+     * slot {@code mo} in a per-method handler table via the composite permutation
+     * ({@code microPerm ∘ invPerm}) — the real VmpOp is NEVER materialized in a
+     * register, and every method/build lays its handler table out differently.
+     * Because K is random per method per build, no two builds share a byte-identical
+     * dispatch layout. MUST match VmpInterpreter.VmpMethod.microPerm.
+     */
+    static int[] microPerm(byte[] K) {
+        int[] p = new int[256];
+        for (int i = 0; i < 256; i++) p[i] = i;
+        long s = 0xA4093822299F31D0L;   // distinct domain constant from slotPerm/opcodePerm
+        byte[] kb = (K == null) ? new byte[0] : K;
+        for (byte b : kb) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+        for (int i = 255; i > 0; i--) {
+            s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27; s *= 0x2545F4914F6CDD1DL;
+            int j = (int) (Long.remainderUnsigned(s, i + 1L));
+            int t = p[i]; p[i] = p[j]; p[j] = t;
+        }
+        return p;
+    }
+
+    /** Inverse of a permutation array. */
+    static int[] inversePerm(int[] perm) {
+        int[] inv = new int[perm.length];
+        for (int i = 0; i < perm.length; i++) inv[perm[i]] = i;
+        return inv;
+    }
+
+    /**
+     * Composite dispatch permutation: {@code composite[t] = microPerm[invPerm[t]]}.
+     * At runtime {@code mo = composite[storedOpcode ^ twin]} yields the handler slot
+     * without ever revealing the real VmpOp. The build logs its fingerprint for
+     * cross-build ISA-polymorphism verification (see {@code kbox.vmp.permDump}).
+     */
+    static int[] compositePerm(int[] opcodePerm, int[] microPerm) {
+        int[] inv = inversePerm(opcodePerm);
+        int[] c = new int[256];
+        for (int t = 0; t < 256; t++) c[t] = microPerm[inv[t]];
+        return c;
+    }
+
+    /** FNV-1a 32-bit fingerprint of a permutation array (for permDump logging). */
+    static String fnvHex(int[] a) {
+        int h = 0x811c9dc5;
+        for (int v : a) {
+            h ^= (v & 0xFF); h *= 0x01000193;
+            h ^= (v >>> 8) & 0xFF; h *= 0x01000193;
+        }
+        return String.format("%08x", h);
+    }
+
     /*
      * VMP operand length (bytes after the opcode) for the interpreter's current
      * instruction set. MUST match VmpInterpreter's per-opcode pc advance. Used by
@@ -92,17 +184,20 @@ public final class VmpMethodInjector {
     private static int operandLen(int op) { return (op >= 0 && op < 256) ? OP_LEN[op] : 0; }
 
     /**
-     * XORs each opcode byte with {@code twin} so the stored program's opcodes
-     * are non-standard per method. The interpreter recovers the real opcode via
-     * its two-state dispatch {@code (st1 ^ st2) ^ byte} with {@code st1^st2 == twin}.
-     * Only opcode bytes are masked; operands are untouched.
+     * Applies the per-method opcode permutation + twin mask to the program:
+     * each opcode byte becomes {@code perm[real] ^ twin}. The interpreter recovers
+     * the real opcode via its two-state dispatch {@code (st1 ^ st2) == twin}
+     * followed by {@code invPerm[stored ^ twin]}. Only opcode bytes are touched;
+     * operands are untouched. {@code perm} maps the ORIGINAL opcode to the stored
+     * value; the walker uses the original opcode to advance, so the permutation
+     * never perturbs the layout.
      */
-    static void applyOpcodeMask(byte[] code, int twin) {
+    static void applyOpcodeMask(byte[] code, int[] perm, int twin) {
         int n = code.length;
         int pc = 0;
         while (pc < n) {
             int op = code[pc] & 0xFF;
-            code[pc] ^= (byte) twin;
+            code[pc] = (byte) ((perm[op] ^ twin) & 0xFF);
             if (op == 0xFF) break; // END
             pc += 1 + operandLen(op);
         }
@@ -127,13 +222,41 @@ public final class VmpMethodInjector {
     }
 
     static EncryptedProgram encrypt(VmpTranslator.Result r) {
+        return encrypt(r, 0, 0, "");
+    }
+
+    static EncryptedProgram encrypt(VmpTranslator.Result r, int bfLevel, int bfBuildSalt) {
+        return encrypt(r, bfLevel, bfBuildSalt, "");
+    }
+
+    static EncryptedProgram encrypt(VmpTranslator.Result r, int bfLevel, int bfBuildSalt, String key) {
         // Per-method random 32-byte key K (stream seed, NOT stored bare).
         byte[] K = new byte[32];
         VMP_RNG.nextBytes(K);
         int twin = opcodeTwin(K);
-        // Per-method opcode disorder: XOR each opcode byte with the twin.
+        int[] perm = opcodePerm(K);
+        int[] micro = microPerm(K);
+        // Per-method opcode disorder: permute each opcode through a K-derived
+        // bijection, then XOR with the twin. Because K is random per method per
+        // build, no two builds share a byte-identical VMP instruction stream.
         byte[] pc2 = r.code.clone();
-        applyOpcodeMask(pc2, twin);
+        applyOpcodeMask(pc2, perm, twin);
+        // ISA-polymorphism fingerprint: the interpreter's data-driven dispatch layout
+        // (micro-permutation composed over the twin-collapse) recorded here proves —
+        // without decrypting classes.bf.rle — that the L2 ISA is re-keyed per method
+        // per build. Log each method's invPerm/microPerm/composite digest so two builds
+        // can be compared byte-for-byte.
+        if (System.getProperty("kbox.vmp.permDump") != null) {
+            int[] inv = inversePerm(perm);
+            int[] comp = compositePerm(perm, micro);
+            StringBuilder hex = new StringBuilder();
+            for (byte b : K) hex.append(String.format("%02x", b & 0xFF));
+            KBoxLog.info(TAG, "ISA permDump K=" + hex
+                    + " twin=0x" + String.format("%02X", twin)
+                    + " invPerm=" + fnvHex(inv)
+                    + " microPerm=" + fnvHex(micro)
+                    + " composite=" + fnvHex(comp));
+        }
         // Encrypt bytecode with a ChaCha20 keystream derived from K (byte[] secret).
         com.kbox.runtime.ChaCha20.Keystream ks =
                 new com.kbox.runtime.ChaCha20.Keystream(K);
@@ -141,14 +264,31 @@ public final class VmpMethodInjector {
         for (int i = 0; i < r.code.length; i++) {
             encCode[i] = (byte)((pc2[i] & 0xFF) ^ ks.at(i));
         }
+        // BrainfuckShield（二次虚拟化）: 把 VMP 密文流重编码成每方法私有方言磁带程序。
+        // 运行期 VmpMethod 构造时由 BfInterpreter.decodeIfTape 先回放解码回 encCode。
+        if (bfLevel > 0) {
+            byte[] rawEnc = encCode;
+            encCode = com.kbox.core.brainfuckshield.BfMethodInjector.shield(
+                    rawEnc, K, bfBuildSalt, bfLevel);
+            if (System.getProperty("kbox.bf.verify") != null) {
+                if (!com.kbox.core.brainfuckshield.BfMethodInjector.verifyRoundTrip(
+                        rawEnc, K, bfBuildSalt, bfLevel)) {
+                    throw new KBoxException("BrainfuckShield round-trip verify failed");
+                }
+            }
+            if (System.getProperty("kbox.bf.dump") != null) {
+                com.kbox.core.brainfuckshield.BfMethodInjector.log(
+                        -1, rawEnc, encCode, key);
+            }
+        }
         // Encrypt CP strings (Object[] → XOR each String entry in the same stream)
         // and STORE them in PERMUTED physical order so the VM's logical slot i lives
         // at physical slot perm[i]. The keystream offset uses the PHYSICAL index so
         // the runtime (which also computes perm) recovers each slot exactly.
-        int[] perm = slotPerm(K, r.cpRaw.length);
+        int[] slotP = slotPerm(K, r.cpRaw.length);
         Object[] encCp = new Object[r.cpRaw.length];
         for (int i = 0; i < r.cpRaw.length; i++) {
-            int phys = perm[i];   // logical i placed at physical phys
+            int phys = slotP[i];   // logical i placed at physical phys
             if (r.cpRaw[i] instanceof String) {
                 String s = (String) r.cpRaw[i];
                 byte[] sb = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -180,9 +320,15 @@ public final class VmpMethodInjector {
             String key = cn.name + "#" + mn.name + "#" + mn.desc;
             VmpTranslator.Result r = perMethod.get(key);
             if (r == null) continue;
+            // Hard invariant: never re-wrap a native/abstract method — a native
+            // method carrying a Code attribute is rejected by the JVM at load time.
+            if ((mn.access & (Opcodes.ACC_NATIVE | Opcodes.ACC_ABSTRACT)) != 0) {
+                perMethod.remove(key);
+                continue;
+            }
             try {
                 // Encrypt the VMP program before storing in class fields.
-                EncryptedProgram ep = encrypt(r);
+                EncryptedProgram ep = encrypt(r, bfLevel, bfBuildSalt, key);
                 inject(cn, mn, ep, idx);
                 idx++;
             } catch (Exception e) {
@@ -204,56 +350,53 @@ public final class VmpMethodInjector {
         // Store the WRAPPED key (K under AES-GCM hardware master) — never the bare key.
         cn.fields.add(field(cn, keyFieldName, "[B", true));
 
-        // Add initialization code to <clinit>: store program bytes + cp into static fields.
+        // Add initialization code to <clinit>. The VmpMethod construction is
+        // built into a scratch buffer and PREPENDED to the start of <clinit>
+        // (NOT appended at the end): javac emits enum <clinit> that calls the
+        // virtualized private $values() to build the $VALUES field, so every
+        // $vmpm_* field must be initialized before ANY of the original
+        // <clinit> body runs — otherwise $values() executes with a null
+        // VmpMethod and the native interpreter crashes on GetIntField(NULL).
         MethodNode clinit = findOrCreateClinit(cn);
-        // Remove any trailing RETURN so the init code we append is reachable.
-        // (findOrCreateClinit may have created a <clinit> with a trailing RETURN,
-        // or the class already had one.) We re-add the RETURN at the end.
-        if (clinit.instructions.size() > 0) {
-            org.objectweb.asm.tree.AbstractInsnNode last = clinit.instructions.getLast();
-            if (last.getOpcode() == Opcodes.RETURN) {
-                clinit.instructions.remove(last);
-            }
-        }
-        emitByteArrayInit(clinit, cn.name, fieldName, ep.code);
-        emitObjectArrayInit(clinit, cn.name, cpFieldName, ep.cpRaw);
+        MethodNode initBuf = new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
+        emitByteArrayInit(initBuf, cn.name, fieldName, ep.code);
+        emitObjectArrayInit(initBuf, cn.name, cpFieldName, ep.cpRaw);
         // Store the wrapped key in a byte[] field for runtime unwrapping.
-        emitByteArrayInit(clinit, cn.name, keyFieldName, ep.wrappedK);
+        emitByteArrayInit(initBuf, cn.name, keyFieldName, ep.wrappedK);
         // Construct the VmpMethod object eagerly in <clinit> and cache it.
         // NEW + DUP create the uninitialized object reference that <init> consumes.
-        clinit.visitTypeInsn(Opcodes.NEW, INTERPRETER_METHOD);
-        clinit.visitInsn(Opcodes.DUP);
-        clinit.visitFieldInsn(Opcodes.GETSTATIC, cn.name, fieldName, "[B");
-        clinit.visitFieldInsn(Opcodes.GETSTATIC, cn.name, cpFieldName, "[Ljava/lang/Object;");
-        clinit.visitFieldInsn(Opcodes.GETSTATIC, cn.name, keyFieldName, "[B");
-        pushInt(clinit, ep.maxLocals);
-        pushInt(clinit, ep.maxStack);
-        pushInt(clinit, ep.argCount);
-        pushInt(clinit, ep.retSort);
+        initBuf.visitTypeInsn(Opcodes.NEW, INTERPRETER_METHOD);
+        initBuf.visitInsn(Opcodes.DUP);
+        initBuf.visitFieldInsn(Opcodes.GETSTATIC, cn.name, fieldName, "[B");
+        initBuf.visitFieldInsn(Opcodes.GETSTATIC, cn.name, cpFieldName, "[Ljava/lang/Object;");
+        initBuf.visitFieldInsn(Opcodes.GETSTATIC, cn.name, keyFieldName, "[B");
+        pushInt(initBuf, ep.maxLocals);
+        pushInt(initBuf, ep.maxStack);
+        pushInt(initBuf, ep.argCount);
+        pushInt(initBuf, ep.retSort);
         if (ep.exceptions == null) {
-            clinit.visitInsn(Opcodes.ACONST_NULL);
+            initBuf.visitInsn(Opcodes.ACONST_NULL);
         } else {
-            pushInt(clinit, ep.exceptions.length);
-            clinit.visitTypeInsn(Opcodes.ANEWARRAY, "[I");
+            pushInt(initBuf, ep.exceptions.length);
+            initBuf.visitTypeInsn(Opcodes.ANEWARRAY, "[I");
             for (int i = 0; i < ep.exceptions.length; i++) {
-                clinit.visitInsn(Opcodes.DUP);
-                pushInt(clinit, i);
-                pushInt(clinit, ep.exceptions[i].length);
-                clinit.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_INT);
+                initBuf.visitInsn(Opcodes.DUP);
+                pushInt(initBuf, i);
+                pushInt(initBuf, ep.exceptions[i].length);
+                initBuf.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_INT);
                 for (int j = 0; j < ep.exceptions[i].length; j++) {
-                    clinit.visitInsn(Opcodes.DUP);
-                    pushInt(clinit, j);
-                    pushInt(clinit, ep.exceptions[i][j]);
-                    clinit.visitInsn(Opcodes.IASTORE);
+                    initBuf.visitInsn(Opcodes.DUP);
+                    pushInt(initBuf, j);
+                    pushInt(initBuf, ep.exceptions[i][j]);
+                    initBuf.visitInsn(Opcodes.IASTORE);
                 }
-                clinit.visitInsn(Opcodes.AASTORE);
+                initBuf.visitInsn(Opcodes.AASTORE);
             }
         }
-        clinit.visitMethodInsn(Opcodes.INVOKESPECIAL, INTERPRETER_METHOD, "<init>",
+        initBuf.visitMethodInsn(Opcodes.INVOKESPECIAL, INTERPRETER_METHOD, "<init>",
                 "([B[Ljava/lang/Object;[BIIII[[I)V", false);
-        clinit.visitFieldInsn(Opcodes.PUTSTATIC, cn.name, methodFieldName, "L" + INTERPRETER_METHOD + ";");
-        // Re-add the trailing RETURN so <clinit> is well-formed.
-        clinit.instructions.add(new org.objectweb.asm.tree.InsnNode(Opcodes.RETURN));
+        initBuf.visitFieldInsn(Opcodes.PUTSTATIC, cn.name, methodFieldName, "L" + INTERPRETER_METHOD + ";");
+        clinit.instructions.insert(initBuf.instructions);
         // maxStack must cover: 5 args (byte[], Object[], 3 ints) + exceptions-array
         // construction which peaks at ~6 deeper, so 16 is a safe lower bound.
         clinit.maxStack = Math.max(clinit.maxStack, 16);

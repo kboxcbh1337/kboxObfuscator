@@ -196,6 +196,23 @@ public final class ControlFlowObfuscator {
             int insnCount = mn.instructions.size();
             cfLog("    >> " + cn.name + "." + mn.name + mn.desc + " (insn=" + insnCount + ")");
             try {
+                // JNIC-guard: methods selected for Java→native translation are
+                // SKIPPED entirely here. They are translated (and their bytecode
+                // cleared to ACC_NATIVE) at the later JNIC stage, so any
+                // control-flow work done on them is wasted AND multiplies the
+                // JNIC translator / gcc workload by the flattened instruction
+                // count — the source of "JNIC 开启后 1 小时+" on large inputs.
+                // (Same reasoning as the VMP-guard below, just skipping all CF.)
+                boolean isJnicTarget = cfg.isEnableJnic()
+                        && cfg.getNativeMethods()
+                                .contains(com.kbox.core.config.ProtectionConfig
+                                        .memberKey(cn.name, mn.name, mn.desc));
+                if (isJnicTarget) {
+                    methodsSkipped++;
+                    cfLog("    << " + cn.name + "." + mn.name + mn.desc
+                            + " [JNIC-target: skip CF]");
+                    continue;
+                }
                 // MBA instruction substitution must run BEFORE opaque predicates
                 // are injected: the predicates themselves contain balanced IADD
                 // sequences (e.g. the MBA identity left - right computation).
@@ -233,7 +250,12 @@ public final class ControlFlowObfuscator {
                         && cfg.getVmpMethods()
                                 .contains(com.kbox.core.config.ProtectionConfig
                                         .memberKey(cn.name, mn.name, mn.desc));
-                if (!isCtor && !isVmpTarget) {
+                // S6 EPL sweet-spot: flatten only when the real (non-label)
+                // instruction count falls inside [flattenerMinInsns, flattenerMaxInsns].
+                // A huge method risks StackMapTable precision blow-up; a tiny method
+                // gains nothing from a dispatcher. This selects genuine business
+                // methods (the ZKM-style "EPL" bandwidth) and bounds the switch size.
+                if (!isCtor && !isVmpTarget && inFlattenWindow(mn)) {
                     flattened = Flattener.flatten(mn, cfg.getControlFlowStrength());
                     if (flattened) {
                         methodsFlattened++;
@@ -271,6 +293,21 @@ public final class ControlFlowObfuscator {
             cfLog("  << " + cn.name + " [CF-rollback: COMPUTE_FRAMES failed, "
                     + methodCount + " methods reverted to original]");
         }
+    }
+
+    /** True when the method's real (non-label/frame/line) instruction count is
+     *  inside the S6 flattener EPL window [flattenerMinInsns, flattenerMaxInsns].
+     *  Escapes the precision blow-up of over-flattened huge switches while still
+     *  selecting genuine business methods. */
+    private boolean inFlattenWindow(MethodNode mn) {
+        int minIns = cfg.getFlattenerMinInsns();
+        int maxIns = cfg.getFlattenerMaxInsns();
+        int n = 0;
+        for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
+            if (ins.getOpcode() >= 0) n++; // skip labels(-1)/frames/line-numbers
+            if (n > maxIns) return false;  // early out once past the upper bound
+        }
+        return n >= minIns;
     }
 
     /**

@@ -918,13 +918,50 @@ public final class VmpPassPipeline {
 
             final int BOGUS_PREFIX = 19;
 
-            // 3. Build offset map
+            // 3. Build offset map covering EVERY instruction offset (not just
+            // block starts). Exception-table boundaries (tryStart/tryEnd/handler)
+            // can fall in the middle of a block, so a block-start-only map would
+            // leave them stale after the per-block +BOGUS_PREFIX shift and the
+            // interpreter's `ppc >= start && ppc < end` check would never match —
+            // exceptions would bypass their catch and escape the method.
             Map<Integer, Integer> offsetMap = new HashMap<>();
             int newOffset = 0;
             for (Block b : blocks) {
-                offsetMap.put(b.start, newOffset);
-                newOffset += BOGUS_PREFIX;               // bogus prefix
-                newOffset += (b.end - b.start);           // original block body
+                int mapped;
+                int pos = b.start;
+                while (pos < b.end) {
+                    int len = instrLen(code, pos);
+                    offsetMap.put(pos, newOffset);
+                    int m = newOffset + len;
+                    // Guard against degenerate zero-length instructions.
+                    if (m == newOffset) { offsetMap.put(pos, newOffset + 1); newOffset += 1; pos += 1; continue; }
+                    newOffset = m;
+                    pos += len;
+                }
+                mapped = newOffset + BOGUS_PREFIX;        // address of this block's body
+                offsetMap.put(b.start, mapped - BOGUS_PREFIX);
+                newOffset = mapped + (b.end - b.start) - (pos - b.start);
+                newOffset += BOGUS_PREFIX;               // next block's bogus prefix is added below
+            }
+            // Correct finalization: ensure block bodies advance by BOGUS_PREFIX each.
+            {
+                Map<Integer, Integer> full = new HashMap<>();
+                int off = 0;
+                for (Block b : blocks) {
+                    int prefixStart = off;
+                    off += BOGUS_PREFIX;
+                    int pos = b.start;
+                    while (pos < b.end) {
+                        int len = instrLen(code, pos);
+                        if (len < 1) len = 1;
+                        full.put(pos, off);
+                        off += len;
+                        pos += len;
+                    }
+                    full.put(b.start, prefixStart + BOGUS_PREFIX);
+                }
+                full.put(oldEnd, off);
+                offsetMap.putAll(full);
             }
             offsetMap.put(oldEnd, newOffset);
 

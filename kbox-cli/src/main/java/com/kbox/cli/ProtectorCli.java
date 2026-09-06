@@ -21,7 +21,7 @@ import java.nio.file.Paths;
  *   <li>{@code --input PATH} — input jar (plain or Spring Boot fat jar)</li>
  *   <li>{@code --output PATH} — output jar path</li>
  *   <li>{@code --config PATH} — protection config file (optional; defaults applied)</li>
- *   <li>{@code --gui}        — launch the Swing UI instead of running headless</li>
+ *   <li>{@code --gui}        — launch the HTML UI (embedded HTTP server + browser) instead of running headless</li>
  *   <li>{@code --verbose}    — enable DEBUG logging (full progress + stack traces)</li>
  *   <li>{@code --debug-cf}   — per-file control-flow debug to stdout (always visible)</li>
  * </ul>
@@ -32,6 +32,11 @@ import java.nio.file.Paths;
 public final class ProtectorCli {
 
     public static void main(String[] args) {
+        // 双击 / 无参数启动：默认打开 HTML UI（命令行带参数才是指令操控）。
+        if (args.length == 0) {
+            launchGui(null, null, null, false);
+            return;
+        }
         String in = null, out = null, cfgPath = null;
         String mappingPath = null;
         String mcPreset = null;
@@ -108,14 +113,7 @@ public final class ProtectorCli {
 
         if (gui) {
             // Launch GUI directly (kbox-gui is now a dependency of kbox-cli).
-            try {
-                Class<?> guiCls = Class.forName("com.kbox.gui.ProtectorGui");
-                guiCls.getMethod("launch", String.class, String.class, String.class, boolean.class)
-                        .invoke(null, in, out, cfgPath, verbose);
-            } catch (Exception e) {
-                System.err.println("GUI unavailable: " + e.getMessage() + " (run without --gui)");
-                System.exit(2);
-            }
+            launchGui(in, out, cfgPath, verbose);
             return;
         }
         if (in == null || out == null) {
@@ -266,13 +264,14 @@ public final class ProtectorCli {
         System.out.println("                                [ProGuard-style adaptive flags]");
         System.out.println("                                [--list-presets]");
         System.out.println();
+        System.out.println("  (无参数直接双击/运行 = 打开 HTML UI；带参数 = 命令行指令操控)");
         System.out.println("Flags:");
         System.out.println("  --input, -i PATH        Input jar (plain or Spring Boot fat jar)");
         System.out.println("  --output, -o PATH       Output jar path");
         System.out.println("  --mapping PATH          Write a ProGuard-compatible deobfuscation mapping file");
         System.out.println("                          (reverse obfuscation for stack traces; overrides mappingFile in config)");
         System.out.println("  --config, -c PATH       Protection config file (optional)");
-        System.out.println("  --gui                   Launch the Swing UI (built-in, no separate jar needed)");
+        System.out.println("  --gui                   Launch the HTML UI (embedded HTTP server + browser)");
         System.out.println("  --verbose, -v           Enable DEBUG logging (full progress + stack traces)");
         System.out.println("  --debug-cf              Per-file control-flow debug to stdout (always visible)");
         System.out.println("  --log PATH              Also write every log line to PATH as UTF-8");
@@ -318,5 +317,18 @@ public final class ProtectorCli {
         System.out.println("Patterns use glob syntax: ** = any path segments, * = within a package.");
         System.out.println("Example: --scope SELECTIVE --include com/myapp/** --exclude com/myapp/api/*");
         System.out.println("Adaptive example: java -jar kbox.jar -i app.jar -o out.jar -keep com.example.Main -dontwarn");
+    }
+
+    /** Launches the embedded HTML UI (embedded HTTP server + browser). */
+    private static void launchGui(String in, String out, String cfgPath, boolean verbose) {
+        try {
+            Class<?> guiCls = Class.forName("com.kbox.gui.ProtectorGui");
+            guiCls.getMethod("launch", String.class, String.class, String.class, boolean.class)
+                    .invoke(null, in, out, cfgPath, verbose);
+        } catch (Exception e) {
+            System.err.println("GUI unavailable: " + e.getMessage()
+                    + " (headless? use the CLI with --input/--output)");
+            System.exit(2);
+        }
     }
 }

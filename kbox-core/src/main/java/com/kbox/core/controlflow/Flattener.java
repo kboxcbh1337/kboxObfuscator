@@ -101,7 +101,12 @@ final class Flattener {
         t.setDaemon(true);
         t.start();
         try {
-            t.join(3000); // 3 second timeout for entire flatten operation
+            // Timeout for the whole flatten. Timeout-skips were previously waited
+            // 3s each, which made CF on large inputs (thousands of methods) crawl
+            // (flatten-timeout 3000ms * N). The skipped method is discarded anyway,
+            // so a short budget is enough for methods that DO flatten; pathological
+            // CFGs simply skip faster.
+            t.join(700); // 700ms budget (was 3000ms) — big CF speedup on large jars
         } catch (InterruptedException e) {
             t.interrupt();
             cfLog("      skip " + mn.name + mn.desc
@@ -196,7 +201,7 @@ final class Flattener {
         t.setDaemon(true);
         t.start();
         try {
-            t.join(2000); // 2 second timeout
+            t.join(500); // 500ms analyzer budget (was 2000ms) — CF speedup, skipped anyway
         } catch (InterruptedException e) {
             t.interrupt();
             return "analyzer-interrupted";

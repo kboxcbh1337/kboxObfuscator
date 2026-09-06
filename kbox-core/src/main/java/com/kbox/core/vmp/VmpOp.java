@@ -121,7 +121,10 @@ public final class VmpOp {
     public static final byte IF_ACMPNE    = (byte) 0xC9;
     public static final byte GOTO         = 0x3E; // 1 int operand: target pc
 
-    // --- Stack manipulation ---
+    /** No-op micro-operation (VortexVM/L2 interleave filler). Advances pc by 1, touches nothing. */
+    public static final byte NOP          = 0x45;
+
+    // --- Stack ops ---
     public static final byte POP          = 0x40;
     public static final byte POP2         = 0x41;
     public static final byte DUP          = 0x42;
@@ -159,6 +162,12 @@ public final class VmpOp {
     public static final byte CASTORE       = 0x7D; // store char into array
     public static final byte SALOAD        = 0x7E; // load short from array
     public static final byte SASTORE       = 0x7F; // store short into array
+    public static final byte LALOAD        = (byte) 0x83; // load long from array
+    public static final byte FALOAD        = (byte) 0x84; // load float from array
+    public static final byte DALOAD        = (byte) 0x85; // load double from array
+    public static final byte LASTORE       = (byte) 0x86; // store long into array
+    public static final byte FASTORE       = (byte) 0x87; // store float into array
+    public static final byte DASTORE       = (byte) 0x88; // store double into array
     public static final byte CHECKCAST     = 0x78; // 1 operand: cpClass
     public static final byte INSTANCEOF   = 0x79; // 1 operand: cpClass
 
@@ -186,6 +195,7 @@ public final class VmpOp {
             case ACONST_NULL: return "ACONST_NULL";
             case ICONST: return "ICONST";
             case GOTO: return "GOTO";
+            case NOP: return "NOP";
             case IFEQ: return "IFEQ";
             case IFNE: return "IFNE";
             case IADD: return "IADD";

@@ -108,10 +108,23 @@ public final class ExceptionJumpObfuscator {
      * covers the whole method body so the verifier sees a valid control flow.
      * Semantics are preserved: the method still returns the same int, but
      * decompilers render a verbose try/catch around the whole body.
+     *
+     * <p><b>Validation before mutation:</b> the method must start with a
+     * {@link LabelNode} so the try/catch range can be anchored. Methods whose
+     * first instruction is not a label (e.g. VMP-virtualized dispatch bodies,
+     * synthesized stubs) are rejected BEFORE any instruction is touched — an
+     * earlier version inserted the carrier-throw patch first and only then
+     * cast {@code getFirst()} to a label, so a cast failure left the method
+     * half-rewritten (carrier ATHROW injected, handler + try/catch missing)
+     * and the carrier leaked as a raw runtime exception.
      */
     private void rewriteReturn(ClassNode cn, MethodNode mn,
                                org.objectweb.asm.tree.AbstractInsnNode iret) {
-        InsnList patch = new InsnList();
+        org.objectweb.asm.tree.AbstractInsnNode first = mn.instructions.getFirst();
+        if (!(first instanceof LabelNode)) {
+            throw new IllegalStateException(
+                    "method does not start with a label; skipping exception-jump");
+        }
         LabelNode handler = new LabelNode();
         // Stack before IRETURN: [int_value]. Build: new Carrier(value); athrow.
         // NEW Carrier       → [int_value, uninit]
@@ -120,6 +133,7 @@ public final class ExceptionJumpObfuscator {
         // INVOKESPECIAL <init>(I)V → [uninit] (consumes int+top-uninit;
         //                              bottom-uninit is now also initialized)
         // ATHROW            → []  (throws now-initialized Carrier)
+        InsnList patch = new InsnList();
         patch.add(new TypeInsnNode(Opcodes.NEW, CARRIER));
         patch.add(new InsnNode(Opcodes.DUP_X1));
         patch.add(new InsnNode(Opcodes.SWAP));
@@ -134,7 +148,7 @@ public final class ExceptionJumpObfuscator {
         // try { body } catch (Carrier) { handler }
         mn.tryCatchBlocks = mn.tryCatchBlocks == null ? new java.util.ArrayList<>() : mn.tryCatchBlocks;
         mn.tryCatchBlocks.add(new TryCatchBlockNode(
-                (LabelNode) mn.instructions.getFirst(), handler, handler, CARRIER));
+                (LabelNode) first, handler, handler, CARRIER));
     }
 
     /** Creates the synthetic carrier exception class. */

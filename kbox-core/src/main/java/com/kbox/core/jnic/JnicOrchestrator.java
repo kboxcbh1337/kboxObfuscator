@@ -14,8 +14,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Orchestrates the JNIC pipeline for the whole graph:
@@ -77,18 +79,45 @@ public final class JnicOrchestrator {
         Map<String, String> failures = new HashMap<>();
         List<JniBytecodeInterp.InterpFn> fns = new ArrayList<>();
         Map<String, MethodNode> toMark = new HashMap<>();
-        ClassNode firstClass = null;
+        // Every class that ends up with at least one JNIC-native method. Each such
+        // class must load the native library from its <clinit>, otherwise calling
+        // a native method on a class whose <clinit> never ran yields
+        // UnsatisfiedLinkError (JNIC full-coverage sinks entry-point classes too).
+        java.util.Set<ClassNode> nativeClasses = new java.util.LinkedHashSet<>();
+
+        // Method-name multiplicity per class (ALL methods, not just the JNIC
+        // ones) — the JVM decides between the short and long JNI export symbol
+        // from the class's full method table, so translated methods must know
+        // whether their name is overloaded in their owner class.
+        java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts = new HashMap<>();
+        for (ClassNode cn : graph.getClasses().values()) {
+            java.util.Map<String, Integer> nameCounts =
+                    classMethodCounts.computeIfAbsent(cn.name, k -> new HashMap<>());
+            for (MethodNode mn : cn.methods) {
+                nameCounts.merge(mn.name, 1, Integer::sum);
+            }
+        }
 
         KBoxLog.info(TAG, "Native methods to find: " + cfg.getNativeMethods().size()
                 + " keys: " + new ArrayList<>(cfg.getNativeMethods()));
         int index = 0;
         for (Map.Entry<String, ClassNode> e : graph.getClasses().entrySet()) {
             ClassNode cn = e.getValue();
-            if (!cfg.shouldTransformClass(cn.name)) {
+            // Body-sinking eligibility: use shouldProtectClass (NOT shouldTransformClass)
+            // so a KEPT entry-point class can still have its method bodies sunk to
+            // native — same gate as every other body-protection pass (control-flow,
+            // string-encrypt, VMP) and exactly what the AutoJnicVmpSelector used when it
+            // selected the native methods. shouldTransformClass excludes kept classes
+            // and would silently drop every selected method for a single-class app whose
+            // only class is the auto-kept Main, leaving JNIC to produce no native blob.
+            if (!cfg.shouldProtectClass(cn.name)) {
                 KBoxLog.debug(TAG, "  skip " + cn.name + " (shouldTransform=false)");
                 continue;
             }
-            if (firstClass == null) firstClass = cn;
+            if (!cfg.isNativeEligible(cn.name)) {
+                KBoxLog.debug(TAG, "  skip " + cn.name + " (native-excluded prefix)");
+                continue;
+            }
             for (MethodNode mn : cn.methods) {
                 String key = ProtectionConfig.memberKey(cn.name, mn.name, mn.desc);
                 boolean isNative = cfg.getNativeMethods().contains(key);
@@ -120,6 +149,7 @@ public final class JnicOrchestrator {
                     JniBytecodeInterp.InterpFn fn = JniBytecodeInterp.translate(cn.name, mn, index++);
                     fns.add(fn);
                     toMark.put(fn.symbol, mn);
+                    nativeClasses.add(cn);
                     KBoxLog.info(TAG, "Interp-translated " + key + " -> " + fn.symbol
                             + " (javaClass=" + fn.javaClass + ")");
                 } catch (Exception ex) {
@@ -142,7 +172,11 @@ public final class JnicOrchestrator {
         Path interpSrc = NativeCompiler.writeInterpreterSource(cDir);
 
         // Write stub source.
-        String src = NativeCompiler.assembleInterpSource(fns);
+        String src = NativeCompiler.assembleInterpSource(fns, classMethodCounts);
+        // Native shell hardening: encrypt function-body literals (class names,
+        // method signatures) in the generated JNI stubs and mutate any matched
+        // guard functions. Fail-safe — unknown contexts are left verbatim.
+        src = com.kbox.core.nativeshell.NativeShellGuard.guardSource(src);
         Path stubSrc = NativeCompiler.writeSource(cDir, LIB_NAME, src);
 
         List<Path> srcFiles = new ArrayList<>();
@@ -184,9 +218,12 @@ public final class JnicOrchestrator {
             mn.localVariables = null;
         }
 
-        // Inject NativeLoader.load().
-        if (firstClass != null) {
-            injectNativeLoader(firstClass);
+        // Inject NativeLoader.load() into EVERY class that carries a JNIC-native
+        // method (not just the first one). Each such class's <clinit> loads the
+        // native lib, so any native method is guaranteed to be resolvable even
+        // when the entry-point class itself was sunk to native.
+        for (ClassNode nc : nativeClasses) {
+            injectNativeLoader(nc);
         }
         return new Result(cres.library, blob, true, failures);
     }
@@ -212,17 +249,53 @@ public final class JnicOrchestrator {
     }
 
     /**
+     * Opcodes the JNIC v3 interpreter has no dispatch-table entry for (see
+     * {@code kbox_init_table()} in kbox_jnic_interp_v3.c). Everything else the
+     * C interpreter handles natively. {@code LDC_W}/{@code LDC2_W} are absent on
+     * purpose: the serializer normalises both to {@code LDC} (0x12) with a tagged
+     * 16-bit CP operand, so they never appear in the serialised stream. The four
+     * opcodes below are legacy control-flow forms that have no native handler and
+     * whose encoding ({@code insnSize}/{@code writeInsn}) is not implemented, so a
+     * method containing any of them is rejected and left to the Java obfuscator.
+     */
+    private static final Set<Integer> UNSUPPORTED_JNIC_OPCODES = new HashSet<>();
+    static {
+        UNSUPPORTED_JNIC_OPCODES.add(Opcodes.JSR);    // 0xA8
+        UNSUPPORTED_JNIC_OPCODES.add(Opcodes.RET);    // 0xA9
+        UNSUPPORTED_JNIC_OPCODES.add(0xC8);           // GOTO_W (not in ASM Opcodes)
+        UNSUPPORTED_JNIC_OPCODES.add(0xC9);           // JSR_W  (not in ASM Opcodes)
+    }
+
+    /**
      * Checks if a method contains bytecode instructions not supported by
      * the JNIC v3 interpreter. Returns the unsupported opcode name or null.
      *
-     * <p>The C interpreter now natively handles {@code TABLESWITCH},
-     * {@code LOOKUPSWITCH}, {@code MULTIANEWARRAY} and {@code INVOKEDYNAMIC}
-     * (via the injected {@code JnicIndy} bootstrap resolver), so this check is
-     * a no-op. It is retained as a guard so future additions must be reflected
-     * here explicitly rather than silently breaking serialisation.
+     * <p>The C interpreter natively handles the full modern JVM instruction
+     * set — including {@code TABLESWITCH}, {@code LOOKUPSWITCH},
+     * {@code MULTIANEWARRAY}, {@code INVOKEDYNAMIC} (via the injected
+     * {@code JnicIndy} bootstrap resolver), {@code WIDE} (emitted by the
+     * serializer for large local indices) and the exception table — so this
+     * guard only trips on the legacy JSR/RET/GOTO_W/JSR_W forms.
      */
     @SuppressWarnings("unchecked")
     static String checkUnsupportedInsns(MethodNode mn) {
+        for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            int op = insn.getOpcode();
+            if (op < 0) continue; // labels / frames / line numbers
+            if (UNSUPPORTED_JNIC_OPCODES.contains(op)) {
+                return opcodeName(op);
+            }
+        }
         return null;
+    }
+
+    private static String opcodeName(int op) {
+        switch (op) {
+            case Opcodes.JSR:    return "JSR";
+            case Opcodes.RET:    return "RET";
+            case 0xC8:           return "GOTO_W";
+            case 0xC9:           return "JSR_W";
+            default: return String.format("0x%02X", op);
+        }
     }
 }

@@ -35,6 +35,7 @@ public final class ResourceGuardLauncher {
     private static final String CLASS_SEED_PATH = "META-INF/kbox/class-seed.bin";
     private static final String ENCRYPTED_CLASSES_PATH = "META-INF/kbox/encrypted-classes.list";
     private static final String JNIC_CLASSES_PATH = "META-INF/kbox/jnic-classes.list";
+    private static final String PARENT_DELEGATE_PATH = "META-INF/kbox/parent-delegate.list";
     /** Manifest attribute that carries the real main class (dotted FQN). */
     public static final String ORIGINAL_MAIN_CLASS_ATTR = "Original-Main-Class";
 
@@ -88,8 +89,6 @@ public final class ResourceGuardLauncher {
                 String dotted = cn.replace('/', '.');
                 try {
                     Class.forName(dotted, true, sys);
-                    if (System.getProperty("kbox.vmp.dbg") != null)
-                        System.err.println("[KBOX-NATIVE] Pre-loaded JNIC class: " + dotted);
                 } catch (Throwable t) {
                     System.err.println("[KBOX-NATIVE] Pre-load JNIC class failed: " + dotted + " - " + t);
                 }
@@ -115,6 +114,12 @@ public final class ResourceGuardLauncher {
         // 3c. Configure JNIC class list from build-time metadata (already read above).
         if (jnicClassNames != null) {
             guard.setJnicClasses(jnicClassNames);
+        }
+
+        // 3d. Configure parent-delegated library classes (single-loader ASM/lib).
+        java.util.Set<String> parentDelegate = readNameList(sys, PARENT_DELEGATE_PATH);
+        if (parentDelegate != null) {
+            guard.setParentDelegate(parentDelegate);
         }
 
         // 4. Make this the context class loader so frameworks pick it up.
@@ -143,7 +148,12 @@ public final class ResourceGuardLauncher {
 
     /** Reads the JNIC-classes list from the classpath. Returns null if absent. */
     private static java.util.Set<String> readJnicClassList(ClassLoader loader) {
-        try (InputStream in = loader.getResourceAsStream(JNIC_CLASSES_PATH)) {
+        return readNameList(loader, JNIC_CLASSES_PATH);
+    }
+
+    /** Reads a newline-separated internal-name list resource. Returns null if absent. */
+    private static java.util.Set<String> readNameList(ClassLoader loader, String path) {
+        try (InputStream in = loader.getResourceAsStream(path)) {
             if (in == null) return null;
             byte[] data = readAll(in);
             String text = new String(data, java.nio.charset.StandardCharsets.UTF_8);
@@ -164,6 +174,15 @@ public final class ResourceGuardLauncher {
      * If the blob is absent (JNIC disabled) this is a no-op.
      */
     private static void preloadNativeLib(ClassLoader sys) {
+        // Only pre-load when the jar actually ships a native blob. Products
+        // whose JNIC auto-selection found no eligible methods have no
+        // META-INF/kbox/native.bin; NativeLoader.load() would otherwise fail
+        // loudly (stderr noise) for no benefit.
+        try (InputStream in = sys.getResourceAsStream("META-INF/kbox/native.bin")) {
+            if (in == null) return;
+        } catch (Exception e) {
+            return;
+        }
         try {
             // NativeLoader.load() is idempotent (synchronized+loaded flag).
             // We call it here, before any encrypted / guard-loaded classes

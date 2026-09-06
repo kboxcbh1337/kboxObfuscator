@@ -76,7 +76,10 @@ public final class ConstantObfuscator {
     }
 
     public void apply() {
-        if (!cfg.isObfuscateConstants()) return;
+        // mbaConstants is an alternative mechanism: when the intertwined-expression
+        // pass is active, the shared table decryptor is skipped so the two never
+        // rewrite (and fight over) the same constants.
+        if (!cfg.isObfuscateConstants() || cfg.getMbaConstants() > 0) return;
         if (key == Integer.MIN_VALUE) {
             do { key = rng.nextInt(); } while (key == Integer.MIN_VALUE || key == 0);
         }

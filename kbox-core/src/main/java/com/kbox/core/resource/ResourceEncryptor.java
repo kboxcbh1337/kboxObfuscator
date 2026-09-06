@@ -35,7 +35,7 @@ import java.util.Map;
 public final class ResourceEncryptor {
 
     private static final String TAG = "resource-enc";
-    private static final byte MAGIC = (byte) 0x4B;   // 'K'
+    private static final byte MAGIC = (byte) 0x93;   // 'K'^0xD8, masked (NOT ASCII 'K')
     private static final int IV_LEN = 12;
     private static final int TAG_BITS = 128;
 

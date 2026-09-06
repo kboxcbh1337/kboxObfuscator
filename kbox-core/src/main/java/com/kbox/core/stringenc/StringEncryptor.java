@@ -14,6 +14,8 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -377,13 +379,29 @@ public final class StringEncryptor {
 
     /** Append one dynamic argument (stored in a local slot) to the builder. */
     private void appendArg(InsnList out, char t, int slot) {
+        // Booleans must append as "true"/"false", not as int 1/0.
+        if (t == 'Z') {
+            out.add(new VarInsnNode(Opcodes.ILOAD, slot));
+            LabelNode lTrue = new LabelNode();
+            LabelNode lEnd = new LabelNode();
+            out.add(new JumpInsnNode(Opcodes.IFNE, lTrue));
+            out.add(new LdcInsnNode("false"));
+            out.add(new JumpInsnNode(Opcodes.GOTO, lEnd));
+            out.add(lTrue);
+            out.add(new LdcInsnNode("true"));
+            out.add(lEnd);
+            out.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "java/lang/StringBuilder", "append",
+                    "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false));
+            return;
+        }
         // load the argument back from its local slot
         int loadOp;
         switch (t) {
             case 'J': loadOp = Opcodes.LLOAD; break;
             case 'F': loadOp = Opcodes.FLOAD; break;
             case 'D': loadOp = Opcodes.DLOAD; break;
-            case 'Z': case 'C': case 'B': case 'S': case 'I':
+            case 'C': case 'B': case 'S': case 'I':
                 loadOp = Opcodes.ILOAD; break;
             default:  loadOp = Opcodes.ALOAD; break;
         }
@@ -395,7 +413,8 @@ public final class StringEncryptor {
             case 'J': desc = "(J)Ljava/lang/StringBuilder;"; break;
             case 'F': desc = "(F)Ljava/lang/StringBuilder;"; break;
             case 'D': desc = "(D)Ljava/lang/StringBuilder;"; break;
-            case 'Z': case 'C': case 'B': case 'S': case 'I':
+            case 'C': desc = "(C)Ljava/lang/StringBuilder;"; break;
+            case 'B': case 'S': case 'I':
                 desc = "(I)Ljava/lang/StringBuilder;"; break;
             default:  desc = "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"; break;
         }

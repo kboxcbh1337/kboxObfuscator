@@ -112,7 +112,15 @@ public final class MbaConstantObfuscator {
     private static int constantValue(AbstractInsnNode ins) {
         int op = ins.getOpcode();
         if (op >= Opcodes.ICONST_M1 && op <= Opcodes.ICONST_5) return op - Opcodes.ICONST_0;
-        if (ins instanceof IntInsnNode) return ((IntInsnNode) ins).operand;
+        // Only the genuine int-push opcodes. IntInsnNode also covers NEWARRAY,
+        // whose "operand" is an array type code (T_BOOLEAN=4 .. T_LONG=11): those
+        // values slip past the abs(v)<4 filter below, so the old
+        // "instanceof IntInsnNode" test replaced every array allocation with a
+        // bare int expression. NEWARRAY pops a length and pushes a reference, so
+        // dropping it left the operand stack unbalanced at return (+1) and made
+        // the class unloadable — 92 classes of an 8.6k-class jar were rolled back
+        // by the packaging verifier because of this.
+        if (op == Opcodes.BIPUSH || op == Opcodes.SIPUSH) return ((IntInsnNode) ins).operand;
         if (ins instanceof LdcInsnNode && ((LdcInsnNode) ins).cst instanceof Integer)
             return (Integer) ((LdcInsnNode) ins).cst;
         return Integer.MIN_VALUE;

@@ -49,29 +49,14 @@ public final class ExceptionJumpObfuscator {
         if (!cfg.isExceptionJumpObf()) return;
         ClassNode carrier = ensureCarrier();
         if (carrier == null) return;
-        int transformed = 0;
-        int skippedLibrary = 0;
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (cn.name.equals(CARRIER)) continue;
-            // Single canonical decision: library classes are never transformed.
-            // Kept classes are still body-protected (names preserved separately).
-            if (!cfg.shouldProtectClass(cn.name)) {
-                skippedLibrary++;
-                continue;
-            }
-            try {
-                transformed += transformClass(cn);
-            } catch (Throwable t) {
-                if (cfg.isNeverFail()) {
-                    KBoxLog.warn(TAG, "Exception-jump failed for " + cn.name + ": " + t.getMessage());
-                } else {
-                    throw new com.kbox.core.KBoxException(
-                            "Exception-jump obfuscation failed for " + cn.name, t);
-                }
-            }
-        }
-        KBoxLog.info(TAG, "Transformed " + transformed + " int-returns to exception-jump"
-                + (skippedLibrary > 0 ? " (" + skippedLibrary + " library classes skipped)" : ""));
+        java.util.concurrent.atomic.AtomicInteger transformed = new java.util.concurrent.atomic.AtomicInteger();
+        // Per-class independent (carrier already injected above); failures are
+        // caught + logged by the processor, matching neverFail semantics.
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.name.equals(CARRIER)) return;
+            transformed.addAndGet(transformClass(cn));
+        }, cfg.getParallelThreads());
+        KBoxLog.info(TAG, "Transformed " + transformed.get() + " int-returns to exception-jump");
     }
 
     @SuppressWarnings("unchecked")

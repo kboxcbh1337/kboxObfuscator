@@ -95,7 +95,8 @@ html[data-theme="light"] .theme-btn .sun{display:none}
 .sec-title small{font-weight:500;color:var(--text-faint);margin-left:auto;font-size:12px}
 
 /* ---- 文件行 ---- */
-.file-row{display:flex;gap:10px;margin-bottom:13px;align-items:center}
+.file-row{display:flex;gap:10px;margin-bottom:13px;align-items:center;border:1px dashed transparent;border-radius:14px;padding:4px 6px;transition:border-color .35s,background .35s,transform .35s}
+.file-row.drop-hover{border-color:var(--green-2);background:color-mix(in srgb,var(--green-3) 7%,transparent);transform:translateY(-1px)}
 .file-row label{width:128px;flex:none;font-size:13px;color:var(--text-dim);letter-spacing:.03em}
 .file-row input{flex:1;background:var(--code-bg);border:1px solid var(--border);color:var(--text);
   border-radius:12px;padding:12px 14px;font-size:13.5px;outline:none;
@@ -144,6 +145,12 @@ textarea:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
 .btn-run:active:not(:disabled){transform:translateY(0) scale(.985)}
 .btn-run:disabled{filter:grayscale(.4) brightness(.75);cursor:not-allowed;animation:none}
 .btn-run:disabled::before{display:none}
+.btn.loading{opacity:.75;cursor:progress;position:relative;pointer-events:none}
+.btn.loading::after{content:"";position:absolute;inset:0;border-radius:inherit;
+  background:linear-gradient(120deg,transparent 30%,rgba(74,222,128,.35) 50%,transparent 70%);
+  background-size:220% 100%;animation:stripe .9s linear infinite}
+.btn.ok-flash{box-shadow:0 0 0 3px var(--green-2),0 0 22px var(--glow);animation:okPulse .9s ease}
+@keyframes okPulse{0%{transform:scale(1)}40%{transform:scale(1.06)}100%{transform:scale(1)}}
 .ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,.5);transform:scale(0);
   animation:ripple .65s ease-out forwards;pointer-events:none}
 @keyframes ripple{to{transform:scale(4);opacity:0}}
@@ -229,15 +236,17 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
   <!-- 目标文件 -->
   <section class="card">
     <div class="sec-title"><span class="dot"></span>保护目标 <small>INPUT · OUTPUT · CONFIG</small></div>
-    <div class="file-row"><label>输入 jar</label>
-      <input id="inField" placeholder="D:\path\to\app.jar" spellcheck="false">
-      <button class="btn btn-ghost" onclick="browse('open','inField')">浏览…</button></div>
+    <div class="file-row" id="dropIn"><label>输入 jar</label>
+      <input id="inField" placeholder="D:\path\to\app.jar 或拖拽/点浏览选择" spellcheck="false">
+      <input type="file" id="pickIn" accept=".jar,.war,.zip,.class" style="display:none">
+      <button class="btn btn-ghost" id="btnIn">浏览…</button></div>
     <div class="file-row"><label>输出 jar</label>
-      <input id="outField" placeholder="D:\path\to\out.jar" spellcheck="false">
-      <button class="btn btn-ghost" onclick="browse('save','outField')">浏览…</button></div>
-    <div class="file-row"><label>配置（可选）</label>
+      <input id="outField" placeholder="留空则自动生成 输入名-protected.jar" spellcheck="false">
+      <button class="btn btn-ghost" id="btnOut" title="输出路径由输入自动推导，或手动填写">自动</button></div>
+    <div class="file-row" id="dropCfg"><label>配置（可选）</label>
       <input id="cfgField" placeholder="ns-full.conf · 留空则默认保护" spellcheck="false">
-      <button class="btn btn-ghost" onclick="browse('open','cfgField')">浏览…</button></div>
+      <input type="file" id="pickCfg" accept=".conf,.txt,.properties" style="display:none">
+      <button class="btn btn-ghost" id="btnCfg">浏览…</button></div>
     <div class="row">
       <div class="field" style="flex:1;min-width:260px">
         <label>C 编译器（native 链路）</label>
@@ -316,6 +325,16 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
       <label class="toggle"><input type="checkbox" id="vmpProtectRuntime"><span class="sw"></span><span class="lbl">VMP 保护运行期<span class="sub">运行时解密方法也虚拟化</span></span></label>
       <label class="toggle"><input type="checkbox" id="silentShield" checked><span class="sw"></span><span class="lbl">SilentShield 适配审计<span class="sub">弱点驱动自动策略</span></span></label>
     </div>
+    <div class="row" id="excRow" style="display:none">
+      <div class="field" style="flex:1;min-width:280px">
+        <label>VMP 排除类（虚拟化豁免 · 需勾选 VMP）</label>
+        <textarea id="vmpExclude" placeholder="每行一个类名或前缀，点分/斜杠均可，如：&#10;com.example.ui&#10;com/example/netty.NettyHandler" spellcheck="false"></textarea>
+      </div>
+      <div class="field" style="flex:1;min-width:280px">
+        <label>JNIC 排除类（原生化豁免 · 需勾选 JNIC）</label>
+        <textarea id="jnicExclude" placeholder="每行一个类名或前缀，点分/斜杠均可，如：&#10;com.example.io&#10;com/example/netty.NettyHandler" spellcheck="false"></textarea>
+      </div>
+    </div>
     <div class="row">
       <div class="field"><label>nativeShell 增强壳</label>
         <select id="nativeShell"><option value="0">0 · 关</option><option value="1">1 · M1 字符串擦除</option><option value="2">2 · +M2 控制流变异</option><option value="3" selected>3 · +M3 IAT 隐藏</option></select></div>
@@ -369,8 +388,10 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
     <div class="sec-title"><span class="dot"></span>执行 <small>PROTECTION ENGINE</small></div>
     <div class="run-zone">
       <button class="btn btn-run" id="runBtn">开始混淆</button>
+      <button class="btn btn-ghost" id="adaptBtn" title="扫描输入 jar，识别应用/库/Spring Boot/Minecraft mod，自动回填推荐选项">⚡ 智能适配</button>
       <div class="loading-ring" id="ring"><div class="ring"></div><div class="ring r2"></div></div>
     </div>
+    <div class="summary" id="adaptInfo"></div>
 
     <div class="status-head" style="margin-top:22px">
       <span class="status-dot" id="statusDot"></span>
@@ -418,13 +439,83 @@ document.addEventListener('click',e=>{
   b.appendChild(ri);setTimeout(()=>ri.remove(),700);
 });
 
-/* ---------- 浏览（后端 JFileChooser） ---------- */
-async function browse(mode,field){
-  const res=await fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mode,current:$(field).value})});
-  const j=await res.json();
-  if(j.path)$(field).value=j.path;
+/* ---------- VMP/JNIC 排除类：仅在开启 VMP 或 JNIC 时可填 ---------- */
+function syncExclusionRow(){
+  const on=$('vmp').checked||$('jnic').checked;
+  $('excRow').style.display=on?'flex':'none';
+  const ta=[$('vmpExclude'),$('jnicExclude')];
+  for(const t of ta)t.disabled=!on;
+  // 单项细化：VMP 排除仅在 VMP 开时可用，JNIC 排除仅在 JNIC 开时可用
+  $('vmpExclude').parentElement.style.opacity=$('vmp').checked?'1':'.38';
+  $('jnicExclude').parentElement.style.opacity=$('jnic').checked?'1':'.38';
+  $('vmpExclude').disabled=!$('vmp').checked;
+  $('jnicExclude').disabled=!$('jnic').checked;
 }
+$('vmp').addEventListener('change',syncExclusionRow);
+$('jnic').addEventListener('change',syncExclusionRow);
+syncExclusionRow();
+
+/* ---------- 纯 HTML 文件选择（浏览器原生 + 丝滑上传动画，不再调 Java 对话框） ---------- */
+function pickFile(fileInput, field, btn, isCfg){
+  const f=fileInput.files&&fileInput.files[0];
+  if(!f)return;
+  const btn0=btn;
+  btn.classList.add('loading');btn.disabled=true;
+  const oldTxt=btn.textContent;btn.textContent='上传中…';
+  field.parentElement.classList.add('drop-hover');
+  const fd=new FormData();fd.append('file',f);
+  fetch('/api/upload',{method:'POST',body:fd})
+    .then(r=>r.json())
+    .then(j=>{
+      if(!j.ok){flash('上传失败: '+(j.error||''));return;}
+      field.value=j.path;
+      field.dispatchEvent(new Event('change'));
+      btn.classList.remove('loading');btn.disabled=false;btn.textContent=oldTxt;
+      field.parentElement.classList.remove('drop-hover');
+      if(!isCfg&&!$('outField').value.trim()){
+        // 输出自动推导：同目录 + "-protected.jar"
+        const p=j.path.replace(/\\/g,'/');
+        const slash=p.lastIndexOf('/');
+        const dir=p.slice(0,slash+1), name=p.slice(slash+1);
+        const dot=name.lastIndexOf('.');
+        const base=dot>0?name.slice(0,dot):name;
+        $('outField').value=dir+base+'-protected.jar';
+      }
+      // 成功闪光
+      btn.classList.add('ok-flash');setTimeout(()=>btn.classList.remove('ok-flash'),900);
+      flash('已选择: '+j.name+'（'+Math.max(1,Math.round(j.size/1024))+' KB）');
+    })
+    .catch(()=>{btn.classList.remove('loading');btn.disabled=false;btn.textContent=oldTxt;field.parentElement.classList.remove('drop-hover');flash('上传失败: 无法连接后端');});
+}
+$('btnIn').addEventListener('click',()=>$('pickIn').click());
+$('btnCfg').addEventListener('click',()=>$('pickCfg').click());
+$('pickIn').addEventListener('change',function(){pickFile(this,$('inField'),$('btnIn'),false);this.value='';});
+$('pickCfg').addEventListener('change',function(){pickFile(this,$('cfgField'),$('btnCfg'),true);this.value='';});
+$('btnOut').addEventListener('click',()=>{
+  const inV=$('inField').value.trim();
+  if(!inV){flash('请先选择输入 jar，输出路径将自动推导');return;}
+  const p=inV.replace(/\\/g,'/');const slash=p.lastIndexOf('/');
+  const dir=p.slice(0,slash+1),name=p.slice(slash+1);
+  const dot=name.lastIndexOf('.');const base=dot>0?name.slice(0,dot):name;
+  $('outField').value=dir+base+'-protected.jar';
+  flash('已自动生成输出路径');
+});
+/* 拖拽选择（丝滑高亮动画） */
+function setupDrop(zoneId,fileInput,field,btn,isCfg){
+  const z=$(zoneId);if(!z)return;
+  z.addEventListener('dragover',e=>{e.preventDefault();z.classList.add('drop-hover');});
+  z.addEventListener('dragleave',()=>z.classList.remove('drop-hover'));
+  z.addEventListener('drop',e=>{
+    e.preventDefault();z.classList.remove('drop-hover');
+    const f=e.dataTransfer.files&&e.dataTransfer.files[0];
+    if(!f)return;
+    const dt=new DataTransfer();dt.items.add(f);
+    fileInput.files=dt.files;
+    pickFile(fileInput,field,btn,isCfg);
+  });
+}
+setupDrop('dropIn',$('pickIn'),$('inField'),$('btnIn'),false);
+setupDrop('dropCfg',$('pickCfg'),$('cfgField'),$('btnCfg'),true);
 
 /* ---------- 状态轮询 ---------- */
 function setUi(status){
@@ -490,7 +581,67 @@ function toggleAllMax(on){
   if(!on){
     for(const id of DEFAULT_CHECKED){if($(id))$(id).checked=true;}
   }
+  if(typeof syncExclusionRow==='function')syncExclusionRow();
 }
+
+/* ---------- 智能适配：分析输入 jar 并回填推荐选项 ---------- */
+let _adaptTimer=null,_adaptSeq=0,_autoApplied=false;
+async function analyze(auto){
+  const inV=$('inField').value.trim();
+  if(!inV){ if(!auto)flash('请先填写输入 jar'); return; }
+  const info=$('adaptInfo');
+  if(!auto){
+    info.classList.remove('show');info.style.color='';
+    info.innerHTML='<div class="loading-ring show" style="display:inline-block;width:18px;height:18px;margin-right:8px;vertical-align:-3px"><div class="ring" style="border-width:2px"></div></div>分析中…';
+    info.classList.add('show');
+  }
+  const mySeq=++_adaptSeq;
+  try{
+    const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({input:inV})});
+    const j=await res.json();
+    if(mySeq!==_adaptSeq)return;                 // 过期响应（输入又变了）
+    if(!j.ok){ if(!auto){info.style.color='var(--danger)';info.innerHTML='⚠ '+(j.error||'分析失败');} return;}
+    applyAdapt(j);
+    _autoApplied=true;
+    const chips=(j.checks||[]).map(c=>'<b>'+escapeHtml(c)+'</b>').join(' · ');
+    const html='<b>'+escapeHtml(j.label)+'</b> — '+j.classes+' 类 / '+j.resources+' 资源<br>'+
+      chips+'<br><span style="opacity:.9">'+escapeHtml(j.note||'')+'</span>'+
+      (auto?'':'<br><span style="opacity:.6;font-size:11.5px">推荐已应用到下方选项 — 可继续微调；勾选「一键全开」可整体拉满。</span>');
+    info.innerHTML=html;
+    info.classList.add('show');
+  }catch(e){ if(!auto){info.style.color='var(--danger)';info.innerHTML='⚠ 无法连接后端服务';} }
+}
+function applyAdapt(j){
+  const sets=j.sets||{};
+  for(const k in sets){
+    const el=$(k); if(!el)continue;
+    const v=sets[k];
+    if(el.type==='checkbox')el.checked=(v!=='0'&&v!=='false');
+    else if(el.value!==undefined)el.value=v;
+  }
+  const am=$('allMax');
+  if(am&&am.checked){am.checked=false;}   // 推荐集与 allMax 覆盖冲突，关掉全开档
+  if($('allMaxRow'))$('allMaxRow').style.borderColor='';
+  if(typeof syncExclusionRow==='function')syncExclusionRow();
+}
+/* 自动适配：输入 jar 失焦/更换后自动分析并回填（无需手动点按钮）。 */
+function scheduleAutoAnalyze(){
+  if(_adaptTimer)clearTimeout(_adaptTimer);
+  _adaptTimer=setTimeout(()=>{ if($('inField').value.trim())analyze(true); },500);
+}
+$('adaptBtn').addEventListener('click',()=>analyze(false));
+$('inField').addEventListener('change',scheduleAutoAnalyze);
+/* 页面打开即自动适配：CLI 预填(--gui -i/-o)或用户上次输入的 jar。 */
+(function initAuto(){
+  try{
+    if(window._pf&&window._pf.i){
+      $('inField').value=window._pf.i;
+      if(window._pf.o)$('outField').value=window._pf.o;
+    }
+    if($('inField').value.trim())scheduleAutoAnalyze();
+  }catch(e){}
+})();
 
 /* ---------- 启动混淆 ---------- */
 async function protect(){
@@ -526,7 +677,8 @@ async function protect(){
     selfWipeSections:+$('selfWipeSections').value,processHeartbeat:+$('processHeartbeat').value,
     honeypotPe:+$('honeypotPe').value,oneTimeSemantic:+$('oneTimeSemantic').value,lineageChain:+$('lineageChain').value,
     selfRefAuth:+$('selfRefAuth').value,multiRep:+$('multiRep').value,polyGold:+$('polyGold').value,
-    signalPoison:+$('signalPoison').value,buildSigBind:+$('buildSigBind').value
+    signalPoison:+$('signalPoison').value,buildSigBind:+$('buildSigBind').value,
+    vmpExclude:$('vmpExclude').value.trim(),jnicExclude:$('jnicExclude').value.trim()
   };
   try{
     const res=await fetch('/api/protect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

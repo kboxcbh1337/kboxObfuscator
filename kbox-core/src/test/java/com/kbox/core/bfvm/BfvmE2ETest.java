@@ -189,7 +189,7 @@ public class BfvmE2ETest {
     public void mainPrintsThroughBf() throws Exception {
         Class<?> c = loadTransformed("Calc");
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        PrintStream ps = new PrintStream(bos, true, StandardCharsets.UTF_8);
+        PrintStream ps = new PrintStream(bos, true, StandardCharsets.UTF_8.name());
         PrintStream old = System.out;
         System.setOut(ps);
         try {

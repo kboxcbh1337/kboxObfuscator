@@ -71,14 +71,27 @@ public final class DependencyAnalyzer {
         try {
             byte[] data = readAll(zf.getInputStream(me));
             graph.setManifest(data);
-            // Parse Main-Class header (cheap, no java.util.jar.Manifest to avoid Unicode issues).
+            // Parse the headers line-by-line (cheap, and avoids java.util.jar
+            // Manifest which canonicalizes the on-disk format). Attribute names
+            // are matched at line start so the "Original-Main-Class" attribute
+            // we inject can never be mistaken for "Main-Class".
             String s = new String(data, "UTF-8");
-            int i = s.indexOf("Main-Class:");
-            if (i >= 0) {
-                int j = i + "Main-Class:".length();
-                int nl = s.indexOf('\n', j);
-                String mc = s.substring(j, nl < 0 ? s.length() : nl).trim();
-                graph.setManifestMainClass(mc.replace('.', '/'));
+            for (String line : s.split("\r?\n")) {
+                int c = line.indexOf(':');
+                if (c < 0) continue;
+                String key = line.substring(0, c).trim();
+                String val = line.substring(c + 1).trim();
+                if (val.isEmpty()) continue;
+                if ("Main-Class".equals(key)) {
+                    graph.setManifestMainClass(val.replace('.', '/'));
+                } else if ("Start-Class".equals(key)) {
+                    // Spring Boot executable jar: Main-Class is the boot loader
+                    // (org.springframework.boot.loader.launch.JarLauncher, which
+                    // lives at the jar ROOT) and Start-Class is the real
+                    // application entry point. Kept so the packager rewrites
+                    // Start-Class instead of Main-Class for these jars.
+                    graph.setManifestStartClass(val.replace('.', '/'));
+                }
             }
         } catch (IOException ex) {
             KBoxLog.warn(TAG, "Could not read manifest: " + ex);
@@ -101,9 +114,24 @@ public final class DependencyAnalyzer {
             readNestedJar(zf.getInputStream(e), name);
         } else if (name.equals("META-INF/MANIFEST.MF")) {
             // already handled
+        } else if (springBoot && (name.equals("BOOT-INF/classpath.idx")
+                || name.equals("BOOT-INF/layers.idx"))) {
+            // Spring Boot structural indexes. The boot loader resolves them by
+            // this exact path (declared via Spring-Boot-Classpath-Index /
+            // Spring-Boot-Layers-Index in the manifest), so they are copied
+            // verbatim at their original location by Packager and must never
+            // enter the renameable resource set — rewriting BOOT-INF/classpath.idx
+            // to res/<hash>.idx leaves the boot loader with an EMPTY classpath.
         } else {
             // Resource file (services, spring.factories, hbm.xml, etc.)
-            graph.getResources().put(name, readAll(zf.getInputStream(e)));
+            // For a Spring Boot fat jar the classpath root IS BOOT-INF/classes/,
+            // so application code asks the loader for the path WITHOUT that
+            // prefix (it requests "application.yml", not
+            // "BOOT-INF/classes/application.yml"). Store the logical path: the
+            // runtime resource mapping is keyed by logical name, and the packager
+            // re-adds the clsRoot prefix when writing entries.
+            String key = name.substring(clsRoot.length());
+            graph.getResources().put(key, readAll(zf.getInputStream(e)));
         }
     }
 
@@ -121,6 +149,9 @@ public final class DependencyAnalyzer {
                     byte[] bytes = readAll(nzf.getInputStream(e));
                     // Only keep app-owned classes (skip JDK / well-known libs to save memory).
                     parseClass(internal, bytes, label + "!" + e.getName());
+                    // Reference-only: these bytes ship verbatim inside the nested
+                    // jar, so the packager must not write them again.
+                    graph.getNestedJarClasses().add(internal);
                 }
             }
         } finally {
@@ -195,7 +226,16 @@ public final class DependencyAnalyzer {
             try {
                 ClassReader cr = new ClassReader(bytes);
                 ClassNode n = new ClassNode();
-                cr.accept(n, ClassReader.SKIP_DEBUG | ClassReader.EXPAND_FRAMES);
+                // NOT SKIP_DEBUG: that flag also suppresses visitParameter, which
+                // drops the MethodParameters attribute from every class we
+                // re-serialize. Spring Framework 6.1+ reads constructor parameter
+                // names from exactly that attribute for constructor binding, so
+                // losing it makes @ConfigurationProperties beans fail with
+                // "Unable to create instance for com.example.Foo — This may be due
+                // to missing parameter name information" (the LocalVariableTable is
+                // stripped later anyway; MethodParameters is runtime-significant and
+                // must survive).
+                cr.accept(n, ClassReader.EXPAND_FRAMES);
                 node = n;
             } catch (Exception ex) {
                 error = ex;

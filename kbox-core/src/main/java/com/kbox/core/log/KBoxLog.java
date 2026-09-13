@@ -60,7 +60,9 @@ public final class KBoxLog {
             Files.createDirectories(file.toAbsolutePath().getParent());
             OutputStream fos = Files.newOutputStream(file, java.nio.file.StandardOpenOption.CREATE,
                     java.nio.file.StandardOpenOption.APPEND, java.nio.file.StandardOpenOption.WRITE);
-            fileOut = new PrintStream(fos, true, StandardCharsets.UTF_8);
+            // PrintStream(OutputStream, boolean, Charset) is Java 10+; use the
+            // Java 1.1 String-encoding overload (same UTF-8 encoding).
+            fileOut = new PrintStream(fos, true, StandardCharsets.UTF_8.name());
             return fileOut;
         } catch (IOException e) {
             System.err.println("[KBoxLog] cannot open UTF-8 log file " + file + ": " + e.getMessage());

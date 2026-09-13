@@ -11,6 +11,11 @@ package com.kbox.runtime;
  *       (a class or a stored hash was touched, even without a debugger);</li>
  *   <li>{@link VmpInterpreter} — the per-method instruction-stream FNV-1a check
  *       or the interpreter self-hash fired (an in-memory patch).</li>
+ *   <li>{@link BfSecureLoader} (Brainfuck mode only) — the resident native
+ *       decoder's {@code probeEnv()}: injected Frida / .NET-CLR mscoree /
+ *       coreclr libraries, a registry tamper vector (AppInit/AppCert/IFEO) or a
+ *       Frida in-memory payload. Resolved reflectively so a non-BF artifact
+ *       (where the class is absent) degrades to a silent {@code false}.</li>
  * </ul>
  * Historically the string decryptor consulted <em>only</em> {@link AntiDebug},
  * so repackaging a jar or patching a method in memory — without ever attaching a
@@ -30,11 +35,12 @@ public final class TamperShield {
 
     private TamperShield() {}
 
-    /** True if any of the three tamper signals has fired. */
+    /** True if any of the four tamper signals has fired. */
     public static boolean isTampered() {
         if (AntiDebug.isTampered()) return true;
         if (integrityTampered()) return true;
-        return vmTampered();
+        if (vmTampered()) return true;
+        return nativeEnvTampered();
     }
 
     /** IntegrityCheck is a hard reference only guarded at runtime (may not be injected). */
@@ -54,5 +60,36 @@ public final class TamperShield {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** Brainfuck-mode native environment probe ({@link BfSecureLoader#probeEnv}):
+     *  injection modules / registry tamper / Frida memory. Reflective + defensive —
+     *  absent class (non-BF artifact) or a JNI-less runtime both yield false.
+     *
+     *  <p>Throttled to once per second: this gate is consulted by EVERY string
+     *  decryption, and an unthrottled native call would walk the address space
+     *  for every string (CPU/memory hog on hot loops). A cached verdict is
+     *  semantically fine — an injected Frida/.NET payload that appears is still
+     *  caught within 1s, and the native W1/W2 watchdogs re-poll independently. */
+    private static volatile long lastEnvProbe = 0;
+    private static volatile boolean lastEnvProbeResult = false;
+
+    private static boolean nativeEnvTampered() {
+        long now = System.currentTimeMillis();
+        if (now - lastEnvProbe < 1000) return lastEnvProbeResult;
+        boolean r = false;
+        try {
+            Class<?> loader = Class.forName("com.kbox.runtime.BfSecureLoader",
+                    false, TamperShield.class.getClassLoader());
+            java.lang.reflect.Method m = loader.getDeclaredMethod("probeEnv");
+            m.setAccessible(true);
+            Object res = m.invoke(null);
+            r = res instanceof Integer && ((Integer) res).intValue() != 0;
+        } catch (Throwable t) {
+            r = false;
+        }
+        lastEnvProbe = now;
+        lastEnvProbeResult = r;
+        return r;
     }
 }

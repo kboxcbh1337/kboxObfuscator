@@ -391,8 +391,14 @@ public final class ResourceGuardClassLoader extends ClassLoader {
     public URL getResource(String name) {
         byte[] data = resolve(name);
         if (data == null) return super.getResource(name);
+        URL cached = resourceUrls.get(name);
+        if (cached != null) return cached;
+        String path = "/" + MEM_SEQ.incrementAndGet() + "/" + name;
+        MEM_RESOURCES.put(path, data);
         try {
-            return new URL("data:," + java.util.Base64.getEncoder().encodeToString(data));
+            URL u = new URL("kboxmem", null, -1, path, MEM_HANDLER);
+            resourceUrls.put(name, u);
+            return u;
         } catch (Exception e) {
             return null;
         }
@@ -408,12 +414,8 @@ public final class ResourceGuardClassLoader extends ClassLoader {
     @Override
     public Enumeration<URL> getResources(String name) throws java.io.IOException {
         final java.util.List<URL> urls = new java.util.ArrayList<>();
-        byte[] data = resolve(name);
-        if (data != null) {
-            try {
-                urls.add(new URL("data:," + java.util.Base64.getEncoder().encodeToString(data)));
-            } catch (Exception ignore) {}
-        }
+        URL own = getResource(name);
+        if (own != null) urls.add(own);
         Enumeration<URL> parent = super.getResources(name);
         while (parent.hasMoreElements()) urls.add(parent.nextElement());
         final java.util.Iterator<URL> it = urls.iterator();
@@ -422,6 +424,55 @@ public final class ResourceGuardClassLoader extends ClassLoader {
             @Override public URL nextElement() { return it.next(); }
         };
     }
+
+    // ------------------------------------------------------------------
+    //  In-memory resource URLs
+    //
+    //  A resolved (renamed / decrypted) resource must be handed out as a URL that
+    //  the caller can actually open. Emitting "data:" does NOT work: the JDK ships
+    //  no URLStreamHandler for that protocol, so `new URL(...)` throws and the
+    //  method ends up returning null — the resource looks missing. Spring Boot
+    //  survives that because it reads resources through getResourceAsStream, but
+    //  anything that goes through getResource()/URL.openStream() does not:
+    //  java.util.ResourceBundle is the common case, and it fails with
+    //  "MissingResourceException: Can't find bundle for base name ...".
+    // ------------------------------------------------------------------
+
+    /** Backing store for the synthetic resource URLs handed out by getResource. */
+    private static final java.util.Map<String, byte[]> MEM_RESOURCES =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** One URL per requested resource name, so repeated lookups stay stable. */
+    private final java.util.Map<String, URL> resourceUrls = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final java.util.concurrent.atomic.AtomicLong MEM_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Serves {@link #MEM_RESOURCES} entries; called by the JVM. */
+    private static final java.net.URLStreamHandler MEM_HANDLER = new java.net.URLStreamHandler() {
+        @Override
+        protected java.net.URLConnection openConnection(URL u) {
+            return new java.net.URLConnection(u) {
+                @Override public void connect() { /* in-memory */ }
+
+                @Override
+                public java.io.InputStream getInputStream() throws java.io.IOException {
+                    byte[] d = MEM_RESOURCES.get(u.getPath());
+                    if (d == null) {
+                        throw new java.io.FileNotFoundException(u.toExternalForm());
+                    }
+                    return new ByteArrayInputStream(d);
+                }
+
+                @Override public int getContentLength() {
+                    byte[] d = MEM_RESOURCES.get(u.getPath());
+                    return d == null ? -1 : d.length;
+                }
+
+                @Override public long getContentLengthLong() { return getContentLength(); }
+            };
+        }
+    };
 
     /** Returns the decrypted bytes for {@code name} or null when unmapped. */
     private byte[] resolve(String name) {

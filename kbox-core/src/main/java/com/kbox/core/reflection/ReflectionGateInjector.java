@@ -54,6 +54,11 @@ public final class ReflectionGateInjector {
     private static final int FNV_OFFSET = 0x811c9dc5;
     private static final int FNV_PRIME = 0x01000193;
 
+    /** Allow-list entries written per fill helper. The JVM rejects any method
+     *  whose bytecode exceeds 64 KiB; one entry costs ~4 instructions, so this
+     *  keeps every generated method far below the limit. */
+    private static final int FILL_CHUNK = 2000;
+
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
 
@@ -113,26 +118,67 @@ public final class ReflectionGateInjector {
         cn.fields.add(new FieldNode(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
                 "_allow", "[I", null, null));
 
-        // <clinit>: _allow = new int[]{h1, h2, ...}
+        // <clinit>: allocate _allow, then fill it from size-bounded helpers.
+        //
+        // The allow-list holds one hash per class in the input — tens of thousands
+        // for a real application jar. Emitting it as a single array literal made
+        // <clinit> exceed the JVM's 64 KiB per-method bytecode limit, so
+        // serialization raised MethodTooLargeException and, a synthetic class
+        // having no original bytes to roll back to, the holder was silently
+        // dropped: every rewritten Class.forName call site then pointed at a class
+        // that does not exist (NoClassDefFoundError at runtime). Filling in chunks
+        // keeps each method small with no behavioural change.
+        List<Integer> hashes = new java.util.ArrayList<>(allow);
         MethodNode clinit = new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
         InsnList cl = clinit.instructions;
-        pushInt(cl, allow.size());
+        pushInt(cl, hashes.size());
         cl.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_INT));
-        int idx = 0;
-        for (int h : allow) {
-            cl.add(new InsnNode(Opcodes.DUP));
-            pushInt(cl, idx++);
-            pushInt(cl, h);
-            cl.add(new InsnNode(Opcodes.IASTORE));
-        }
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_allow", "[I"));
+        for (int base = 0; base < hashes.size(); base += FILL_CHUNK) {
+            cl.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_allow", "[I"));
+            cl.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder,
+                    fillerName(base / FILL_CHUNK), "([I)V", false));
+        }
         cl.add(new InsnNode(Opcodes.RETURN));
-        clinit.maxStack = 3;
+        clinit.maxStack = 2;
         clinit.maxLocals = 0;
         cn.methods.add(clinit);
 
+        for (int base = 0; base < hashes.size(); base += FILL_CHUNK) {
+            cn.methods.add(buildFiller(fillerName(base / FILL_CHUNK), hashes,
+                    base, Math.min(base + FILL_CHUNK, hashes.size())));
+        }
+
         cn.methods.add(buildCheckForName(holder));
         graph.getClasses().put(holder, cn);
+    }
+
+    /** Name of the {@code <clinit>} fill helper for chunk {@code k}. */
+    private static String fillerName(int k) {
+        return "_f" + k;
+    }
+
+    /**
+     * Emits {@code private static void <name>(int[] a)} storing
+     * {@code hashes[from..to)} into {@code a} at their absolute indices. Splitting
+     * the store across several methods is what keeps the generated holder inside
+     * the JVM's 64 KiB per-method bytecode limit for large input jars.
+     */
+    private static MethodNode buildFiller(String name, List<Integer> hashes,
+                                          int from, int to) {
+        MethodNode m = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC, name, "([I)V", null, null);
+        InsnList d = m.instructions;
+        for (int i = from; i < to; i++) {
+            d.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            pushInt(d, i);
+            pushInt(d, hashes.get(i));
+            d.add(new InsnNode(Opcodes.IASTORE));
+        }
+        d.add(new InsnNode(Opcodes.RETURN));
+        m.maxStack = 3;
+        m.maxLocals = 1;
+        return m;
     }
 
     private MethodNode buildCheckForName(String holder) {
@@ -250,9 +296,8 @@ public final class ReflectionGateInjector {
 
     @SuppressWarnings("unchecked")
     private void inject(String holder) {
-        int wrapped = 0;
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (!cfg.shouldProtectClass(cn.name)) continue;
+        java.util.concurrent.atomic.AtomicInteger wrapped = new java.util.concurrent.atomic.AtomicInteger();
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if (mn.instructions == null) continue;
                 for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
@@ -266,12 +311,12 @@ public final class ReflectionGateInjector {
                     wrap.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, "checkForName",
                             "(Ljava/lang/String;)Ljava/lang/String;", false));
                     mn.instructions.insertBefore(call, wrap);
-                    wrapped++;
+                    wrapped.incrementAndGet();
                 }
             }
-        }
-        if (wrapped > 0) {
-            KBoxLog.info(TAG, "Wrapped " + wrapped + " Class.forName call sites");
+        }, cfg.getParallelThreads());
+        if (wrapped.get() > 0) {
+            KBoxLog.info(TAG, "Wrapped " + wrapped.get() + " Class.forName call sites");
         }
     }
 

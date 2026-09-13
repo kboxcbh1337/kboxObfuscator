@@ -185,6 +185,9 @@ public final class ConfigLoader {
             case "bfvmMethod": addNormalizedMethod(cfg.getBfvmMethods(), val); break;
             case "nativeEligiblePrefix": addAll(cfg.getNativeEligiblePrefixes(), val); break;
             case "nativeExcludePrefix": addAll(cfg.getNativeExcludePrefixes(), val); break;
+            case "vmpExcludePrefix": addAll(cfg.getVmpExcludePrefixes(), val); break;
+            case "jnicExcludePrefix": addAll(cfg.getJnicExcludePrefixes(), val); break;
+            case "bodyExcludePrefix": addAll(cfg.getBodyProtectExcludePrefixes(), val); break;
             case "entryPoint": cfg.getEntryPoints().add(val); break;
             case "encryptResource": addAll(cfg.getEncryptResourcePatterns(), val); break;
             case "excludeResource": addAll(cfg.getExcludeResourcePatterns(), val); break;

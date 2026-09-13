@@ -94,6 +94,13 @@ public final class AesStringEncryptor {
 
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
+    /** True when the additive native crypto layer (native-crypto.bin) is present in
+     *  this build. When true the decryptor first asks NativeCrypto to decrypt in C —
+     *  plaintext bytes live only on the native heap, transiently, wiped before the
+     *  jstring escapes. When false the decryptor stays pure Java and never references
+     *  the NativeCrypto class (which the packager injects only alongside the blob),
+     *  so a no-toolchain build is still safe and byte-identical. */
+    private final boolean nativeCrypto;
     /** Per-thread SecureRandom for thread-safe IV generation in parallel mode. */
     private final ThreadLocal<SecureRandom> rng = ThreadLocal.withInitial(SecureRandom::new);
 
@@ -128,8 +135,13 @@ public final class AesStringEncryptor {
     private byte[] strSalt;
 
     public AesStringEncryptor(ClassGraph graph, ProtectionConfig cfg) {
+        this(graph, cfg, false);
+    }
+
+    public AesStringEncryptor(ClassGraph graph, ProtectionConfig cfg, boolean nativeCrypto) {
         this.graph = graph;
         this.cfg = cfg;
+        this.nativeCrypto = nativeCrypto;
     }
 
     /**
@@ -643,6 +655,18 @@ public final class AesStringEncryptor {
         // _init = true
         cl.add(new InsnNode(Opcodes.ICONST_1));
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "_init", "Z"));
+        // L7: 用后即擦 — 密钥材料减驻留。解密器只引用 _key（32B AES 键，运行时必需）
+        // 与 _cache（弱引用）。T（256B 盲化表）、S（16B salt）、D（域 tag）在 _key
+        // 派生后不再被任何方法读取，这里置 null/0，让运行期堆里不长期保存整张表。
+        // _key 本体（SecretKeySpec 内部 byte[32]）无法擦除 —— 每次解密都要用它，
+        // 这是 JVM 运行时必须保留的最小密钥面；D/S/T 去掉后堆扫描无法再拿到
+        // 表与盐来重派生或交叉验证。
+        cl.add(new InsnNode(Opcodes.ACONST_NULL));
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "T", "[B"));
+        cl.add(new InsnNode(Opcodes.ACONST_NULL));
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "S", "[B"));
+        cl.add(new InsnNode(Opcodes.ICONST_0));
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "D", "I"));
         cl.add(new InsnNode(Opcodes.RETURN));
         clinit.maxStack = 6;
         clinit.maxLocals = 2;
@@ -708,6 +732,38 @@ public final class AesStringEncryptor {
         LabelNode tryEnd = new LabelNode();
         LabelNode handler = new LabelNode();
         d.add(tryStart);
+
+        if (nativeCrypto) {
+            // Native sink first: result = NativeCrypto.decryptString(enc, _key.getEncoded()).
+            // The plaintext never materialises on the Java heap — it is decrypted in C
+            // (secure alloc), converted to a jstring, then the native buffer is wiped.
+            // A null return (library unavailable / native failure) falls through to the
+            // byte-identical JCE path below, so native and Java builds stay in lock-step.
+            d.add(new VarInsnNode(Opcodes.ALOAD, 0));            // enc
+            d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_key", "Ljavax/crypto/spec/SecretKeySpec;"));
+            d.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "javax/crypto/spec/SecretKeySpec", "getEncoded", "()[B", false));
+            d.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "com/kbox/runtime/NativeCrypto", "decryptString",
+                    "([B[B)Ljava/lang/String;", false));
+            d.add(new VarInsnNode(Opcodes.ASTORE, 6));           // result
+            LabelNode jce = new LabelNode();
+            d.add(new VarInsnNode(Opcodes.ALOAD, 6));
+            d.add(new JumpInsnNode(Opcodes.IFNULL, jce));
+            // _cache[id] = new WeakReference(result)
+            d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "_cache", CACHE));
+            d.add(new VarInsnNode(Opcodes.ILOAD, 1));
+            d.add(new TypeInsnNode(Opcodes.NEW, "java/lang/ref/WeakReference"));
+            d.add(new InsnNode(Opcodes.DUP));
+            d.add(new VarInsnNode(Opcodes.ALOAD, 6));
+            d.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/ref/WeakReference",
+                    "<init>", "(Ljava/lang/Object;)V", false));
+            d.add(new InsnNode(Opcodes.AASTORE));
+            // return result
+            d.add(new VarInsnNode(Opcodes.ALOAD, 6));
+            d.add(new InsnNode(Opcodes.ARETURN));
+            d.add(jce);
+        }
 
         // iv = new byte[12]; System.arraycopy(enc, 0, iv, 0, 12)
         pushInt(d, IV_LEN);

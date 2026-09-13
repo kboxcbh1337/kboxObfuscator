@@ -200,8 +200,15 @@ public final class NameObfuscator {
     }
 
     private void renameMethodGroup(List<String> owners, String name, String desc) {
-        // If ANY member is kept, pin the entire group to its original name.
+        // If ANY member is kept OR its declaring class is untransformable
+        // (library / KBox runtime / kept-prefix — see LibraryClassifier),
+        // pin the entire group to its original name. Renaming a method whose
+        // declaring class is protected would desync definitions from call
+        // sites (NoSuchMethodError in self-obfuscation: com.kbox.runtime.*
+        // methods must keep their names because the engine's own injected
+        // bootstrap/plaintext classes reference them by exact signature).
         for (String o : owners) {
+            if (!cfg.shouldTransformClass(o)) return; // untransformable -> keep original name
             ClassNode cn = graph.getClasses().get(o);
             if (cn != null && decision.keepMethod(cn, name, desc)) {
                 return; // keep original name for everyone
@@ -222,6 +229,10 @@ public final class NameObfuscator {
         // Fields don't have override semantics, but a field hidden by a same-named
         // field in a subclass is independent; rename each declaration independently.
         for (ClassNode cn : graph.getClasses().values()) {
+            // Library / KBox runtime / kept classes keep their field names too
+            // (same reasoning as renameMethodGroup above — a renamed field in a
+            // protected class desyncs readers/writers from the declaration).
+            if (!cfg.shouldTransformClass(cn.name)) continue;
             if (cn.fields == null) continue;
             for (FieldNode fn : (List<FieldNode>) cn.fields) {
                 if (decision.keepField(cn, fn.name, fn.desc)) continue;

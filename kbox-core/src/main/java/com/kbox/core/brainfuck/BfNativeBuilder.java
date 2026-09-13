@@ -38,6 +38,138 @@ public final class BfNativeBuilder {
     private static final String C_SOURCE = "kbox_bf_loader.c";
     private static final String LIB_NAME = "kbox_bf_loader";
 
+    /** Loads + re-serializes the loader class (shares Packager's routine so the
+     *  hashed bytes equal the injected bytes). Returns null when unavailable. */
+    private static byte[] loaderReSerialized() {
+        byte[] raw = null;
+        try (InputStream in = BfNativeBuilder.class.getClassLoader()
+                .getResourceAsStream("com/kbox/runtime/BfSecureLoader.class")) {
+            if (in != null) raw = readAll(in);
+        } catch (Exception ignore) { }
+        if (raw == null) return null;
+        byte[] re = com.kbox.core.packaging.Packager.reSerializeRuntimeClass(
+                raw, "com/kbox/runtime/BfSecureLoader");
+        return re != null ? re : raw;
+    }
+
+    /** Java-8-safe {@code InputStream.readAllBytes()} replacement. */
+    private static byte[] readAll(InputStream in) throws IOException {
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) bo.write(buf, 0, n);
+        return bo.toByteArray();
+    }
+
+    /** FNV-1a64 of every non-abstract code-bearing method of the loader class.
+     *  Returns parallel lists (names, descs, code[] hashes). Hashing the WHOLE
+     *  method surface — not a fixed "key" set — means an ASM patch to ANY loader
+     *  method (main, failIfAgentPresent, readOriginalMainClass, findClass,
+     *  <init>, or even <clinit> where the boot agent-gate call lives) is caught
+     *  natively, and a patched loader that adds/removes a method is caught by
+     *  the KBOX_LDCOUNT constant. Parsed from the RE-SERIALIZED bytes (exactly
+     *  what {@code injectBoot} writes), so a clean artifact always matches. */
+    private static void loaderMethodHashes(byte[] cls,
+                                           java.util.List<String> names,
+                                           java.util.List<String> descs,
+                                           java.util.List<Long> hashes,
+                                           int[] declaredOut) throws Exception {
+        java.io.DataInputStream din = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(cls));
+        din.readInt(); din.readUnsignedShort(); din.readUnsignedShort();   // magic + version
+        int cpCount = din.readUnsignedShort();
+        String[] cp = new String[cpCount];
+        for (int i = 1; i < cpCount; i++) {
+            int tag = din.readUnsignedByte();
+            switch (tag) {
+                case 1: { int len = din.readUnsignedShort(); byte[] u = new byte[len];
+                          din.readFully(u); cp[i] = new String(u, StandardCharsets.UTF_8); break; }
+                case 3: case 4: din.skipBytes(4); break;
+                case 5: case 6: din.skipBytes(8); i++; break;
+                case 7: case 8: case 16: case 19: case 20: din.skipBytes(2); break;
+                case 9: case 10: case 11: case 12: case 17: case 18: din.skipBytes(4); break;
+                case 15: din.skipBytes(3); break;
+                default: throw new IOException("cp tag " + tag);
+            }
+        }
+        din.readUnsignedShort(); din.readUnsignedShort(); din.readUnsignedShort(); // access,this,super
+        int ifc = din.readUnsignedShort();
+        for (int i = 0; i < ifc; i++) din.readUnsignedShort();
+        int fc = din.readUnsignedShort();
+        for (int i = 0; i < fc; i++) skipMember(din);
+        int mc = din.readUnsignedShort();
+        if (declaredOut != null && declaredOut.length > 0) declaredOut[0] = mc;
+        for (int i = 0; i < mc; i++) {
+            int acc = din.readUnsignedShort();
+            int nameIdx = din.readUnsignedShort();
+            int descIdx = din.readUnsignedShort();
+            String name = cp[nameIdx];
+            String desc = cp[descIdx];
+            byte[] code = null;
+            int ac = din.readUnsignedShort();
+            for (int a = 0; a < ac; a++) {
+                int aName = din.readUnsignedShort();
+                int aLen = din.readInt();
+                if (code == null && "Code".equals(cp[aName])) {
+                    din.readUnsignedShort(); din.readUnsignedShort();       // max_stack/max_locals
+                    int clen = din.readInt();
+                    byte[] c = new byte[clen];
+                    din.readFully(c);
+                    code = c;
+                    int extra = aLen - (8 + clen);                          // 8 = 2+2+4 header
+                    if (extra > 0) din.skipBytes(extra);
+                    continue;
+                }
+                din.skipBytes(aLen);
+            }
+            if (code == null) continue;   // native / abstract: no Code attribute
+            names.add(name); descs.add(desc); hashes.add(fnv1a64(code));
+        }
+    }
+
+    /** Encrypted per-build loader-method table: name/desc XOR-ciphered like the
+     *  other detection tables, hashes as plain 64-bit constants, plus the total
+     *  declared method count (KBOX_LDCOUNT). Appended into the KBOX_BF_ENCRYPTED
+     *  region so M1 erasure never touches the strings. */
+    private static void emitLoaderMethodTable(StringBuilder sb, SecureRandom rnd) {
+        byte[] cls = loaderReSerialized();
+        if (cls == null) return;
+        java.util.List<String> names = new java.util.ArrayList<>();
+        java.util.List<String> descs = new java.util.ArrayList<>();
+        java.util.List<Long> hashes = new java.util.ArrayList<>();
+        int[] declared = new int[1];
+        try { loaderMethodHashes(cls, names, descs, hashes, declared); }
+        catch (Exception ignore) { }
+        if (names.isEmpty()) return;
+        emitEncGroup(sb, rnd, "KBOX_LDN", names.toArray(new String[0]));
+        emitEncGroup(sb, rnd, "KBOX_LDD", descs.toArray(new String[0]));
+        sb.append("static const unsigned long long KBOX_LDH[")
+          .append(hashes.size()).append("] = {");
+        for (int i = 0; i < hashes.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append("0x").append(String.format("%016x", hashes.get(i))).append("ull");
+        }
+        sb.append("};\n");
+        sb.append("static const unsigned int KBOX_LDCOUNT = ")
+          .append(declared[0]).append("u;\n");
+    }
+
+    private static void skipMember(java.io.DataInputStream din) throws Exception {
+        din.readUnsignedShort(); din.readUnsignedShort(); din.readUnsignedShort(); // access,name,desc
+        int ac = din.readUnsignedShort();
+        for (int a = 0; a < ac; a++) {
+            din.readUnsignedShort();
+            int l = din.readInt();
+            din.skipBytes(l);
+        }
+    }
+
+    private static long fnv1a64(byte[] b) {
+        long h = 0xCBF29CE484222325L;
+        for (byte x : b) { h ^= (x & 0xFFL); h *= 0x100000001B3L; }
+        return h;
+    }
+
     /** 0..F lookup for {@link #hexArray}. */
     private static final char[] HEX = "0123456789ABCDEF".toCharArray();
 
@@ -53,12 +185,38 @@ public final class BfNativeBuilder {
         "jdwp.dll",         /* -Xrunjdwp debugger */
         "dt_socket.dll",    /* JDWP socket transport */
         "dt_shmem.dll",     /* JDWP shared-memory transport */
-        "hprof.dll"         /* -Xrunhprof profiler */
+        "hprof.dll",        /* -Xrunhprof profiler */
+        /* Frida dynamic instrumentation (default module names; a renamed
+         * gadget is covered by the in-memory feature probe in the loader). */
+        "frida-agent-64.dll",
+        "frida-agent-32.dll",
+        "frida-agent.dll",
+        "frida-gadget.dll",
+        "frida-core.dll",
+        "frida-helper-64.exe",
+        "frida-helper-32.exe",
+        /* .NET CLR / Mono injected into a pure-JVM process (mscoree is the
+         * classic CLR bootstrapper; coreclr/clrjit are the CoreCLR pair). */
+        "mscoree.dll",
+        "mscoreei.dll",
+        "coreclr.dll",
+        "clrjit.dll",
+        "clr.dll",
+        "mscordacwks.dll",
+        "msvcr100_clr0400.dll"
+    };
+
+    private static final String[] AGENT_EXPORTS = {
+        "Agent_OnLoad",    /* -agentpath JVMTI agent entry (startup agents)  */
+        "Agent_OnAttach",  /* dynamic-attach / jcmd agent entry             */
+        "Agent_OnUnload"   /* teardown export present on full JVMTI agents  */
     };
 
     private static final String[] MAC_MARKERS = {
         "libinstrument", "libattach", "jdk.attach",
-        "libdt_socket",  "libjdwp",   "libhprof"
+        "libdt_socket",  "libjdwp",   "libhprof",
+        "libfrida-agent", "libfrida-gadget", "libgum",
+        "libcoreclr", "libclrjit", "libmscoree"
     };
 
     private static final String[] LINUX_MARKERS = {
@@ -66,7 +224,9 @@ public final class BfNativeBuilder {
         "libattach.so",     "libattach.dylib",
         "jdk.attach",       "/jdk.attach",
         "libdt_socket.so",  "libjdwp.so",   "libjdwp.dylib",
-        "libhprof.so"
+        "libhprof.so",
+        "libfrida-agent.so", "libfrida-gadget.so", "libfrida-core.so",
+        "libgum-js-loop.so", "libcoreclr.so", "libclrjit.so"
     };
 
     private static final String[] ARG_NEEDLES = {
@@ -190,7 +350,7 @@ public final class BfNativeBuilder {
             if (in == null) {
                 throw new IOException("Missing classpath resource: " + C_SOURCE);
             }
-            source = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            source = new String(readAll(in), StandardCharsets.UTF_8);
         }
         // Symbols are printable ASCII minus digits; emit as decimal byte values
         // so no escaping is ever needed in the C char context.
@@ -266,7 +426,7 @@ public final class BfNativeBuilder {
                 .getResourceAsStream("kbox_reflect_loader.c")) {
             if (rin != null) {
                 Files.write(workDir.resolve("kbox_reflect_loader.c"),
-                        rin.readAllBytes());
+                        readAll(rin));
             } else {
                 KBoxLog.warn(TAG, "Missing classpath resource: kbox_reflect_loader.c"
                         + " (in-memory module mapping unavailable)");
@@ -309,6 +469,7 @@ public final class BfNativeBuilder {
         sb.append("#if defined(_WIN32)\n");
         emitEncGroup(sb, rnd, "KBOX_WMODS", WINDOWS_MODULES);
         emitEncGroup(sb, rnd, "KBOX_HOOKS", HOOK_NEEDLES);
+        emitEncGroup(sb, rnd, "KBOX_AGENT_EXPS", AGENT_EXPORTS);
         sb.append("#endif\n");
         sb.append("#if defined(__APPLE__)\n");
         emitEncGroup(sb, rnd, "KBOX_MAC", MAC_MARKERS);
@@ -316,6 +477,9 @@ public final class BfNativeBuilder {
         sb.append("#if !defined(_WIN32) && !defined(__APPLE__)\n");
         emitEncGroup(sb, rnd, "KBOX_LIN", LINUX_MARKERS);
         sb.append("#endif\n");
+        // Loader key-method table (main/failIfAgentPresent/<init>/entry-read
+        // code[] hashes): name+desc encrypted, hashes as 64-bit constants.
+        emitLoaderMethodTable(sb, rnd);
         return sb.toString();
     }
 

@@ -2,22 +2,27 @@ package com.kbox.core.controlflow;
 
 import com.kbox.core.log.KBoxLog;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.LookupSwitchInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.MultiANewArrayInsnNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
-import org.objectweb.asm.tree.analysis.Analyzer;
-import org.objectweb.asm.tree.analysis.BasicInterpreter;
-import org.objectweb.asm.tree.analysis.BasicValue;
-import org.objectweb.asm.tree.analysis.Frame;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -74,76 +79,24 @@ final class Flattener {
     static boolean flatten(MethodNode mn, int strength) {
         int insnSize = mn.instructions.size();
         int branches = countBranches(mn);
-        // Run the entire flatten (eligibility check + transform) in a daemon
-        // thread with a 3-second timeout. The ASM Analyzer and/or doFlatten can
-        // be pathologically slow on certain CFG shapes after opaque-predicate
-        // injection, and no single method should be allowed to block the build.
-        final java.util.concurrent.atomic.AtomicReference<String> skipReason =
-                new java.util.concurrent.atomic.AtomicReference<>(null);
-        final java.util.concurrent.atomic.AtomicReference<Integer> blockCount =
-                new java.util.concurrent.atomic.AtomicReference<>(-1);
-        final java.util.concurrent.atomic.AtomicReference<Exception> errRef =
-                new java.util.concurrent.atomic.AtomicReference<>(null);
-        final int fstrength = strength;
-        Thread t = new Thread(() -> {
-            try {
-                String reason = checkEligibility(mn);
-                if (reason != null) {
-                    skipReason.set(reason);
-                    return;
-                }
-                int bc = doFlatten(mn, fstrength);
-                blockCount.set(bc);
-            } catch (Exception e) {
-                errRef.set(e);
-            }
-        }, "kbox-flatten");
-        t.setDaemon(true);
-        t.start();
-        try {
-            // Timeout for the whole flatten. Timeout-skips were previously waited
-            // 3s each, which made CF on large inputs (thousands of methods) crawl
-            // (flatten-timeout 3000ms * N). The skipped method is discarded anyway,
-            // so a short budget is enough for methods that DO flatten; pathological
-            // CFGs simply skip faster.
-            t.join(700); // 700ms budget (was 3000ms) — big CF speedup on large jars
-        } catch (InterruptedException e) {
-            t.interrupt();
-            cfLog("      skip " + mn.name + mn.desc
-                    + " insn=" + insnSize + " branches=" + branches
-                    + " [interrupted]");
-            return false;
-        }
-        if (t.isAlive()) {
-            t.interrupt();
-            cfLog("      skip " + mn.name + mn.desc
-                    + " insn=" + insnSize + " branches=" + branches
-                    + " [flatten-timeout]");
-            return false;
-        }
-        if (errRef.get() != null) {
-            KBoxLog.warn(TAG, "Flatten aborted for " + mn.name + mn.desc
-                    + ": " + errRef.get().getMessage());
-            return false;
-        }
-        String reason = skipReason.get();
+        String reason = checkEligibility(mn);
         if (reason != null) {
             cfLog("      skip " + mn.name + mn.desc
                     + " insn=" + insnSize + " branches=" + branches
                     + " [" + reason + "]");
             return false;
         }
-        int bc = blockCount.get();
-        if (bc >= 0) {
+        try {
+            int bc = doFlatten(mn, strength);
             cfLog("      flat " + mn.name + mn.desc
                     + " insn=" + insnSize + "->" + mn.instructions.size()
                     + " blocks=" + bc + " branches=" + branches);
             return true;
+        } catch (Exception e) {
+            KBoxLog.warn(TAG, "Flatten aborted for " + mn.name + mn.desc
+                    + ": " + e.getMessage());
+            return false;
         }
-        cfLog("      skip " + mn.name + mn.desc
-                + " insn=" + insnSize + " branches=" + branches
-                + " [unknown]");
-        return false;
     }
 
     private static int countBranches(MethodNode mn) {
@@ -157,121 +110,247 @@ final class Flattener {
     /**
      * Returns {@code null} if the method is eligible for flattening, or a
      * short reason string explaining why it was skipped (for debug output).
+     *
+     * <p>Eligibility is decided by a single O(n) stack-HEIGHT walk (no ASM
+     * {@code Analyzer}, no per-method thread — those were the CF bottleneck:
+     * one thread per method plus an 800ms analyzer timeout added up to tens of
+     * thousands of thread spawns and discarded most real business methods).
+     * The walk maintains the operand-stack height (in slots) from each block
+     * start and requires every block boundary to have height 0, which is
+     * exactly what the flattener needs: its dispatcher stub ({@code s=id; goto
+     * dispatch}) is inserted only at block starts, so no operand-stack value
+     * may cross a block edge. Heights are type-independent, so this is sound:
+     * any method passing the walk has empty stacks at every jump target and
+     * fall-through successor, precisely the property the old type-based
+     * analyzer check enforced (it only ever looked at {@code getStackSize()}).
      */
     private static String checkEligibility(MethodNode mn) {
         if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return "try-catch";
-        if (mn.instructions == null || mn.instructions.size() < 6) return "too-small";
-        // Allow methods up to 1000 instructions (was 500) for more aggressive flattening.
-        if (mn.instructions.size() > 1000) return "too-large:" + mn.instructions.size();
+        int total = mn.instructions.size();
+        if (total < 6) return "too-small";
+        // Allow methods up to 1600 instructions (was 1000) for more aggressive flattening.
+        if (total > 1600) return "too-large:" + total;
+        AbstractInsnNode[] insns = mn.instructions.toArray();
         int branches = 0;
         boolean hasSwitch = false;
-        for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
+        for (AbstractInsnNode n : insns) {
             int op = n.getOpcode();
             if (op == Opcodes.TABLESWITCH || op == Opcodes.LOOKUPSWITCH) hasSwitch = true;
             if (n instanceof JumpInsnNode) branches++;
         }
         if (hasSwitch) return "switch";
         if (branches < 1) return "few-branches:" + branches;
+        // Branch budget: doFlatten cost grows with the number of blocks (one
+        // LOOKUPSWITCH case per branch), and the whole class is re-serialized
+        // with COMPUTE_FRAMES afterwards — a 100+ block dispatcher is expensive
+        // to build AND to verify. The old Analyzer-based gate discarded most
+        // real methods on its 800ms timeout, which kept flatten coverage low
+        // (and CF fast but weak); the O(n) walk below is instant, so without a
+        // budget it flattens every windowed method and the build regresses
+        // badly on big jars. Keep the coverage at the level the Analyzer gate
+        // actually achieved: a few dozen blocks per method.
+        if (branches > 40) return "too-many-branches:" + branches;
         if (branches == 1) {
             // Single-branch methods: still eligible if there's at least one
             // conditional (not just a GOTO). This catches methods like:
             //   if (x) { a } else { b }
-            for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
-                int op = n.getOpcode();
-                if (op != Opcodes.GOTO && n instanceof JumpInsnNode) return null; // eligible
+            // (the height walk below then verifies the successors are empty).
+            boolean onlyGoto = true;
+            for (AbstractInsnNode n : insns) {
+                if (n instanceof JumpInsnNode && n.getOpcode() != Opcodes.GOTO) {
+                    onlyGoto = false;
+                    break;
+                }
             }
-            return "single-goto";
+            if (onlyGoto) return "single-goto";
         }
-        // Run the ASM Analyzer in a daemon thread with a 2-second timeout.
-        // The Analyzer can be pathologically slow on certain CFG shapes even
-        // with <200 instructions (especially after opaque-predicate injection
-        // adds dead-code branches that confuse fixpoint iteration).
-        final MethodNode fn = mn;
-        final java.util.concurrent.atomic.AtomicReference<Frame<BasicValue>[]> ref =
-                new java.util.concurrent.atomic.AtomicReference<>(null);
-        final java.util.concurrent.atomic.AtomicReference<Exception> err =
-                new java.util.concurrent.atomic.AtomicReference<>(null);
-        Thread t = new Thread(() -> {
-            try {
-                ref.set(new Analyzer<>(new BasicInterpreter()).analyze("__tmp", fn));
-            } catch (Exception e) {
-                err.set(e);
-            }
-        }, "kbox-analyzer");
-        t.setDaemon(true);
-        t.start();
-        try {
-            t.join(500); // 500ms analyzer budget (was 2000ms) — CF speedup, skipped anyway
-        } catch (InterruptedException e) {
-            t.interrupt();
-            return "analyzer-interrupted";
-        }
-        if (t.isAlive()) {
-            t.interrupt();
-            return "analyzer-timeout";
-        }
-        if (err.get() != null) return "analyzer-error";
-        Frame<BasicValue>[] frames = ref.get();
-        if (frames == null) return "analyzer-null";
-        for (int i = 0; i < mn.instructions.size(); i++) {
-            AbstractInsnNode n = mn.instructions.get(i);
+        // Block-start bitmaps: entry (index 0), every jump target, and the
+        // instruction right after every terminator (fall-through successor).
+        boolean[] isJumpTarget = new boolean[total];
+        boolean[] isBlockStart = new boolean[total];
+        isBlockStart[0] = true;
+        Map<AbstractInsnNode, Integer> pos = new IdentityHashMap<>();
+        for (int i = 0; i < total; i++) pos.put(insns[i], i);
+        for (int i = 0; i < total; i++) {
+            AbstractInsnNode n = insns[i];
             if (n instanceof JumpInsnNode) {
-                JumpInsnNode j = (JumpInsnNode) n;
-                if (!hasEmptyStack(mn, j.label, frames)) return "non-empty-stack";
+                Integer ti = pos.get(((JumpInsnNode) n).label);
+                if (ti != null) {
+                    isJumpTarget[ti] = true;
+                    isBlockStart[ti] = true;
+                }
+            }
+            int op = n.getOpcode();
+            if (n instanceof JumpInsnNode || op == Opcodes.RETURN
+                    || op == Opcodes.IRETURN || op == Opcodes.LRETURN
+                    || op == Opcodes.FRETURN || op == Opcodes.DRETURN
+                    || op == Opcodes.ARETURN || op == Opcodes.ATHROW) {
+                int next = i + 1;
+                while (next < total && insns[next].getOpcode() == -1) next++;
+                if (next < total) isBlockStart[next] = true;
             }
         }
-        // The checks above only cover jump TARGETS. A block reached purely by
-        // fall-through (no incoming jump) can carry values on the operand stack
-        // across the block boundary. The flattener inserts its dispatcher stub
-        // (s = id; goto dispatch) at every such boundary; if values are on the
-        // stack there, the dispatcher's `ILOAD state; LOOKUPSWITCH` lands on top
-        // of them and every subsequent operand is shifted, producing invalid
-        // bytecode that COMPUTE_FRAMES happily serializes but the JVM verifier
-        // rejects (e.g. "Bad type on operand stack: String not assignable to
-        // integer at iadd" on Swing paintComponent-style methods). So we also
-        // require an EMPTY stack at the entry and at every fall-through
-        // successor, guaranteeing no operand-stack value crosses a block edge.
-        if (frames[0] == null || frames[0].getStackSize() != 0) return "entry-stack";
-        for (int i = 0; i < mn.instructions.size(); i++) {
-            AbstractInsnNode n = mn.instructions.get(i);
-            boolean isTerminator = false;
-            if (n instanceof JumpInsnNode) {
-                isTerminator = true;
-            } else {
-                int op = n.getOpcode();
-                isTerminator = (op == Opcodes.RETURN || op == Opcodes.IRETURN
-                        || op == Opcodes.LRETURN || op == Opcodes.FRETURN
-                        || op == Opcodes.DRETURN || op == Opcodes.ARETURN
-                        || op == Opcodes.ATHROW);
+        // Single O(n) height walk. h = operand-stack height in slots within the
+        // current block (every block starts at height 0; any nonzero boundary
+        // means a value would have to survive the dispatcher -> ineligible).
+        int h = 0;
+        for (int i = 0; i < total; i++) {
+            if (isBlockStart[i] && h != 0) {
+                return isJumpTarget[i] ? "non-empty-stack" : "fall-thru-stack";
             }
-            if (isTerminator) {
-                AbstractInsnNode ft = skipLabels(n.getNext());
-                if (ft != null) {
-                    int ftIdx = indexOf(mn, ft);
-                    if (ftIdx >= 0 && ftIdx < frames.length) {
-                        Frame<BasicValue> ff = frames[ftIdx];
-                        if (ff != null && ff.getStackSize() != 0) return "fall-thru-stack";
-                    }
+            int e = stackEffect(insns[i]);
+            h += e;
+            if (h < 0) return "stack-underflow";
+            AbstractInsnNode n = insns[i];
+            if (n instanceof JumpInsnNode) {
+                int op = n.getOpcode();
+                if (op == Opcodes.GOTO) {
+                    // GOTO transfers the whole stack; successor must be empty.
+                    if (h != 0) return "fall-thru-stack";
+                } else if (op != Opcodes.JSR) {
+                    // Conditional: pops its condition on BOTH paths; successors
+                    // (target + fall-through) must both be empty.
+                    if (h != 0) return "non-empty-stack";
                 }
             }
         }
         return null; // eligible
     }
 
-    private static boolean hasEmptyStack(MethodNode mn, LabelNode label, Frame<BasicValue>[] frames) {
-        int idx = indexOf(mn, label);
-        if (idx < 0 || idx >= frames.length) return false;
-        Frame<BasicValue> f = frames[idx];
-        return f != null && f.getStackSize() == 0;
-    }
-
-    private static int indexOf(MethodNode mn, AbstractInsnNode target) {
-        int i = 0;
-        for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
-            if (n == target) return i;
-            i++;
+    /**
+     * Net operand-stack height effect (pushes − pops, in slots) of one
+     * instruction. Long/double count 2 slots. Type-independent.
+     */
+    private static int stackEffect(AbstractInsnNode n) {
+        int op = n.getOpcode();
+        if (op == -1) return 0; // labels / frames / line numbers
+        switch (op) {
+            // Pushes
+            case Opcodes.ACONST_NULL: case Opcodes.ICONST_M1: case Opcodes.ICONST_0:
+            case Opcodes.ICONST_1: case Opcodes.ICONST_2: case Opcodes.ICONST_3:
+            case Opcodes.ICONST_4: case Opcodes.ICONST_5: case Opcodes.BIPUSH:
+            case Opcodes.SIPUSH: case Opcodes.FCONST_0: case Opcodes.FCONST_1:
+            case Opcodes.FCONST_2: case Opcodes.NEW: case Opcodes.NEWARRAY:
+                return 1;
+            case Opcodes.LCONST_0: case Opcodes.LCONST_1: case Opcodes.DCONST_0:
+            case Opcodes.DCONST_1:
+                return 2;
+            // Stack ops
+            case Opcodes.POP: return -1;
+            case Opcodes.POP2: return -2;
+            case Opcodes.DUP: case Opcodes.DUP_X1: case Opcodes.DUP_X2: return 1;
+            case Opcodes.DUP2: case Opcodes.DUP2_X1: case Opcodes.DUP2_X2: return 2;
+            case Opcodes.SWAP: return 0;
+            // Int arithmetic
+            case Opcodes.IADD: case Opcodes.ISUB: case Opcodes.IMUL:
+            case Opcodes.IDIV: case Opcodes.IREM: case Opcodes.IAND:
+            case Opcodes.IOR: case Opcodes.IXOR: case Opcodes.ISHL:
+            case Opcodes.ISHR: case Opcodes.IUSHR:
+                return -1;
+            case Opcodes.INEG: return 0;
+            // Long arithmetic
+            case Opcodes.LADD: case Opcodes.LSUB: case Opcodes.LMUL:
+            case Opcodes.LDIV: case Opcodes.LREM: case Opcodes.LAND:
+            case Opcodes.LOR: case Opcodes.LXOR:
+                return -2;
+            case Opcodes.LNEG: return 0;
+            case Opcodes.LSHL: case Opcodes.LSHR: case Opcodes.LUSHR: return -1;
+            // Float / double arithmetic
+            case Opcodes.FADD: case Opcodes.FSUB: case Opcodes.FMUL:
+            case Opcodes.FDIV: case Opcodes.FREM:
+                return -1;
+            case Opcodes.FNEG: return 0;
+            case Opcodes.DADD: case Opcodes.DSUB: case Opcodes.DMUL:
+            case Opcodes.DDIV: case Opcodes.DREM:
+                return -2;
+            case Opcodes.DNEG: return 0;
+            // Conversions
+            case Opcodes.I2L: case Opcodes.I2D: case Opcodes.F2L: case Opcodes.F2D:
+                return 1;
+            case Opcodes.L2I: case Opcodes.L2F: case Opcodes.D2I: case Opcodes.D2F:
+                return -1;
+            case Opcodes.I2F: case Opcodes.L2D: case Opcodes.D2L:
+            case Opcodes.F2I: case Opcodes.I2B: case Opcodes.I2C: case Opcodes.I2S:
+                return 0;
+            // Comparisons
+            case Opcodes.LCMP: case Opcodes.DCMPL: case Opcodes.DCMPG: return -3;
+            case Opcodes.FCMPL: case Opcodes.FCMPG: return -1;
+            // Conditional branches (pop their condition on both paths)
+            case Opcodes.IFEQ: case Opcodes.IFNE: case Opcodes.IFLT: case Opcodes.IFGE:
+            case Opcodes.IFGT: case Opcodes.IFLE: case Opcodes.IFNULL:
+            case Opcodes.IFNONNULL:
+                return -1;
+            case Opcodes.IF_ICMPEQ: case Opcodes.IF_ICMPNE: case Opcodes.IF_ICMPLT:
+            case Opcodes.IF_ICMPGE: case Opcodes.IF_ICMPGT: case Opcodes.IF_ICMPLE:
+            case Opcodes.IF_ACMPEQ: case Opcodes.IF_ACMPNE:
+                return -2;
+            case Opcodes.GOTO: return 0;
+            case Opcodes.JSR: return 1; // pushes return address
+            // Returns / throw
+            case Opcodes.IRETURN: case Opcodes.FRETURN: case Opcodes.ARETURN:
+            case Opcodes.ATHROW:
+                return -1;
+            case Opcodes.LRETURN: case Opcodes.DRETURN: return -2;
+            case Opcodes.RETURN: return 0;
+            // Array load / store
+            case Opcodes.IALOAD: case Opcodes.FALOAD: case Opcodes.AALOAD:
+            case Opcodes.BALOAD: case Opcodes.CALOAD: case Opcodes.SALOAD:
+                return -1;
+            case Opcodes.LALOAD: case Opcodes.DALOAD: return 0;
+            case Opcodes.IASTORE: case Opcodes.FASTORE: case Opcodes.AASTORE:
+            case Opcodes.BASTORE: case Opcodes.CASTORE: case Opcodes.SASTORE:
+                return -3;
+            case Opcodes.LASTORE: case Opcodes.DASTORE: return -4;
+            case Opcodes.ARRAYLENGTH: case Opcodes.CHECKCAST:
+            case Opcodes.INSTANCEOF: case Opcodes.IINC:
+                return 0;
+            case Opcodes.MONITORENTER: case Opcodes.MONITOREXIT: return -1;
+            default:
+                break;
         }
-        return -1;
+        if (n instanceof VarInsnNode) {
+            switch (op) {
+                case Opcodes.ILOAD: case Opcodes.FLOAD: case Opcodes.ALOAD: return 1;
+                case Opcodes.LLOAD: case Opcodes.DLOAD: return 2;
+                case Opcodes.ISTORE: case Opcodes.FSTORE: case Opcodes.ASTORE: return -1;
+                case Opcodes.LSTORE: case Opcodes.DSTORE: return -2;
+                default: return 0; // RET etc.
+            }
+        }
+        if (n instanceof LdcInsnNode) {
+            Object cst = ((LdcInsnNode) n).cst;
+            return (cst instanceof Long || cst instanceof Double) ? 2 : 1;
+        }
+        if (n instanceof TypeInsnNode) {
+            return (op == Opcodes.ANEWARRAY || op == Opcodes.CHECKCAST
+                    || op == Opcodes.INSTANCEOF) ? 0 : 1; // NEW -> 1
+        }
+        if (n instanceof MultiANewArrayInsnNode) {
+            return 1 - ((MultiANewArrayInsnNode) n).dims;
+        }
+        if (n instanceof FieldInsnNode) {
+            int size = Type.getType(((FieldInsnNode) n).desc).getSize();
+            switch (op) {
+                case Opcodes.GETSTATIC: return size;
+                case Opcodes.PUTSTATIC: return -size;
+                case Opcodes.GETFIELD: return size - 1;
+                case Opcodes.PUTFIELD: return -(size + 1);
+                default: return 0;
+            }
+        }
+        if (n instanceof MethodInsnNode || n instanceof InvokeDynamicInsnNode) {
+            int v = Type.getArgumentsAndReturnSizes(
+                    (n instanceof MethodInsnNode)
+                            ? ((MethodInsnNode) n).desc
+                            : ((InvokeDynamicInsnNode) n).desc);
+            int argSlots = v >>> 2;
+            int retSlots = v & 0x03; // 0=void, 1=one slot, 2=long/double
+            if (n instanceof MethodInsnNode && op != Opcodes.INVOKESTATIC) {
+                return retSlots - (argSlots + 1); // receiver
+            }
+            return retSlots - argSlots;
+        }
+        return 0; // unknown instruction: neutral (never reached for valid bytecode)
     }
 
     private static int doFlatten(MethodNode mn, int strength) {
@@ -382,7 +461,11 @@ final class Flattener {
                 inverted.add(new JumpInsnNode(invert(c.getOpcode()), skip));
                 InsnList stub = exitStub(stateLocal, maskLocal, dispatch,
                         takenId, idMask.get(takenId));
-                while (stub.size() > 0) inverted.add(stub.getFirst());
+                // InsnList.getFirst() does NOT unlink the node, so the previous
+                // "while (stub.size() > 0) inverted.add(stub.getFirst())" spun
+                // forever (same node re-added, size never shrank). add(InsnList)
+                // moves every instruction and clears the source list.
+                inverted.add(stub);
                 inverted.add(skip);
                 mn.instructions.insert(term, inverted);
                 mn.instructions.remove(term);

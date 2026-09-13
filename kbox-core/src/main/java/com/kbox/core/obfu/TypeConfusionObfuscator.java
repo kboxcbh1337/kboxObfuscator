@@ -116,6 +116,19 @@ public final class TypeConfusionObfuscator {
             if ((acc & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE
                     | Opcodes.ACC_SYNTHETIC)) != 0) continue;
             if (mn.name.equals("<init>") || mn.name.equals("<clinit>")) continue;
+            // The carrier-relay rewrites insert their OWN athrow/catch into the
+            // method and re-route parameter/local slots through it. On a method that
+            // ALREADY carries exception handlers this corrupts the exception table
+            // (the original handler's range is swallowed / dispatch changes), so a
+            // NumberFormatException that the original code caught now escapes the
+            // method and crashes the app. Real case: com.formdev.flatlaf.UIDefaultsLoader
+            // (bundled FlatLaf) — "0.5" routed into Integer.parseInt threw an
+            // uncaught NumberFormatException during UIManager.setLookAndFeel:
+            //   NumberFormatException: For input string: "0.5"
+            //     at Integer.parseInt
+            //     at com.formdev.flatlaf.lbe.mmz   (parseInteger)
+            // Same guard ExceptionJumpObfuscator uses.
+            if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) continue;
             String key = ProtectionConfig.memberKey(cn.name, mn.name, mn.desc);
             if (cfg.getVmpMethods().contains(key) || cfg.getNativeMethods().contains(key)) continue;
 

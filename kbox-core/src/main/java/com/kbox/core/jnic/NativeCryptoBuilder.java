@@ -71,7 +71,11 @@ public final class NativeCryptoBuilder {
     private static String readResource(String name) throws IOException {
         try (InputStream in = NativeCryptoBuilder.class.getClassLoader().getResourceAsStream(name)) {
             if (in == null) throw new KBoxException("Resource not found: " + name);
-            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) bo.write(buf, 0, n);
+            return new String(bo.toByteArray(), StandardCharsets.UTF_8);
         }
     }
 

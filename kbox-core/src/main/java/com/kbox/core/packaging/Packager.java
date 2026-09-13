@@ -168,7 +168,14 @@ public final class Packager {
                         case Opcodes.RETURN: want = 0; break;
                         case Opcodes.IRETURN: case Opcodes.FRETURN:
                         case Opcodes.ARETURN: want = 1; break;
-                        case Opcodes.LRETURN: case Opcodes.DRETURN: want = 2; break;
+                        // Frame.getStackSize() counts stack VALUES, not slots: a
+                        // long/double occupies one entry (carrying size 2), so a
+                        // LRETURN/DRETURN is correct with exactly 1 value. Using
+                        // 2 here flagged EVERY long/double-returning method as
+                        // "non-empty stack at return" — the original, unmodified
+                        // jar alone shows 1911 such false positives — and rolled
+                        // those classes back to unprotected bytes.
+                        case Opcodes.LRETURN: case Opcodes.DRETURN: want = 1; break;
                         default: continue;
                     }
                     Frame<BasicValue> f = frames[idx];
@@ -333,6 +340,7 @@ public final class Packager {
             String clsRoot = springBoot ? "BOOT-INF/classes/" : "";
             ResourceReferenceUpdater ru = new ResourceReferenceUpdater(classMap);
             ManifestUpdater mu = new ManifestUpdater(classMap);
+            mu.setSpringBootFatJar(springBoot);
 
             // 1. Write classes (renamed paths). If class encryption is on,
             //    eligible classes are AES-GCM encrypted with a magic header.
@@ -400,6 +408,14 @@ public final class Packager {
                 if (guardSkip.contains(e.getKey())) {
                     continue; // written by injectResourceGuardClasses later
                 }
+                // Classes that came from a nested BOOT-INF/lib jar are analysis-only:
+                // their bytes are shipped verbatim inside that nested jar, so
+                // re-emitting them here would duplicate every library class into
+                // BOOT-INF/classes/ (a real 60 MB -> 121 MB bloat) and shadow the
+                // nested jars on the application classpath.
+                if (graph.getNestedJarClasses().contains(e.getKey())) {
+                    continue;
+                }
                 String oldInternal = e.getKey();
                 String newInternal = mapName(classMap, oldInternal);
                 String entryName = clsRoot + newInternal + ".class";
@@ -447,6 +463,21 @@ public final class Packager {
                     verifyErr = checkFrameConsistency(bytes);
                 }
                 if (verifyErr != null) {
+                    byte[] orig = lookupOriginalBytes(oldInternal, reverseClassMap, graph);
+                    // Regression gate. [STACK-FAIL] comes from a dataflow oracle
+                    // (Analyzer + BasicInterpreter) that ALSO mis-flags the
+                    // pristine input — 285 methods of the raw LiquidBounce jar,
+                    // almost all Kotlin coroutine state machines — because it
+                    // reports an inflated stack size for them. A verdict that
+                    // reproduces on the untouched original bytes is therefore an
+                    // oracle artifact, not damage we introduced: keep the
+                    // protected bytes instead of throwing the hardening away.
+                    if (orig != null && verifyErr.startsWith("[STACK-FAIL]")
+                            && checkStackAtReturn(orig) != null) {
+                        verifyErr = null;
+                    }
+                }
+                if (verifyErr != null) {
                     // TEMP-DIAG: dump the verify-failing transformed bytes for analysis.
                     try {
                         java.nio.file.Files.write(
@@ -461,7 +492,8 @@ public final class Packager {
                         verifyFails++;
                     }
                 }
-                if (classGuard && shouldEncryptClass(newInternal, oldInternal, cfg, nativePlainClosure)) {
+                if (classGuard && shouldEncryptClass(e.getValue(), graph, newInternal,
+                        oldInternal, cfg, nativePlainClosure)) {
                     try {
                         bytes = encryptClassBody(bytes, classSeed, licenseMaterial(cfg));
                         encryptedClassNames.add(newInternal);
@@ -492,10 +524,14 @@ public final class Packager {
                     int nul = res.indexOf('\u0000');
                     String newPath = nul >= 0 ? res.substring(0, nul) : path;
                     String newContent = nul >= 0 ? res.substring(nul + 1) : new String(bytes, StandardCharsets.UTF_8);
-                    putEntry(out, newPath, newContent.getBytes(StandardCharsets.UTF_8));
+                    putEntry(out, clsRoot + newPath, newContent.getBytes(StandardCharsets.UTF_8));
                 } else {
                     // Binary or already-processed resource: write raw bytes.
-                    putEntry(out, path, bytes);
+                    // Resource keys are LOGICAL paths (a Spring Boot fat jar strips
+                    // the BOOT-INF/classes/ prefix when reading, see
+                    // DependencyAnalyzer); re-add clsRoot so the entry lands where
+                    // the runtime classloader actually looks for it.
+                    putEntry(out, clsRoot + path, bytes);
                 }
                 resCount++;
             }
@@ -512,8 +548,13 @@ public final class Packager {
                     && new String(graph.getManifest(), StandardCharsets.UTF_8).contains("TweakClass:");
             String tweakerClass = (classGuard && hasTweakClass)
                     ? "com.kbox.runtime.KBoxClassDecryptTweaker" : null;
+            // Spring Boot jars hook the launcher in through Start-Class (Main-Class
+            // must stay the boot loader), so the class to remap is Start-Class.
+            String entryClass = springBoot ? graph.getManifestStartClass()
+                                           : graph.getManifestMainClass();
+            if (entryClass == null) entryClass = graph.getManifestMainClass();
             byte[] manifest = mu.update(graph.getManifest(),
-                    dotted(graph.getManifestMainClass()), launcherClass, tweakerClass);
+                    dotted(entryClass), launcherClass, tweakerClass);
             // Entry-point obfuscation: mask the real main class name in the
             // manifest so a static dump can't trivially spot the application's
             // main() class. Only applied when the launcher substitution occurred
@@ -528,7 +569,7 @@ public final class Packager {
             {
                 byte[] bseed = com.kbox.runtime.HardwareKeyRing.currentBuildSeed();
                 if (bseed != null && bseed.length == 32) {
-                    putEntry(out, "META-INF/kbox/seed.bin", bseed);
+                    putEntry(out, clsRoot + "META-INF/kbox/seed.bin", bseed);
                 }
             }
             // Engine tamper seal: bind this output to the CURRENT engine license
@@ -554,17 +595,17 @@ public final class Packager {
                     writeResourceGuardMetadata(out, clsRoot, resMapping, resSeed);
                 }
                 if (classGuard && encryptedClassNames != null) {
-                    writeClassGuardMetadata(out, encryptedClassNames, classSeed);
+                    writeClassGuardMetadata(out, clsRoot, encryptedClassNames, classSeed);
                 }
                 // Library-classified in-jar classes (asm/kotlin/third-party) must be
                 // loaded by the PARENT loader, never re-defined locally by the guard
                 // loader, or ASM-style engines land with two copies -> ClassCastException.
-                writeParentDelegateList(out, parentDelegate);
+                writeParentDelegateList(out, clsRoot, parentDelegate);
             }
             // 4b. JNIC: write the packed native blob + inject NativeLoader/ChaCha20.
             if (nativeBlob != null) {
-                putEntry(out, "META-INF/kbox/native.bin", nativeBlob);
-                writeJnicClassList(out, cfg);
+                putEntry(out, clsRoot + "META-INF/kbox/native.bin", nativeBlob);
+                writeJnicClassList(out, clsRoot, cfg);
                 rtCount += injectNativeLoaderClasses(out, clsRoot, graph, rtInjected);
                 KBoxLog.info(TAG, "Wrote packed native blob ("
                         + nativeBlob.length + " bytes) -> META-INF/kbox/native.bin");
@@ -574,7 +615,7 @@ public final class Packager {
             //     Purely additive; when the blob is absent the runtime uses the
             //     byte-identical Java HKDF path, so this block is optional.
             if (nativeCryptoBlob != null) {
-                putEntry(out, "META-INF/kbox/native-crypto.bin", nativeCryptoBlob);
+                putEntry(out, clsRoot + "META-INF/kbox/native-crypto.bin", nativeCryptoBlob);
                 rtCount += injectOne(out, clsRoot, "com/kbox/runtime/NativeCrypto", rtInjected, graph);
                 rtCount += injectOne(out, clsRoot, "com/kbox/runtime/ChaCha20", rtInjected, graph);
                 rtCount += injectOne(out, clsRoot, "com/kbox/runtime/KbnlKey", rtInjected, graph);
@@ -586,7 +627,7 @@ public final class Packager {
             //     is absent (compile disabled/failed) the byte-identical Java
             //     interpreter runs instead, so this block is strictly additive.
             if (vmpBlob != null) {
-                putEntry(out, "META-INF/kbox/vmp.bin", vmpBlob);
+                putEntry(out, clsRoot + "META-INF/kbox/vmp.bin", vmpBlob);
                 // The seam (VmpInterpreterNative.tryExecute) depends on
                 // NativeLoader.loadVmp(), which must be present even when JNIC is
                 // off/empty (otherwise NoClassDefFoundError silently kills the
@@ -597,7 +638,7 @@ public final class Packager {
                         + vmpBlob.length + " bytes) -> META-INF/kbox/vmp.bin");
             }
             if (epdManifest != null && epdManifest.length > 0) {
-                putEntry(out, "META-INF/kbox/method_epd.bin", epdManifest);
+                putEntry(out, clsRoot + "META-INF/kbox/method_epd.bin", epdManifest);
                 KBoxLog.info(TAG, "Wrote EPL binning manifest ("
                         + epdManifest.length + " bytes) -> META-INF/kbox/method_epd.bin");
             }
@@ -607,6 +648,13 @@ public final class Packager {
             if (rtCount > 0) {
                 KBoxLog.info(TAG, "Injected " + rtCount + " runtime classes");
             }
+            // Every KBox-owned helper referenced by the classes we just wrote must
+            // actually be in the output. Several passes synthesize per-build
+            // helpers (string/constant holders, type-confusion carriers, ...) and
+            // rewrite call sites to point at them; a dropped helper only shows up
+            // as a bare NoClassDefFoundError at runtime, with no hint about which
+            // pass lost it. Turn that into a build error instead.
+            verifyKboxReferenceClosure(written, rtInjected, guardSkip);
             // Anti-unpack decoys: harmless entries that confuse extractor tools
             // (dir/file masquerade, bad-CRC bait, decoy native lib) without affecting
             // the running app. Only when resource obfuscation is active (max mode).
@@ -625,7 +673,8 @@ public final class Packager {
                     ZipEntry ze = en.nextElement();
                     if (ze.isDirectory() || !ze.getName().startsWith("BOOT-INF/lib/")) continue;
                     if (!ze.getName().endsWith(".jar")) continue;
-                    putEntry(out, ze.getName(), readAll(in.getInputStream(ze)));
+                    // STORED (uncompressed), NOT deflated — see putStoredEntry.
+                    putStoredEntry(out, ze.getName(), readAll(in.getInputStream(ze)));
                 }
                 Enumeration<? extends ZipEntry> en2 = in.entries();
                 while (en2.hasMoreElements()) {
@@ -634,6 +683,40 @@ public final class Packager {
                     String n = ze.getName();
                     if (n.startsWith("org/springframework/boot/loader/") && n.endsWith(".class")) {
                         putEntry(out, n, readAll(in.getInputStream(ze)));
+                    }
+                }
+                // Structural entries the boot loader resolves BEFORE any application
+                // code runs. These must survive verbatim:
+                //   * BOOT-INF/classpath.idx — Boot 3.2+ builds the launched
+                //     classloader's URL set from this index. If it is missing or
+                //     renamed, the classpath comes up EMPTY and every
+                //     BOOT-INF/classes|lib lookup fails with ClassNotFoundException.
+                //   * BOOT-INF/layers.idx — layered-jar metadata (same reasoning).
+                Enumeration<? extends ZipEntry> en3 = in.entries();
+                while (en3.hasMoreElements()) {
+                    ZipEntry ze = en3.nextElement();
+                    String n = ze.getName();
+                    if (n.equals("BOOT-INF/classpath.idx") || n.equals("BOOT-INF/layers.idx")) {
+                        putEntry(out, n, readAll(in.getInputStream(ze)));
+                    }
+                }
+                // Directory entries, all of them. Two independent reasons:
+                //   1. BOOT-INF/classes/ and BOOT-INF/lib/ ARE the boot loader's
+                //      nested classpath roots — without those two directory entries
+                //      no application class can be loaded at all.
+                //   2. Spring's component scan resolves
+                //      "classpath*:com/example/**/*.class" by asking the loader for
+                //      the package directory ("com/example/") and walking it. With
+                //      the package directories missing the scan yields NOTHING, so
+                //      every @Component/@Service/@Repository silently disappears and
+                //      the app dies later with NoSuchBeanDefinitionException — a
+                //      failure that looks nothing like a packaging problem.
+                // The analyzer skips directories generically, so re-emit them here.
+                Enumeration<? extends ZipEntry> en4 = in.entries();
+                while (en4.hasMoreElements()) {
+                    ZipEntry ze = en4.nextElement();
+                    if (ze.isDirectory()) {
+                        putEntry(out, ze.getName(), new byte[0]);
                     }
                 }
             }
@@ -687,6 +770,7 @@ public final class Packager {
                                Mapping mapping, byte[] nativeBlob,
                                byte[] jnicBlob, ProtectionConfig cfg,
                                BfSymbolSet sym, byte[] vmpBlob,
+                               byte[] nativeCryptoBlob,
                                byte[] epdManifest) throws IOException {
         Path parent = outputJar.getParent();
         if (parent != null) Files.createDirectories(parent);
@@ -701,17 +785,68 @@ public final class Packager {
             reverseClassMap.putIfAbsent(en.getValue(), en.getKey());
         }
 
+        // BF-MC hybrid (opt-in): detect the loader and keep its critical surface
+        // plaintext — loader metadata (protectedResources) + entry classes + the
+        // mixin package (keepPrefixes) are written as readable jar entries; every
+        // other class still hides inside the Brainfuck-RLE blob. Entry classes get
+        // BfSecureLoader.attach() injected into <clinit> so the blob is decoded the
+        // moment the loader first touches the mod.
+        boolean hybrid = cfg.isBrainfuckMcHybrid();
+        java.util.Set<String> plainClasses = new java.util.HashSet<>();    // renamed internal names kept plaintext
+        java.util.Set<String> plainResources = new java.util.HashSet<>();  // resource paths kept plaintext
+        if (hybrid) {
+            try {
+                com.kbox.core.minecraft.MinecraftModDetector mc =
+                        new com.kbox.core.minecraft.MinecraftModDetector(graph, cfg);
+                com.kbox.core.minecraft.MinecraftModDetector.Result r = mc.detect();
+                if (r.isMod()) {
+                    plainResources.addAll(r.protectedResources);
+                    for (String dotted : r.entryClasses) {
+                        plainClasses.add(dotted.replace('.', '/'));
+                    }
+                    for (String prefix : r.keepPrefixes) {
+                        for (String internal : graph.getClasses().keySet()) {
+                            if (internal.startsWith(prefix)) plainClasses.add(internal);
+                        }
+                    }
+                    KBoxLog.info(TAG, "BF hybrid keeps plaintext: "
+                            + plainClasses.size() + " classes, " + plainResources.size()
+                            + " resource paths (" + r.loader + ")");
+                } else {
+                    KBoxLog.warn(TAG, "BF hybrid: no MC loader detected — all classes go into the blob");
+                }
+            } catch (Throwable t) {
+                KBoxLog.warn(TAG, "BF hybrid detection failed: " + t.getMessage()
+                        + " — all classes go into the blob");
+            }
+        }
+
         // 1. Same correctness repairs as the normal path.
         fixCrossPackageClassAccess(graph, classMap);
         repairDanglingMemberReferences(graph, mapping);
 
         // 2. Serialize every graph class into the blob map (renamed keys).
+        //    Hybrid mode: loader-critical classes (entry classes + mixin package)
+        //    are serialized as PLAINTEXT jar entries instead of the blob, with
+        //    BfSecureLoader.attach() injected into <clinit>.
         Map<String, byte[]> classes = new LinkedHashMap<>();
+        Map<String, byte[]> plainClassBytes = new LinkedHashMap<>();
         int rolledBack = 0;
         int verifyFails = 0;
         for (Map.Entry<String, ClassNode> e : graph.getClasses().entrySet()) {
             String oldInternal = e.getKey();
             String newInternal = mapName(classMap, oldInternal);
+            if (hybrid && plainClasses.contains(oldInternal)) {
+                // Keep this class readable by the mod loader.
+                injectBfAttach(e.getValue());
+                byte[] pbytes = serialize(e.getValue(), graph, cfg);
+                if (pbytes != null) {
+                    plainClassBytes.put(newInternal, pbytes);
+                    continue;
+                }
+                KBoxLog.warn(TAG, "BF hybrid skip (serialization failed) " + newInternal
+                        + " — falling through to blob");
+            }
             byte[] bytes = serialize(e.getValue(), graph, cfg);
             if (bytes == null) {
                 if (cfg.isRollbackToOriginalBytes()) {
@@ -762,6 +897,14 @@ public final class Packager {
             String path = e.getKey();
             byte[] bytes = e.getValue();
             if (path.equals("META-INF/MANIFEST.MF")) continue;
+            // Hybrid mode: loader-critical metadata (fabric.mod.json, mods.toml,
+            // mixins.json, pack.mcmeta, FMLAT/accesswidener, ...) stays plaintext
+            // verbatim — the loader parses these raw, so a rewritten/obfuscated
+            // copy would break discovery even when the entry classes are kept.
+            if (hybrid && plainResources.contains(path)) {
+                plainFramework.put(path, bytes);
+                continue;
+            }
             if (isFrameworkText(path)) {
                 String res = ru.rewrite(path, bytes);
                 int nul = res.indexOf('\u0000');
@@ -816,6 +959,15 @@ public final class Packager {
                 KBoxLog.info(TAG, "BF kept framework text as plain jar entries: "
                         + plainFramework.keySet());
             }
+            // Hybrid mode: loader-critical classes written as plaintext .class
+            // entries (with BfSecureLoader.attach() in <clinit>).
+            if (!plainClassBytes.isEmpty()) {
+                for (Map.Entry<String, byte[]> pc : plainClassBytes.entrySet()) {
+                    putEntry(out, pc.getKey() + ".class", pc.getValue());
+                }
+                KBoxLog.info(TAG, "BF hybrid wrote " + plainClassBytes.size()
+                        + " loader-critical classes as plain jar entries");
+            }
 
             putEntry(out, "META-INF/kbox/classes.bf.rle", packed.rleBytes);
             // NOTE: no separate index.dat is shipped. The name->(offset,len) index
@@ -840,6 +992,16 @@ public final class Packager {
                 putEntry(out, "META-INF/kbox/vmp.bin", vmpBlob);
                 KBoxLog.info(TAG, "BF packed VMP native lib -> META-INF/kbox/vmp.bin ("
                         + vmpBlob.length + " bytes)");
+            }
+            // Native crypto layer (string-decrypt sink + HKDF): the AES holder
+            // decryptor references NativeCrypto.decryptString when the blob was
+            // compiled, so both the blob and the class must ship in BF mode too —
+            // otherwise every protected string resolves to a NoClassDefFoundError
+            // and the decryptor's catch-all falls back to garbage (noise).
+            if (nativeCryptoBlob != null) {
+                putEntry(out, "META-INF/kbox/native-crypto.bin", nativeCryptoBlob);
+                KBoxLog.info(TAG, "BF packed native crypto lib -> META-INF/kbox/native-crypto.bin ("
+                        + nativeCryptoBlob.length + " bytes)");
             }
             if (epdManifest != null && epdManifest.length > 0) {
                 putEntry(out, "META-INF/kbox/method_epd.bin", epdManifest);
@@ -889,6 +1051,12 @@ public final class Packager {
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/HardwareKeyRing", rtInjected, graph, bootObs);
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/ChaCha20", rtInjected, graph, bootObs);
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/ChaCha20$Keystream", rtInjected, graph, bootObs);
+            // NativeCrypto is the optional native string-decrypt sink + HKDF seam;
+            // when the native-crypto blob was compiled the AES holder calls it, so
+            // it must be boot-loadable in BF mode too (it depends only on KbnlKey /
+            // ChaCha20 / BfSecureLoader, all already boot classes above). When the
+            // blob is absent the holder stays pure Java and never references it.
+            rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/NativeCrypto", rtInjected, graph, bootObs);
             if (rtCount > 0) {
                 if (bootObs != null) {
                     KBoxLog.info(TAG, "BF boot obfuscation: " + bootObs.encrypted()
@@ -1092,8 +1260,8 @@ public final class Packager {
             KBoxLog.warn(TAG, "Failed to encrypt resources.map: " + e.getMessage() + " (writing plaintext)");
             encryptedMap = mapBytes;
         }
-        putEntry(out, "META-INF/kbox/resources.map", encryptedMap);
-        putEntry(out, "META-INF/kbox/resource-guard.bin", seed);
+        putEntry(out, clsRoot + "META-INF/kbox/resources.map", encryptedMap);
+        putEntry(out, clsRoot + "META-INF/kbox/resource-guard.bin", seed);
         KBoxLog.info(TAG, "Wrote resource guard metadata (mapping=" + mapping.size() + " entries)");
     }
 
@@ -1128,7 +1296,7 @@ public final class Packager {
                 sb.append(Character.forDigit((b >> 4) & 0xF, 16));
                 sb.append(Character.forDigit(b & 0xF, 16));
             }
-            putEntry(out, "META-INF/kbox/integrity.hash",
+            putEntry(out, clsRoot + "META-INF/kbox/integrity.hash",
                     sb.toString().getBytes(StandardCharsets.UTF_8));
             KBoxLog.info(TAG, "Wrote integrity hash (" + hashed + " classes)");
         } catch (Exception e) {
@@ -1136,7 +1304,174 @@ public final class Packager {
         }
     }
 
+    /**
+     * Asserts that every KBox-owned class referenced by the written classes is
+     * actually present in the output.
+     *
+     * <p>Per-build synthetic helpers (string/constant holders, type-confusion
+     * carriers, honeypot holders) are created inside a pass and referenced from
+     * rewritten call sites. If one is dropped, the artifact still builds fine and
+     * only fails at runtime with a bare {@code NoClassDefFoundError} naming the
+     * helper — which says nothing about which pass lost it. Failing here keeps a
+     * broken jar from ever being shipped.
+     *
+     * @param written      internal name -> written bytes for every class from the
+     *                     input jar (already in renamed space).
+     * @param injected     internal names of the runtime classes we injected.
+     * @param guardClasses internal names written by the resource/class guard.
+     */
+    private void verifyKboxReferenceClosure(Map<String, byte[]> written,
+                                            java.util.Set<String> injected,
+                                            java.util.Set<String> guardClasses) {
+        java.util.Set<String> present = new java.util.HashSet<>(written.keySet());
+        if (injected != null) present.addAll(injected);
+        if (guardClasses != null) present.addAll(guardClasses);
+
+        java.util.TreeMap<String, String> missing = new java.util.TreeMap<>();
+        for (Map.Entry<String, byte[]> e : written.entrySet()) {
+            java.util.Set<String> refs = new java.util.HashSet<>();
+            collectTypeRefs(e.getValue(), refs);
+            for (String r : refs) {
+                if (!isKboxOwned(r) || present.contains(r)) continue;
+                missing.putIfAbsent(r, e.getKey());
+            }
+        }
+        if (missing.isEmpty()) return;
+
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> m : missing.entrySet()) {
+            sb.append("\n  ").append(m.getKey())
+              .append("   (referenced by ").append(m.getValue()).append(')');
+        }
+        throw new com.kbox.core.KBoxException("Protected jar would reference "
+                + missing.size() + " missing KBox runtime class(es); refusing to "
+                + "write a broken artifact:" + sb);
+    }
+
+    /** True for the internal names of KBox-synthesized runtime helpers. */
+    private static boolean isKboxOwned(String internal) {
+        return internal.startsWith("com/kbox/runtime/")
+                || internal.startsWith("com/kbox/shield/")
+                || internal.startsWith("com/kbox/honey/")
+                || internal.startsWith("com/kbox/mock/");
+    }
+
+    /**
+     * Lightweight scan for every type internal-name a class file refers to
+     * (superclass, interfaces, descriptors, owners of field/method/type
+     * instructions, invokedynamic bootstrap targets). Deliberately reads the
+     * class with {@link org.objectweb.asm.ClassReader} instead of the tree API so
+     * it also works on classes whose tree parse is heavy, and so a class we
+     * cannot parse never aborts the audit.
+     */
+    private static void collectTypeRefs(byte[] bytes, java.util.Set<String> refs) {
+        try {
+            new org.objectweb.asm.ClassReader(bytes).accept(
+                    new org.objectweb.asm.ClassVisitor(org.objectweb.asm.Opcodes.ASM9) {
+                        @Override
+                        public void visit(int version, int access, String name, String sig,
+                                          String superName, String[] ifaces) {
+                            if (superName != null) refs.add(superName);
+                            if (ifaces != null) java.util.Collections.addAll(refs, ifaces);
+                        }
+
+                        @Override
+                        public org.objectweb.asm.FieldVisitor visitField(
+                                int access, String name, String desc, String sig, Object value) {
+                            collectDescRefs(desc, refs);
+                            return null;
+                        }
+
+                        @Override
+                        public org.objectweb.asm.MethodVisitor visitMethod(
+                                int access, String name, String desc, String sig, String[] ex) {
+                            collectDescRefs(desc, refs);
+                            if (ex != null) java.util.Collections.addAll(refs, ex);
+                            return new org.objectweb.asm.MethodVisitor(org.objectweb.asm.Opcodes.ASM9) {
+                                @Override
+                                public void visitTypeInsn(int opcode, String type) {
+                                    if (type != null) refs.add(type);
+                                }
+
+                                @Override
+                                public void visitMethodInsn(int opcode, String owner, String name,
+                                                            String desc, boolean itf) {
+                                    if (owner != null) refs.add(owner);
+                                    collectDescRefs(desc, refs);
+                                }
+
+                                @Override
+                                public void visitFieldInsn(int opcode, String owner,
+                                                           String name, String desc) {
+                                    if (owner != null) refs.add(owner);
+                                    collectDescRefs(desc, refs);
+                                }
+
+                                @Override
+                                public void visitLdcInsn(Object value) {
+                                    if (value instanceof org.objectweb.asm.Type) {
+                                        collectDescRefs(((org.objectweb.asm.Type) value).getDescriptor(), refs);
+                                    }
+                                }
+
+                                @Override
+                                public void visitInvokeDynamicInsn(String name, String desc,
+                                                                   org.objectweb.asm.Handle bsm, Object... args) {
+                                    collectDescRefs(desc, refs);
+                                    if (bsm != null) {
+                                        refs.add(bsm.getOwner());
+                                        collectDescRefs(bsm.getDesc(), refs);
+                                    }
+                                    for (Object a : args) {
+                                        if (a instanceof org.objectweb.asm.Type) {
+                                            collectDescRefs(((org.objectweb.asm.Type) a).getDescriptor(), refs);
+                                        } else if (a instanceof org.objectweb.asm.Handle) {
+                                            refs.add(((org.objectweb.asm.Handle) a).getOwner());
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void visitMultiANewArrayInsn(String desc, int dims) {
+                                    collectDescRefs(desc, refs);
+                                }
+                            };
+                        }
+                    }, org.objectweb.asm.ClassReader.SKIP_FRAMES | org.objectweb.asm.ClassReader.SKIP_DEBUG);
+        } catch (Throwable ignored) {
+            // Unparseable class: the writer already rolled it back to its original
+            // bytes, and there is nothing to audit here.
+        }
+    }
+
     // ===== Anti-Dump: class body encryption =====
+
+    /**
+     * True when the class carries an annotation from a package whose runtime
+     * provider may read class files as resources rather than loading them
+     * (Spring component scanning, JPA/EE metadata readers, Jackson).
+     */
+    private static boolean hasFrameworkAnnotation(ClassNode cn) {
+        if (cn == null) return false;
+        return hasFrameworkAnnotation(cn.visibleAnnotations)
+                || hasFrameworkAnnotation(cn.invisibleAnnotations);
+    }
+
+    private static boolean hasFrameworkAnnotation(java.util.List<?> annotations) {
+        if (annotations == null) return false;
+        for (Object o : annotations) {
+            if (!(o instanceof org.objectweb.asm.tree.AnnotationNode)) continue;
+            String d = ((org.objectweb.asm.tree.AnnotationNode) o).desc;
+            if (d == null) continue;
+            if (d.startsWith("Lorg/springframework/")
+                    || d.startsWith("Ljakarta/")
+                    || d.startsWith("Ljavax/")
+                    || d.startsWith("Lcom/fasterxml/jackson/")) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /**
      * Compute the transitive dependency closure of every JNIC owner class.
@@ -1252,8 +1587,28 @@ public final class Packager {
     /** True when the class (by new internal name) is eligible for encryption. */
     private static boolean shouldEncryptClass(String newInternal, String oldInternal,
                                               ProtectionConfig cfg, Set<String> nativePlainClosure) {
+        return shouldEncryptClass(null, null, newInternal, oldInternal, cfg, nativePlainClosure);
+    }
+
+    private static boolean shouldEncryptClass(ClassNode cn, ClassGraph graph,
+                                              String newInternal, String oldInternal,
+                                              ProtectionConfig cfg, Set<String> nativePlainClosure) {
         // Never encrypt KBox runtime classes — they must load before the guard.
         if (newInternal.startsWith("com/kbox/runtime/")) return false;
+        // Never encrypt a class that a runtime framework PARSEs as a resource.
+        //
+        // Spring's component scan does not call loadClass: it reads every candidate
+        // .class through the classloader and feeds the bytes to its own ASM
+        // ClassReader, and for "classpath*:" scans PathMatchingResourcePatternResolver
+        // reaches the raw jar entry directly, bypassing the guard loader entirely.
+        // Ciphertext (the masked-KBCE header) therefore reaches Spring's ClassReader,
+        // which aborts the scan with "Incompatible class format ... during classpath
+        // scanning" — the app then loses every @Component/@Service/@Repository bean.
+        // Classes carrying framework annotations, and Spring Data repository
+        // interfaces (whose query methods are parsed by name), are exactly the ones
+        // that must stay parseable on disk.
+        if (hasFrameworkAnnotation(cn)) return false;
+        if (com.kbox.core.name.RetentionDecision.isSpringDataRepository(graph, newInternal)) return false;
         // Never encrypt any class in the transitive dependency closure of a
         // JNIC owner — those classes are resolved through the system loader
         // which cannot decrypt KBCE-encrypted bytes (ClassFormatError).
@@ -1332,15 +1687,15 @@ public final class Packager {
     }
 
     /** Writes {@code META-INF/kbox/class-seed.bin} (32-byte seed) and {@code META-INF/kbox/encrypted-classes.list}. */
-    private void writeClassGuardMetadata(ZipOutputStream out,
+    private void writeClassGuardMetadata(ZipOutputStream out, String clsRoot,
                                          java.util.Set<String> encryptedNames,
                                          byte[] classSeed) throws IOException {
-        putEntry(out, "META-INF/kbox/class-seed.bin", classSeed);
+        putEntry(out, clsRoot + "META-INF/kbox/class-seed.bin", classSeed);
         StringBuilder sb = new StringBuilder();
         for (String n : encryptedNames) {
             sb.append(n).append('\n');
         }
-        putEntry(out, "META-INF/kbox/encrypted-classes.list",
+        putEntry(out, clsRoot + "META-INF/kbox/encrypted-classes.list",
                 sb.toString().getBytes(StandardCharsets.UTF_8));
         KBoxLog.info(TAG, "Wrote class guard metadata (" + encryptedNames.size() + " encrypted classes)");
     }
@@ -1350,7 +1705,8 @@ public final class Packager {
      * (internal name) per line. Runtime uses this list to detect native
      * classes without parsing anti-decompiler-mangled bytecode.
      */
-    private void writeJnicClassList(ZipOutputStream out, ProtectionConfig cfg) throws IOException {
+    private void writeJnicClassList(ZipOutputStream out, String clsRoot,
+                                    ProtectionConfig cfg) throws IOException {
         java.util.Set<String> classNames = new java.util.LinkedHashSet<>();
         for (String key : cfg.getNativeMethods()) {
             int hashIdx = key.indexOf('#');
@@ -1363,7 +1719,7 @@ public final class Packager {
         for (String n : classNames) {
             sb.append(n).append('\n');
         }
-        putEntry(out, "META-INF/kbox/jnic-classes.list",
+        putEntry(out, clsRoot + "META-INF/kbox/jnic-classes.list",
                 sb.toString().getBytes(StandardCharsets.UTF_8));
         KBoxLog.info(TAG, "Wrote JNIC class list (" + classNames.size() + " classes) -> META-INF/kbox/jnic-classes.list");
     }
@@ -1374,14 +1730,14 @@ public final class Packager {
      * never re-defined locally by the guard loader, to keep a single copy of
      * bytecode/lib classes across loaders (else ClassCastException).
      */
-    private void writeParentDelegateList(ZipOutputStream out,
+    private void writeParentDelegateList(ZipOutputStream out, String clsRoot,
                                          java.util.Set<String> parentDelegate) throws IOException {
         if (parentDelegate == null || parentDelegate.isEmpty()) return;
         StringBuilder sb = new StringBuilder();
         for (String n : parentDelegate) {
             sb.append(n).append('\n');
         }
-        putEntry(out, "META-INF/kbox/parent-delegate.list",
+        putEntry(out, clsRoot + "META-INF/kbox/parent-delegate.list",
                 sb.toString().getBytes(StandardCharsets.UTF_8));
         KBoxLog.info(TAG, "Wrote parent-delegate list (" + parentDelegate.size()
                 + " classes) -> META-INF/kbox/parent-delegate.list");
@@ -1711,7 +2067,16 @@ public final class Packager {
             return 0;
         }
         byte[] bytes = raw;
-        if (obs != null) bytes = obs.obfuscate(raw);
+        /* BfSecureLoader must ship byte-identical to the build-time baseline:
+         * the native decoder bakes FNV hashes of its key methods (main/
+         * failIfAgentPresent/<init>/entry-read) and verifies them via JVMTI
+         * GetBytecodes at startup. Skipping the BootstrapObfuscator rewrite
+         * for THIS class keeps those bytes deterministic (an obfuscated main
+         * would change its code[] and false-positive every clean artifact).
+         * Its strings carry no secret, so the skipped hardening is harmless. */
+        if (obs != null && !internal.equals("com/kbox/runtime/BfSecureLoader")) {
+            bytes = obs.obfuscate(raw);
+        }
         byte[] fin = reSerializeRuntimeClass(bytes, internal);
         if (fin != null) bytes = fin;
         putEntry(out, clsRoot + internal + ".class", bytes);
@@ -1743,7 +2108,7 @@ public final class Packager {
             byte[] spki = parseHexLicense(cfg.getLicPublicKey());
             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
             com.kbox.runtime.LicVerifier.writeMaskedPublicKey(bo, spki);
-            putEntry(out, "META-INF/kbox/lic.pub", bo.toByteArray());
+            putEntry(out, clsRoot + "META-INF/kbox/lic.pub", bo.toByteArray());
             KBoxLog.info(TAG, "Embedded masked license public key ("
                     + spki.length + " bytes) + LicVerifier runtime");
         } catch (Exception e) {
@@ -1790,12 +2155,19 @@ public final class Packager {
 
     /**
      * Re-serializes a runtime class bytecode with COMPUTE_FRAMES to ensure
-     * correct StackMapTable.  The raw compiler output may have incomplete or
+     * correct StackMapTable. The raw compiler output may have incomplete or
      * missing stack-map frames that cause VerifyError at runtime.
+     *
+     * <p><b>Deterministic</b>: identical {@code raw} always yields identical
+     * output, so {@code BfNativeBuilder} reproduces exactly the bytes
+     * {@code injectBoot} will write for the loader (used to bake the loader's
+     * expected FNV hash into the native decoder). Public so the builder can
+     * share the SAME implementation — any drift would break the native
+     * loader-tamper check.
      *
      * @return re-serialized bytes, or null if class cannot be parsed
      */
-    private static byte[] reSerializeRuntimeClass(byte[] raw, String internal) {
+    public static byte[] reSerializeRuntimeClass(byte[] raw, String internal) {
         try {
             org.objectweb.asm.ClassReader cr = new org.objectweb.asm.ClassReader(raw);
             org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
@@ -1955,7 +2327,12 @@ public final class Packager {
         try {
             byte[] result = serializeWithMode(cn, graph, true);
             if (result != null) return result;
-        } catch (Exception e) {
+        } catch (Exception | AssertionError e) {
+            // ASM signals malformed input bytecode with AssertionError (an Error,
+            // not an Exception) from Frame.putAbstractType during
+            // computeAllFrames. Without it here the whole pipeline dies on one
+            // bad class instead of rolling that class back to its original
+            // bytes, which defeats the neverFail/rollbackToOriginalBytes contract.
             KBoxLog.warn(TAG, "COMPUTE_FRAMES failed for " + cn.name
                     + " (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
             dumpDiagnosticClass(cn, graph);
@@ -2431,8 +2808,22 @@ public final class Packager {
 
     private byte[] serializeWithMode(ClassNode cn, ClassGraph graph, boolean computeFrames) {
         int flags = ClassWriter.COMPUTE_MAXS | (computeFrames ? ClassWriter.COMPUTE_FRAMES : 0);
-        ClassWriter cw = graphAwareWriter(graph, flags);
+        final boolean[] imprecise = new boolean[1];
+        ClassWriter cw = graphAwareWriter(graph, flags, imprecise);
         cn.accept(cw);
+        if (computeFrames && imprecise[0]) {
+            // At least one branch join needed a common supertype we could neither
+            // read from the graph nor load reflectively, so a frame had to be
+            // widened to java/lang/Object. That widening is not always legal —
+            // FlatLaf.getDisabledIcon merges `ImageFilter` with a RENAMED
+            // GrayFilter subclass and the widened `Object` frame was rejected at
+            // class load (VerifyError: ... not assignable to java/awt/image/ImageFilter).
+            // The original bytes carry javac's own (correct) StackMapTable, so
+            // rolling back is always safe; shipping wrong frames is not.
+            KBoxLog.warn(TAG, "Frames not precisely computable for " + cn.name
+                    + " (unresolvable common supertype) -> rolling back to original bytes");
+            return null;
+        }
         return cw.toByteArray();
     }
 
@@ -2440,8 +2831,18 @@ public final class Packager {
      * Builds a {@link ClassWriter} whose {@code getCommonSuperClass} resolves
      * types from the {@link ClassGraph} instead of the system classloader, so
      * frame computation never needs Minecraft/skija/viaversion on the classpath.
+     *
+     * @param imprecise optional out-flag: set to {@code true} when a common
+     *                  supertype could not be determined and {@code java/lang/Object}
+     *                  had to be assumed, so the caller can fall back to the
+     *                  original bytes instead of shipping possibly-invalid frames.
      */
     private static ClassWriter graphAwareWriter(ClassGraph graph, int flags) {
+        return graphAwareWriter(graph, flags, null);
+    }
+
+    private static ClassWriter graphAwareWriter(ClassGraph graph, int flags,
+                                                final boolean[] imprecise) {
         return new ClassWriter(flags) {
             @Override
             protected String getCommonSuperClass(String type1, String type2) {
@@ -2462,23 +2863,66 @@ public final class Packager {
                         a = an == null ? null : an.superName;
                     }
                 }
-                // At least one type is not in the class graph (e.g. a JDK type such
-                // as java/lang/Throwable or java/lang/Exception, which are never part
-                // of the input jar's class graph). Resolving those to java/lang/Object
-                // silently downgrades e.g. `Throwable root = e; while(...) root =
-                // root.getCause();` to `Object` in the recomputed StackMapTable, so
-                // the JVM then rejects `Throwable.getCause()` with VerifyError. The
-                // tool's own runtime classpath CAN load JDK+ASM types (they are what
-                // the class writer itself runs on), so fall back to reflective
-                // resolution for anything the graph does not contain. Object is a
-                // last-resort only for types that are missing from BOTH.
-                try {
-                    return commonSuperClassReflective(type1, type2, graph);
-                } catch (Throwable ex) {
+                // At least one type is not in the class graph (a JDK type such as
+                // java/awt/image/ImageFilter, or a RENAMED in-jar type the tool's own
+                // classpath cannot load). Resolving these straight to java/lang/Object
+                // silently downgrades recomputed frames and the JVM then rejects the
+                // class. Real case: FlatLaf.getDisabledIcon merges `ImageFilter`
+                // (from a checkcast) with a renamed GrayFilter subclass at a branch
+                // join; the frame was written as Object, and `Object` is not
+                // assignable to the ImageFilter the invokedynamic declares ->
+                //   VerifyError: Bad type on operand stack ... invokedynamic
+                // So first compare the superclass-name chains, which stay exact even
+                // once a chain leaves the graph.
+                String byChain = commonSuperByChain(type1, type2, graph);
+                if (byChain != null) return byChain;
+                // Needs at least one reflective load. When a side cannot be loaded
+                // at all, the answer is a guess: report it so the caller can keep
+                // the original, valid bytes for this class.
+                Class<?> c1 = loadClass(type1, graph);
+                Class<?> c2 = loadClass(type2, graph);
+                if (c1 == null || c2 == null) {
+                    if (imprecise != null) imprecise[0] = true;
                     return "java/lang/Object";
                 }
+                return commonSuperClassReflective(type1, type2, graph);
             }
         };
+    }
+
+    /**
+     * Superclass-name chain of {@code type}, following {@code superName} while the
+     * graph knows the node. The chain keeps the name of the first node that leaves
+     * the graph (that name is still exact) and then stops, because deeper links are
+     * unknowable without loading the class.
+     */
+    private static java.util.List<String> superChain(String type, ClassGraph graph) {
+        java.util.List<String> chain = new java.util.ArrayList<>();
+        String cur = type;
+        for (int guard = 0; cur != null && guard < 128; guard++) {
+            chain.add(cur);
+            ClassNode cn = graph.getClasses().get(cur);
+            cur = (cn == null) ? null : cn.superName;
+        }
+        return chain;
+    }
+
+    /**
+     * Common superclass decided purely from superclass-name chains: the first name
+     * of {@code type1}'s chain that also occurs in {@code type2}'s chain. Returns
+     * {@code null} when the chains share no known name.
+     *
+     * <p>Only {@code superName} is followed (never interfaces) because ASM's
+     * {@code getCommonSuperClass} contract wants a class, and a StackMapTable entry
+     * carrying an interface type is not accepted where a class is required.
+     */
+    private static String commonSuperByChain(String type1, String type2, ClassGraph graph) {
+        java.util.List<String> c1 = superChain(type1, graph);
+        java.util.List<String> c2 = superChain(type2, graph);
+        for (String a : c1) {
+            if (c2.contains(a)) return a;
+        }
+        return null;
     }
 
     /**
@@ -2570,11 +3014,16 @@ public final class Packager {
             ClassWriter cw = new ClassWriter(cr, 0);
             ClassRemapper remap = new ClassRemapper(cw, new FullRollbackRemapper(mapping, graph));
             cr.accept(remap, 0);
-            byte[] remapped = cw.toByteArray();
-            // Recompute frames from scratch so a rolled-back class is
-            // guaranteed to carry a StackMapTable consistent with its
-            // (renamed) bytecode.
-            return recomputeFrames(remapped, graph);
+            // Deliberately NO frame recomputation here. `current` is the pristine
+            // input class, so its StackMapTable was produced by javac against the
+            // real library hierarchy and is already correct; ClassRemapper renamed
+            // the types inside it consistently. Recomputing frames from our
+            // classpath-limited graph is what downgraded e.g. a merged
+            // `ImageFilter` frame to `Object` and produced
+            //   VerifyError: Bad type on operand stack ... invokedynamic
+            // on a rolled-back class — i.e. the rollback itself broke a class that
+            // was valid. Keep the original frames.
+            return cw.toByteArray();
         } catch (Exception e) {
             KBoxLog.warn(TAG, "Rollback byte remap failed: " + e.getMessage());
             return current;
@@ -2644,8 +3093,67 @@ public final class Packager {
         return internal == null ? null : internal.replace('/', '.');
     }
 
+    /**
+     * BF-MC hybrid: prepends {@code BfSecureLoader.attach()} to the class'
+     * {@code <clinit>} (creating one if absent) so the blob is decoded when the
+     * mod loader first touches a plaintext entry class. attach() is idempotent,
+     * so multiple entry classes calling it are harmless. INVOKESTATIC is stack
+     * neutral, so inserting at the head of a clinit is always frame-safe.
+     */
+    private static void injectBfAttach(org.objectweb.asm.tree.ClassNode cn) {
+        org.objectweb.asm.tree.MethodNode clinit = null;
+        for (Object mo : cn.methods) {
+            org.objectweb.asm.tree.MethodNode m = (org.objectweb.asm.tree.MethodNode) mo;
+            if ("<clinit>".equals(m.name)) { clinit = m; break; }
+        }
+        org.objectweb.asm.tree.InsnList insns = new org.objectweb.asm.tree.InsnList();
+        insns.add(new org.objectweb.asm.tree.MethodInsnNode(
+                org.objectweb.asm.Opcodes.INVOKESTATIC,
+                "com/kbox/runtime/BfSecureLoader", "attach", "()V", false));
+        if (clinit == null) {
+            clinit = new org.objectweb.asm.tree.MethodNode(
+                    org.objectweb.asm.Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
+            clinit.instructions.add(insns);
+            clinit.instructions.add(new org.objectweb.asm.tree.InsnNode(
+                    org.objectweb.asm.Opcodes.RETURN));
+            clinit.maxStack = 1;
+            cn.methods.add(clinit);
+        } else {
+            clinit.instructions.insert(insns);
+            if (clinit.maxStack < 1) clinit.maxStack = 1;
+        }
+    }
+
     private static void putEntry(ZipOutputStream out, String name, byte[] data) throws IOException {
         ZipEntry e = new ZipEntry(name);
+        out.putNextEntry(e);
+        out.write(data);
+        out.closeEntry();
+    }
+
+    /**
+     * Writes an entry STORED (uncompressed) with an explicit CRC-32.
+     *
+     * <p>Required for {@code BOOT-INF/lib/*.jar}: Spring Boot's boot loader maps
+     * each nested jar as a contiguous byte window of the outer archive, so the
+     * nested bytes must not be deflated. Deflating them makes every nested jar —
+     * and with it every library class and every {@code META-INF} resource it
+     * carries ({@code AutoConfiguration.imports}, SLF4J providers, …) —
+     * unresolvable at runtime, while the application's own
+     * {@code BOOT-INF/classes} entries keep working, which makes the failure look
+     * like a Spring configuration problem instead of a packaging one.
+     * {@code spring-boot-maven-plugin} stores these entries uncompressed for
+     * exactly the same reason.
+     */
+    private static void putStoredEntry(ZipOutputStream out, String name, byte[] data)
+            throws IOException {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(data);
+        ZipEntry e = new ZipEntry(name);
+        e.setMethod(ZipEntry.STORED);
+        e.setSize(data.length);
+        e.setCompressedSize(data.length);
+        e.setCrc(crc.getValue());
         out.putNextEntry(e);
         out.write(data);
         out.closeEntry();

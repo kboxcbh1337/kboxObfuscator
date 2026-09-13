@@ -8,10 +8,7 @@ import com.kbox.core.log.KBoxLog;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-import javax.swing.JFileChooser;
-import javax.swing.SwingUtilities;
 import java.awt.Desktop;
-import java.awt.HeadlessException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -66,6 +63,10 @@ public final class ProtectorGui {
     private HttpServer server;
     private volatile boolean running;                 // 当前是否正在保护
 
+    /** CLI 传入的预填路径（launch 时设置），routeRoot 注入到页面供自动适配。 */
+    private volatile String prefillIn;
+    private volatile String prefillOut;
+
     private static final class LogEntry {
         final long s;
         final String lvl;
@@ -108,7 +109,11 @@ public final class ProtectorGui {
         }));
 
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.setExecutor(Executors.newCachedThreadPool(r -> {
+        // FIXED core pool (not cached): a cached pool has corePoolSize 0, so when
+        // the UI is idle (>60s with no request) every worker is reaped and the
+        // JVM exits — the page then becomes unreachable ("浏览器打不开"). Keeping
+        // two permanent non-daemon workers holds the process alive while idle.
+        server.setExecutor(Executors.newFixedThreadPool(4, r -> {
             Thread t = new Thread(r, "kbox-http");
             t.setDaemon(false);                    // 非 daemon：保持 JVM 存活
             return t;
@@ -131,7 +136,8 @@ public final class ProtectorGui {
         server.createContext("/", this::routeRoot);
         server.createContext("/api/state", this::routeState);
         server.createContext("/api/protect", this::routeProtect);
-        server.createContext("/api/browse", this::routeBrowse);
+        server.createContext("/api/upload", this::routeUpload);
+        server.createContext("/api/analyze", this::routeAnalyze);
         server.createContext("/favicon.ico", ex -> send(ex, 204, "no-cache", ""));
     }
 
@@ -146,8 +152,16 @@ public final class ProtectorGui {
             byte[] html = in.readAllBytes();
             ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
             ex.getResponseHeaders().set("Cache-Control", "no-store");
-            ex.sendResponseHeaders(200, html.length);
-            try (OutputStream os = ex.getResponseBody()) { os.write(html); }
+            // Prefill from the CLI launch arguments (--gui -i/-o) so the page can
+            // run its automatic "smart-adapt" analysis without manual entry.
+            String pf = "<script>window._pf={i:" + (prefillIn == null ? "null" : esc(prefillIn))
+                    + ",o:" + (prefillOut == null ? "null" : esc(prefillOut)) + "};</script>";
+            byte[] body = pf.getBytes(StandardCharsets.UTF_8);
+            byte[] out = new byte[html.length + body.length];
+            System.arraycopy(body, 0, out, 0, body.length);
+            System.arraycopy(html, 0, out, body.length, html.length);
+            ex.sendResponseHeaders(200, out.length);
+            try (OutputStream os = ex.getResponseBody()) { os.write(out); }
         }
     }
 
@@ -213,36 +227,229 @@ public final class ProtectorGui {
                 "{\"ok\":true,\"runId\":" + curRunId + "}");
     }
 
-    /** 原生文件选择对话框（EDT）。 */
-    private void routeBrowse(HttpExchange ex) throws IOException {
+    /** 纯 HTML 文件选择：浏览器 multipart 上传到服务端临时目录，返回真实路径。
+     *  不再调用 Java Swing JFileChooser（浏览器原生选择 + 丝滑动画）。 */
+    private void routeUpload(HttpExchange ex) throws IOException {
         if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
-            send(ex, 405, "application/json; charset=utf-8", "{\"path\":null}");
+            send(ex, 405, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"POST required\"}");
+            return;
+        }
+        String ctype = ex.getRequestHeaders().getFirst("Content-Type");
+        if (ctype == null || !ctype.toLowerCase(java.util.Locale.ROOT).startsWith("multipart/form-data")) {
+            send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"multipart required\"}");
+            return;
+        }
+        byte[] body = ex.getRequestBody().readAllBytes();
+        String boundary = null;
+        int bi = ctype.indexOf("boundary=");
+        if (bi >= 0) {
+            boundary = ctype.substring(bi + 9).trim();
+            if (boundary.startsWith("\"")) {
+                int e2 = boundary.indexOf('"', 1);
+                if (e2 > 1) boundary = boundary.substring(1, e2);
+            }
+        }
+        if (boundary == null || boundary.isEmpty() || body.length == 0) {
+            send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"bad multipart\"}");
+            return;
+        }
+        byte[] delim = ("--" + boundary).getBytes(StandardCharsets.ISO_8859_1);
+        int p0 = indexOf(body, delim, 0);
+        if (p0 < 0) { send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"no part\"}"); return; }
+        p0 += delim.length;
+        if (p0 + 2 <= body.length && body[p0] == '-' && body[p0 + 1] == '-') {
+            send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"no file part\"}");
+            return;
+        }
+        while (p0 + 2 <= body.length && (body[p0] == '\r' || body[p0] == '\n')) p0++;
+        int hdrEnd = indexOf(body, "\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1), p0);
+        if (hdrEnd < 0) { send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"bad header\"}"); return; }
+        String header = new String(body, p0, hdrEnd - p0, StandardCharsets.ISO_8859_1);
+        String filename = "";
+        int fn = header.indexOf("filename=\"");
+        if (fn >= 0) {
+            int f0 = fn + 10;
+            int f1 = header.indexOf('"', f0);
+            if (f1 > f0) filename = header.substring(f0, f1);
+        }
+        if (filename.isEmpty()) {
+            send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"no filename\"}");
+            return;
+        }
+        int dataStart = hdrEnd + 4;
+        int partEnd = indexOf(body, delim, dataStart);
+        if (partEnd < 0) partEnd = body.length;
+        int dataLen = partEnd - dataStart;
+        if (dataLen >= 2 && body[dataStart + dataLen - 2] == '\r' && body[dataStart + dataLen - 1] == '\n') {
+            dataLen -= 2;   // 去掉 part 尾部的 CRLF
+        }
+        if (dataLen <= 0) {
+            send(ex, 400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"empty file\"}");
+            return;
+        }
+        filename = new java.io.File(filename).getName();   // 防目录穿越
+        Path uploadDir = Paths.get("kbox-work", "uploads");
+        try { java.nio.file.Files.createDirectories(uploadDir); } catch (Exception ignore) { }
+        Path out = uploadDir.resolve(System.currentTimeMillis() + "-" + filename);
+        byte[] chunk = new byte[dataLen];
+        System.arraycopy(body, dataStart, chunk, 0, dataLen);
+        java.nio.file.Files.write(out, chunk);
+        send(ex, 200, "application/json; charset=utf-8",
+                "{\"ok\":true,\"path\":" + esc(out.toAbsolutePath().toString())
+                + ",\"name\":" + esc(filename) + ",\"size\":" + dataLen + "}");
+    }
+
+    /** 字节数组子串查找（零依赖）。 */
+    private static int indexOf(byte[] hay, byte[] needle, int from) {
+        outer:
+        for (int i = Math.max(0, from); i + needle.length <= hay.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (hay[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /** 输入 jar 智能分析：识别项目类型并给出推荐选项（自适应配置）。 */
+    private void routeAnalyze(HttpExchange ex) throws IOException {
+        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+            send(ex, 405, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"POST required\"}");
             return;
         }
         String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-        String mode = jstr(body, "mode");
-        String current = jstr(body, "current");
-        final String[] picked = {null};
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                try {
-                    JFileChooser fc = new JFileChooser();
-                    if (!current.isEmpty()) {
-                        try { fc.setSelectedFile(Paths.get(current).toFile()); } catch (Exception ignore) {}
-                    }
-                    int r = "open".equals(mode) ? fc.showOpenDialog(null) : fc.showSaveDialog(null);
-                    if (r == JFileChooser.APPROVE_OPTION && fc.getSelectedFile() != null) {
-                        picked[0] = fc.getSelectedFile().getAbsolutePath();
-                    }
-                } catch (HeadlessException he) {
-                    KBoxLog.warn("gui", "browse: headless environment");
-                }
-            });
-        } catch (Exception e) {
-            KBoxLog.warn("gui", "browse dialog failed: " + e.getMessage());
+        String in = jstr(body, "input");
+        if (in.isEmpty() || !new java.io.File(in).isFile()) {
+            send(ex, 200, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"error\":\"输入 jar 不存在或不可读\"}");
+            return;
         }
-        send(ex, 200, "application/json; charset=utf-8",
-                "{\"path\":" + (picked[0] == null ? "null" : esc(picked[0])) + "}");
+        send(ex, 200, "application/json; charset=utf-8", analyzeJar(in));
+    }
+
+    /** 扫描 jar 的布局特征，产出 JSON：{ok,label,note,checks[],sets{key:value}}。 */
+    private static String analyzeJar(String input) {
+        StringBuilder label = new StringBuilder("Java 应用");
+        boolean hasMain = false;
+        boolean springBoot = false;
+        boolean fabric = false, forge = false, bukkit = false, mixin = false, tweak = false;
+        boolean kotlin = false, spi = false;
+        boolean library = false;
+        int classCount = 0, resourceCount = 0;
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(input)) {
+            String manifestMain = null;
+            String tweakClass = null;
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                java.util.zip.ZipEntry e = en.nextElement();
+                if (e.isDirectory()) continue;
+                String n = e.getName();
+                if (n.endsWith(".class")) classCount++;
+                else resourceCount++;
+                if (n.equals("META-INF/MANIFEST.MF")) {
+                    try {
+                        java.io.InputStream is = zf.getInputStream(e);
+                        byte[] mb = is.readAllBytes(); is.close();
+                        String mf = new String(mb, StandardCharsets.UTF_8);
+                        for (String line : mf.split("\r?\n")) {
+                            if (line.startsWith("Main-Class:")) manifestMain = line.substring(11).trim();
+                            else if (line.startsWith("TweakClass:")) tweakClass = line.substring(11).trim();
+                        }
+                    } catch (Throwable ignore) { }
+                } else if (n.startsWith("BOOT-INF/classes/")) springBoot = true;
+                else if (n.equals("fabric.mod.json")) fabric = true;
+                else if (n.equals("META-INF/mods.toml") || n.equals("META-INF/neoforge.mods.toml")) forge = true;
+                else if (n.equals("plugin.yml")) bukkit = true;
+                else if (n.endsWith("mixins.json") || (n.startsWith("mixin") && n.endsWith(".json"))) mixin = true;
+                else if (n.startsWith("kotlin/") || n.startsWith("kotlinx/")) kotlin = true;
+                else if (n.startsWith("META-INF/services/")) spi = true;
+            }
+            hasMain = manifestMain != null && !manifestMain.isEmpty();
+            if (tweakClass != null) tweak = true;
+            if (fabric || forge || bukkit || tweak || mixin) library = false;
+            else if (!hasMain && !springBoot) library = true;
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":" + esc("无法分析 jar: " + t) + "}";
+        }
+
+        // 建议集合：{checkbox/select key -> "1"/"0"/数值}
+        java.util.LinkedHashMap<String, String> sets = new java.util.LinkedHashMap<>();
+        // —— 全部项目共用的中等强度基线 ——
+        sets.put("rename", "1"); sets.put("strings", "1"); sets.put("cf", "1");
+        sets.put("cfStrength", "2"); sets.put("strStrength", "3");
+        sets.put("kotlin", kotlin ? "1" : "0"); sets.put("silentShield", "1");
+        sets.put("antiDebug", "1"); sets.put("vmpSelfCheck", "1"); sets.put("integrity", "1");
+        sets.put("whiteboxStrings", "1"); sets.put("exJump", "1");
+        sets.put("hideCallGraph", "1"); sets.put("fakeDebugInfo", "1");
+        sets.put("methodInlineExtract", "1"); sets.put("eraseAnnotations", "1");
+        sets.put("nativeShell", "2"); sets.put("antiDec", "2");
+        sets.put("scatter", "0"); sets.put("typeConfusion", "0"); sets.put("mbaConstants", "0");
+        sets.put("bfvm", "0"); sets.put("bfShield", "0"); sets.put("bfShieldLevel", "0");
+
+        StringBuilder note = new StringBuilder();
+        String[] kinds;
+        if (springBoot) {
+            label.setLength(0); label.append("Spring Boot 可执行包");
+            hasMain = true;
+            kinds = new String[] { "Spring Boot fat jar（BOOT-INF/classes）", "入口由 spring 启动器接管" };
+            // BF 会把启动器吞进 blob 破坏 boot 链路：走类加密而非 BF。
+            sets.put("bfLoader", "0"); sets.put("classEnc", "1"); sets.put("resources", "1");
+            sets.put("vmp", "0"); sets.put("jnic", "0"); sets.put("autoAdaptMc", "0");
+            sets.put("reflectionGate", "0");
+            note.append("Spring 大量反射/代理，避免 VMP 化框架类；已关 VMP/JNIC/BF，开启类加密。");
+        } else if (fabric || forge || bukkit || tweak || mixin) {
+            String which = fabric ? "Fabric" : forge ? "Forge/NeoForge" : bukkit ? "Bukkit/Paper" : tweak ? "Forge TweakClass" : "含 Mixin";
+            label.setLength(0); label.append("Minecraft ").append(which).append(" 模组");
+            kinds = new String[] {
+                (fabric ? "fabric.mod.json" : forge ? "META-INF/mods.toml" : bukkit ? "plugin.yml" : tweak ? "TweakClass" : "mixins.json"),
+                hasMain ? "带主类" : "纯 mod（无主类）", mixin ? "含 Mixin" : null
+            };
+            sets.put("autoAdaptMc", "1");
+            sets.put("bfLoader", "0"); sets.put("classEnc", "0"); sets.put("resources", "0");
+            sets.put("vmp", "0"); sets.put("jnic", "0"); sets.put("reflectionGate", "0");
+            note.append("已启用 autoAdaptMc（mod 加载器自动适配）；类加密/资源混淆/BF 关闭以避免 Mixin 与入口破坏。");
+        } else if (library) {
+            label.setLength(0); label.append("Java 库（无 Main-Class）");
+            kinds = new String[] { "库类（被第三方引用）", spi ? "ServiceLoader SPI 提供方" : null };
+            sets.put("bfLoader", "0"); sets.put("classEnc", "1"); sets.put("resources", "1");
+            sets.put("vmp", "0"); sets.put("jnic", "0"); sets.put("autoAdaptMc", "0");
+            note.append("无入口 → BF 混沌加载自动降级；改用类加密 + 资源混淆。库包注意 keep 公开 API。");
+        } else {
+            // 普通可执行应用
+            label.setLength(0); label.append("可执行 Java 应用");
+            kinds = new String[] { hasMain ? "带 Main-Class" : "入口类未知" };
+            sets.put("bfLoader", "1"); sets.put("classEnc", "0"); sets.put("resources", "0");
+            sets.put("vmp", "1"); sets.put("vmpNative", "1");
+            sets.put("jnic", "1"); sets.put("jnicEpl", "1");
+            sets.put("obfConstants", "1"); sets.put("reflectionGate", "1");
+            sets.put("autoAdaptMc", "0");
+            note.append("独立应用：BF 混沌加载 + VMP/JNIC 分层；性能敏感可关 JNIC。");
+        }
+
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{\"ok\":true,\"label\":").append(esc(label.toString()))
+          .append(",\"classes\":").append(classCount)
+          .append(",\"resources\":").append(resourceCount)
+          .append(",\"checks\":[");
+        boolean first = true;
+        if (hasMain) { sb.append(esc("Main-Class 入口")); first = false; }
+        if (springBoot) { if (!first) sb.append(','); sb.append(esc("Spring Boot")); first = false; }
+        for (String k : kinds) {
+            if (k == null) continue;
+            if (!first) sb.append(',');
+            sb.append(esc(k)); first = false;
+        }
+        if (kotlin) { if (!first) sb.append(','); sb.append(esc("Kotlin 类（元数据修复已开）")); first = false; }
+        if (spi) { if (!first) sb.append(','); sb.append(esc("ServiceLoader SPI（已保留）")); first = false; }
+        sb.append("],\"sets\":{");
+        boolean fs = true;
+        for (java.util.Map.Entry<String, String> e2 : sets.entrySet()) {
+            if (!fs) sb.append(',');
+            fs = false;
+            sb.append(esc(e2.getKey())).append(':').append(esc(e2.getValue()));
+        }
+        sb.append("},\"note\":").append(esc(note.toString())).append('}');
+        return sb.toString();
     }
 
     // ============================================================
@@ -317,6 +524,11 @@ public final class ProtectorGui {
         p.setAutoAdaptMinecraft(jbool(o, "autoAdaptMc", false));
         p.setReflectionGate(jbool(o, "reflectionGate", false));
         p.setJnicEplDriven(jbool(o, "jnicEpl", false));
+        // ---- VMP/JNIC 排除类（自定义前缀列表，逗号/分号/换行分隔）----
+        String vmpExc = jstr(o, "vmpExclude");
+        if (!vmpExc.isEmpty()) addExclusionPrefixes(p.getVmpExcludePrefixes(), vmpExc);
+        String jnicExc = jstr(o, "jnicExclude");
+        if (!jnicExc.isEmpty()) addExclusionPrefixes(p.getJnicExcludePrefixes(), jnicExc);
         p.setHideCallGraph(jbool(o, "hideCallGraph", false));
         p.setFakeDebugInfo(jbool(o, "fakeDebugInfo", false));
         p.setMethodInlineExtract(jbool(o, "methodInlineExtract", false));
@@ -412,6 +624,19 @@ public final class ProtectorGui {
         try { return Integer.parseInt(n.toString()); } catch (Exception e) { return dflt; }
     }
 
+    /** 解析 UI 排除类列表（逗号/分号/换行分隔），归一化点分格式后写入前缀集合。 */
+    private static void addExclusionPrefixes(java.util.Set<String> target, String raw) {
+        for (String tok : raw.split("[,;\n\r]+")) {
+            String t = tok.trim();
+            if (t.isEmpty()) continue;
+            // 兼容点分（com.example.Foo）与斜杠（com/example/Foo）两种写法
+            String dotted = t.replace('/', '.').replace('\\', '.');
+            if (dotted.endsWith(".*")) dotted = dotted.substring(0, dotted.length() - 2);
+            if (dotted.endsWith(".")) dotted = dotted.substring(0, dotted.length() - 1);
+            if (!dotted.isEmpty()) target.add(dotted);
+        }
+    }
+
     private static long paramLong(String query, String key, long dflt) {
         for (String kv : query.split("&")) {
             int e = kv.indexOf('=');
@@ -462,11 +687,13 @@ public final class ProtectorGui {
         if (verbose) KBoxLog.setLevel(KBoxLog.LEVEL_DEBUG);
         try {
             ProtectorGui g = new ProtectorGui();
+            g.prefillIn = in;
+            g.prefillOut = out;
             int port = g.server.getAddress().getPort();
             System.out.println("[KBox-GUI] HTML UI: http://127.0.0.1:" + port + "/");
             openBrowser("http://127.0.0.1:" + port + "/");
             if (in != null && out != null) {
-                KBoxLog.info("gui", "已预填输入/输出，请在页面点击「开始混淆」。");
+                KBoxLog.info("gui", "已预填输入/输出，页面将自动完成配置适配。");
             }
         } catch (Exception e) {
             System.err.println("[KBox-GUI] failed to start: " + e.getMessage());
@@ -476,14 +703,38 @@ public final class ProtectorGui {
     }
 
     private static void openBrowser(String url) {
+        // 1) 标准 AWT Desktop。
         try {
             if (Desktop.isDesktopSupported()) {
                 Desktop.getDesktop().browse(URI.create(url));
                 return;
             }
-        } catch (Exception ignore) {}
-        // 兜底：打印 URL，让用户手动打开。
-        System.out.println("[KBox-GUI] 请手动打开浏览器访问: " + url);
+        } catch (Throwable ignore) {
+            // fall through to OS-level launchers
+        }
+        // 2) OS 级启动器（Desktop 在无 JNI 桌面/受限会话下常失败）。
+        try {
+            String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+            if (os.contains("win")) {
+                // rundll32 打开默认浏览器；cmd start 作为二次兜底。
+                try {
+                    new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", url).start();
+                    return;
+                } catch (Throwable ignore) { }
+                new ProcessBuilder("cmd", "/c", "start", "", "\"" + url + "\"").start();
+                return;
+            }
+            if (os.contains("mac")) {
+                new ProcessBuilder("open", url).start();
+                return;
+            }
+            new ProcessBuilder("xdg-open", url).start();
+            return;
+        } catch (Throwable ignore) {
+            // fall through to the manual-URL hint below
+        }
+        // 3) 兜底：打印 URL，让用户手动打开（服务在 127.0.0.1 上持续可用）。
+        System.out.println("[KBox-GUI] 无法自动打开浏览器，请手动访问: " + url);
     }
 
     public static void main(String[] args) {

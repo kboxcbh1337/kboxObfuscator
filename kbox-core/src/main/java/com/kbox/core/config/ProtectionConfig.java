@@ -77,9 +77,26 @@ public final class ProtectionConfig {
      *  heap, so a heap dump yields nothing but RLE noise. Conflicts with JNIC,
      *  class encryption and resource obfuscation (auto-disabled at run time). */
     private boolean brainfuckLoader = false;
+    /** BF-MC hybrid mode (opt-in, default off). When the input is a Minecraft
+     *  mod and BOTH {@code brainfuckLoader} and this flag are set, the BF-RLE
+     *  blob is kept for the bulk of the classes while the loader-critical
+     *  surface stays plaintext: loader metadata (fabric.mod.json / mods.toml /
+     *  mixins.json ...), the loader entry classes and the mixin package are
+     *  written as readable jar entries, and {@code BfSecureLoader.attach()} is
+     *  injected into each entry class' {@code <clinit>} so the blob is decoded
+     *  when the mod is first touched by the loader. Limitation: only classes
+     *  reachable through the plaintext entry surface can resolve blob classes;
+     *  keep the entry surface small. Off = the pipeline degrades BF to non-RLE
+     *  full protection (BFVM/Shield/strings/VMP/JNIC still apply). */
+    private boolean brainfuckMcHybrid = false;
     private boolean fixKotlinMetadata = true;     // rewrite Kotlin @Metadata after rename
-    /** Auto-detect the Minecraft mod loader and adapt keep/resource rules. */
-    private boolean autoAdaptMinecraft = false;
+    /** Auto-detect the Minecraft mod loader (fabric.mod.json / mods.toml / plugin.yml
+     *  / TweakClass / mixins.json) and keep its entry points + loader metadata out of
+     *  the obfuscation scope. On by default: for a genuine MC-mod input this is what
+     *  keeps the output actually loadable by the real loader instead of silently
+     *  renaming entry classes and producing a jar that can never start. No-op for
+     *  ordinary jars (the detector returns "not a mod"). */
+    private boolean autoAdaptMinecraft = true;
 
     // --- Anti-analysis toggles ---
     /** 0=off, 1=light, 2=medium, 3=aggressive. Injects goto chains, exception-table
@@ -301,6 +318,61 @@ public final class ProtectionConfig {
      * real obfuscation.
      */
     private final Set<String> nativeExcludePrefixes = new HashSet<>();
+    /**
+     * Class name prefixes that must be excluded from VMP virtualization only.
+     * Unlike {@link #nativeExcludePrefixes} (which blacklists BOTH VMP and JNIC),
+     * this lets the user keep a class virtualized-by-JNIC but skipped by VMP (or
+     * vice versa). JNIC conversion, control-flow, strings etc. still run; only the
+     * VMP body-virtualization pass is skipped for these classes.
+     */
+    private final Set<String> vmpExcludePrefixes = new HashSet<>();
+
+    /**
+     * Classes whose method BODIES must stay verbatim — not just their names.
+     *
+     * <p>Populated with Mixin classes and their targets. {@code keepPrefixes}
+     * already stops renaming for them, and VMP/JNIC exclusion stops body sinking,
+     * but every other body pass (opaque predicates, stack-frame redirect,
+     * control-flow flattening, constant/MBA rewriting) still ran because they gate
+     * on {@link #shouldProtectClass(String)}, which by design ignores keeps.
+     *
+     * <p>That is fatal for Mixin: an {@code @Inject} handler is MERGED into the
+     * target class at load time, with Mixin renumbering the local slots and
+     * wrapping the handler in its own try/catch (for cancellation and error
+     * reporting). Passes that rewrite frames, locals or exception tables therefore
+     * corrupt the handler. Observed: LiquidBounce's
+     * {@code MixinMinecraftServer#onInit} was rewritten into an
+     * "athrow a carrier exception, catch it, re-materialise the parameter"
+     * prologue; after Mixin's own catch wrapped the handler, the payload slot read
+     * back null and the game died with
+     * <pre>
+     *   NullPointerException
+     *     at net.minecraft.server.MinecraftServer.handler$onInit$zdd000(...)
+     *     at net.minecraft.server.MinecraftServer.&lt;init&gt;
+     * </pre>
+     */
+    private final Set<String> bodyProtectExcludePrefixes = new HashSet<>();
+
+    /** @return true if this class must keep its original method bodies verbatim. */
+    public boolean isBodyProtectExcluded(String internalName) {
+        if (internalName == null || bodyProtectExcludePrefixes.isEmpty()) return false;
+        String dotted = internalName.replace('/', '.');
+        for (String p : bodyProtectExcludePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        return false;
+    }
+
+    public Set<String> getBodyProtectExcludePrefixes() { return bodyProtectExcludePrefixes; }
+    /**
+     * Class name prefixes that must be excluded from JNIC native conversion only.
+     * Unlike {@link #nativeExcludePrefixes} (which blacklists BOTH VMP and JNIC),
+     * this lets the user keep a class virtualized-by-VMP but skipped by JNIC (or
+     * vice versa). VMP virtualization, control-flow, strings etc. still run; only
+     * the JNIC Java→C sinking pass is skipped for these classes.
+     */
+    private final Set<String> jnicExcludePrefixes = new HashSet<>();
 
     // --- S8 JNIC EPL-driven layering ---
     // Default false: when nativeMethod/nativeMethods are configured explicitly, the
@@ -492,6 +564,8 @@ public final class ProtectionConfig {
     public void setObfuscateResources(boolean v) { obfuscateResources = v; }
     public boolean isBrainfuckLoader() { return brainfuckLoader; }
     public void setBrainfuckLoader(boolean v) { brainfuckLoader = v; }
+    public boolean isBrainfuckMcHybrid() { return brainfuckMcHybrid; }
+    public void setBrainfuckMcHybrid(boolean v) { brainfuckMcHybrid = v; }
     public boolean isFixKotlinMetadata() { return fixKotlinMetadata; }
     public void setFixKotlinMetadata(boolean v) { fixKotlinMetadata = v; }
     public boolean isAutoAdaptMinecraft() { return autoAdaptMinecraft; }
@@ -623,6 +697,8 @@ public final class ProtectionConfig {
     public Set<String> getBfvmMethods() { return bfvmMethods; }
     public Set<String> getNativeEligiblePrefixes() { return nativeEligiblePrefixes; }
     public Set<String> getNativeExcludePrefixes() { return nativeExcludePrefixes; }
+    public Set<String> getVmpExcludePrefixes() { return vmpExcludePrefixes; }
+    public Set<String> getJnicExcludePrefixes() { return jnicExcludePrefixes; }
     /** Returns {@code true} if JNIC/VMP must not convert the given class. */
     public boolean isExcludedFromNative(String internalName) {
         if (internalName == null || nativeExcludePrefixes.isEmpty()) return false;
@@ -633,11 +709,65 @@ public final class ProtectionConfig {
         }
         return false;
     }
+    /** Returns {@code true} if the class is excluded from VMP virtualization
+     *  (either the shared native blacklist or the VMP-only list). */
+    public boolean isExcludedFromVmp(String internalName) {
+        if (internalName == null) return false;
+        String dotted = internalName.replace('/', '.');
+        for (String p : nativeExcludePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        for (String p : vmpExcludePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        return false;
+    }
+    /** Returns {@code true} if the class is excluded from JNIC native conversion
+     *  (either the shared native blacklist or the JNIC-only list). */
+    public boolean isExcludedFromJnic(String internalName) {
+        if (internalName == null) return false;
+        String dotted = internalName.replace('/', '.');
+        for (String p : nativeExcludePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        for (String p : jnicExcludePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        return false;
+    }
     /** Returns {@code true} if the class may be considered for JNIC/VMP
      *  auto-selection, honouring the whitelist {@link #nativeEligiblePrefixes}
      *  (empty whitelist = every non-excluded class is eligible). */
     public boolean isNativeEligible(String internalName) {
         if (isExcludedFromNative(internalName)) return false;
+        if (nativeEligiblePrefixes.isEmpty()) return true;
+        String dotted = internalName.replace('/', '.');
+        for (String p : nativeEligiblePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        return false;
+    }
+    /** Returns {@code true} if the class may be considered for VMP auto-selection
+     *  (honours the shared whitelist and the VMP-only exclusion list). */
+    public boolean isVmpEligible(String internalName) {
+        if (isExcludedFromVmp(internalName)) return false;
+        if (nativeEligiblePrefixes.isEmpty()) return true;
+        String dotted = internalName.replace('/', '.');
+        for (String p : nativeEligiblePrefixes) {
+            if (p == null || p.isEmpty()) continue;
+            if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
+        }
+        return false;
+    }
+    /** Returns {@code true} if the class may be considered for JNIC auto-selection
+     *  (honours the shared whitelist and the JNIC-only exclusion list). */
+    public boolean isJnicEligible(String internalName) {
+        if (isExcludedFromJnic(internalName)) return false;
         if (nativeEligiblePrefixes.isEmpty()) return true;
         String dotted = internalName.replace('/', '.');
         for (String p : nativeEligiblePrefixes) {
@@ -709,6 +839,9 @@ public final class ProtectionConfig {
      * {@link com.kbox.core.config.LibraryClassifier#shouldProtect}.
      */
     public boolean shouldProtectClass(String internalName) {
+        // Framework-managed classes (Mixin handlers above all) keep their bodies
+        // verbatim — see bodyProtectExcludePrefixes.
+        if (isBodyProtectExcluded(internalName)) return false;
         return libraryClassifier.shouldProtect(internalName, this);
     }
 
@@ -757,6 +890,7 @@ public final class ProtectionConfig {
         c.enableJnic = enableJnic;
         c.obfuscateResources = obfuscateResources;
         c.brainfuckLoader = brainfuckLoader;
+        c.brainfuckMcHybrid = brainfuckMcHybrid;
         c.fixKotlinMetadata = fixKotlinMetadata;
         c.autoAdaptMinecraft = autoAdaptMinecraft;
         c.antiDecompilerLevel = antiDecompilerLevel;
@@ -778,6 +912,9 @@ public final class ProtectionConfig {
         c.bfvmMethods.addAll(bfvmMethods);
         c.nativeEligiblePrefixes.addAll(nativeEligiblePrefixes);
         c.nativeExcludePrefixes.addAll(nativeExcludePrefixes);
+        c.vmpExcludePrefixes.addAll(vmpExcludePrefixes);
+        c.bodyProtectExcludePrefixes.addAll(bodyProtectExcludePrefixes);
+        c.jnicExcludePrefixes.addAll(jnicExcludePrefixes);
         c.cc = cc;
         c.licPublicKey = licPublicKey;
         c.licAppSecret = licAppSecret;
@@ -843,6 +980,7 @@ public final class ProtectionConfig {
                 + ", jnic=" + enableJnic + ", native=" + nativeMethods.size()
                 + ", resources=" + obfuscateResources
                 + ", bfLoader=" + brainfuckLoader
+                + ", bfMcHybrid=" + brainfuckMcHybrid
                 + ", autoMc=" + autoAdaptMinecraft
                 + ", antiDec=" + antiDecompilerLevel + ", antiDbg=" + antiDebug
                 + ", vmpChk=" + vmpSelfCheck + ", scatter=" + scatterStrings
@@ -850,6 +988,7 @@ public final class ProtectionConfig {
                 + ", exJmp=" + exceptionJumpObf + ", ntvHook=" + nativeAntiHook
                 + ", nullGuard=" + nullGuard
                 + ", keepPrefix=" + keepPrefixes + ", cc=" + cc
+                + ", vmpExc=" + vmpExcludePrefixes + ", jnicExc=" + jnicExcludePrefixes
                 + ", lic=" + isLicensed()
                 + ", scope=" + obfuscationScope
                 + ", include=" + includePatterns.size()

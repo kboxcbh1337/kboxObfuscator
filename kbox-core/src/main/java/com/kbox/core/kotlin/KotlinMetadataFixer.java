@@ -66,7 +66,8 @@ public final class KotlinMetadataFixer {
 
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
-    private int fixedClasses;
+    private final java.util.concurrent.atomic.AtomicInteger fixedClasses =
+            new java.util.concurrent.atomic.AtomicInteger();
     private int fixedModules;
 
     public KotlinMetadataFixer(ClassGraph graph, ProtectionConfig cfg) {
@@ -80,14 +81,14 @@ public final class KotlinMetadataFixer {
             fixClassMetadata(mapping);
             fixModuleFiles(mapping);
         }
-        KBoxLog.info(TAG, "Fixed @Metadata on " + fixedClasses + " classes, "
+        KBoxLog.info(TAG, "Fixed @Metadata on " + fixedClasses.get() + " classes, "
                 + fixedModules + " .kotlin_module files");
     }
 
     @SuppressWarnings("unchecked")
     private void fixClassMetadata(Mapping mapping) {
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (cn.visibleAnnotations == null) continue;
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.visibleAnnotations == null) return;
             for (AnnotationNode an : (List<AnnotationNode>) cn.visibleAnnotations) {
                 if (!METADATA_DESC.equals(an.desc)) continue;
                 try {
@@ -97,7 +98,7 @@ public final class KotlinMetadataFixer {
                             + ": " + t);
                 }
             }
-        }
+        }, cfg.getParallelThreads());
     }
 
     /** Rewrite one class's @Metadata annotation in place. */
@@ -183,7 +184,7 @@ public final class KotlinMetadataFixer {
         if (out.xi() != 0) addPair(vals, "xi", out.xi());
         an.values.clear();
         an.values.addAll(vals);
-        fixedClasses++;
+        fixedClasses.incrementAndGet();
     }
 
     private static void addPair(List<Object> vals, String k, Object v) {

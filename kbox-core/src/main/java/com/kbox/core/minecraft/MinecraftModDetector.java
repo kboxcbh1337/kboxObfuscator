@@ -220,6 +220,31 @@ public final class MinecraftModDetector {
                 if (!part.isEmpty()) r.keepPrefixes.add(part.replace('.', '/'));
             }
         }
+        // FMLAT: the access-transformer file. Forge applies its member signatures
+        // against RAW class bytes at load time, so the file MUST survive
+        // byte-for-byte (name + content) — renaming it breaks every transform.
+        // Note the file name is loader-specific (e.g. "liquidbounce_at.cfg"),
+        // which the generic "*.accesstransformer.cfg" rule below cannot match.
+        String fmlAt = extractManifestValue(manifest, "FMLAT");
+        if (fmlAt != null && !fmlAt.isEmpty()) {
+            r.protectedResources.add(fmlAt.trim());
+        }
+        // FMLCorePlugin: the core-mod bootstrap class Forge instantiates directly
+        // from the manifest — renaming it fails the mod load before any class is
+        // defined. Same for a directly runnable Main-Class (CLI launch path).
+        String fmlCore = extractManifestValue(manifest, "FMLCorePlugin");
+        if (fmlCore != null) addDotted(r.entryClasses, fmlCore);
+        String fmlMod = extractManifestValue(manifest, "FMLCorePluginContainsFMLMod");
+        if ("true".equalsIgnoreCase(fmlMod == null ? "" : fmlMod.trim())) {
+            // Contains an @Mod class: also keep any @Mod annotation entry.
+            for (ClassNode cn : graph.getClasses().values()) {
+                if (findModId(cn) != null) r.entryClasses.add(cn.name);
+            }
+        }
+        String mainClass = extractManifestValue(manifest, "Main-Class");
+        if (mainClass != null && mainClass.indexOf('.') >= 0) {
+            addDotted(r.entryClasses, mainClass);
+        }
         // The compatibility flags config often lists the mixin package.
         for (Map.Entry<String, byte[]> e : graph.getResources().entrySet()) {
             if (e.getKey().endsWith(".json") && e.getKey().contains("mixin")) {
@@ -277,6 +302,15 @@ public final class MinecraftModDetector {
         for (String res : r.protectedResources) {
             cfg.getExcludeResourcePatterns().add(res);
         }
+        // Loader metadata that must survive byte-for-byte regardless of which loader
+        // was detected (mods may mix several): accessWidener / accesstransformer carry
+        // member signatures matched against RAW class bytes by the runtime loader, so
+        // any rename/encrypt breaks the transform; Fabric nested mods live under
+        // META-INF/jars/ as whole jars (never rename/encrypt a nested jar).
+        cfg.getExcludeResourcePatterns().add("*.accesswidener");
+        cfg.getExcludeResourcePatterns().add("*.accesstransformer.cfg");
+        cfg.getExcludeResourcePatterns().add("META-INF/jars/");
+        cfg.getExcludeResourcePatterns().add("META-INF/jars/*");
     }
 
     private void log(Result r, String loaderName) {

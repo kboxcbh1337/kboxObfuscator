@@ -74,19 +74,15 @@ public final class ResourceNullGuardTransformer {
         }
 
         int totalGuarded = 0;
-        int classCount = 0;
+        java.util.concurrent.atomic.AtomicInteger guarded = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger classes = new java.util.concurrent.atomic.AtomicInteger();
 
-        for (ClassNode cn : graph.getClasses().values()) {
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
             String internalName = cn.name;
             // Skip KBox runtime classes (they already handle null safely)
             if (internalName.startsWith("com/kbox/runtime/")) {
-                continue;
+                return;
             }
-            // Skip library classes (kept classes are still body-protected)
-            if (!cfg.shouldProtectClass(internalName)) {
-                continue;
-            }
-
             int classGuarded = 0;
             @SuppressWarnings("unchecked")
             List<MethodNode> methods = cn.methods;
@@ -98,15 +94,15 @@ public final class ResourceNullGuardTransformer {
                 }
                 classGuarded += guardMethod(mn);
             }
-
             if (classGuarded > 0) {
-                classCount++;
-                totalGuarded += classGuarded;
+                classes.incrementAndGet();
+                guarded.addAndGet(classGuarded);
             }
-        }
+        }, cfg.getParallelThreads());
+        totalGuarded = guarded.get();
 
         KBoxLog.info(TAG, "Null-guard injected: " + totalGuarded
-                + " getResourceAsStream call(s) across " + classCount + " class(es)");
+                + " getResourceAsStream call(s) across " + classes.get() + " class(es)");
         return totalGuarded;
     }
 

@@ -26,6 +26,145 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
+#if defined(_WIN32)
+/* ===== KBox native-shell M3: manual IAT (private resolver) ===== */
+/* No kernel32/ntdll API name is imported directly; every call is
+   resolved at runtime off the PEB + export directories. Keys,
+   ciphertext and slot layout change per build. */
+static unsigned kksfnvstr(const char* s){unsigned h=0x811c9dc5u;if(!s)return h;for(;*s;s++){unsigned char c=(unsigned char)*s;if(c>='A'&&c<='Z')c=(unsigned char)(c+32);h=(h^c)*0x01000193u;}return h;}
+static unsigned kksfnvmod(const unsigned short*w,int n){unsigned h=0x811c9dc5u;for(int i=0;i<n;i++){unsigned c=w[i];if(c>='A'&&c<='Z')c+=32;h=(h^(c&0xFF))*0x01000193u;}return h;}
+static const unsigned char _ks3K[16]={0x43,0xF9,0xF9,0x25,0x18,0x7A,0x9A,0xD7,0xE0,0xF2,0x66,0xD5,0x0B,0xB1,0xF0,0x2B};
+static const unsigned char _ks3D[247]={0x15,0x90,0x8B,0x51,0x6D,0x1B,0xF6,0x96,0x8C,0x9E,0x09,0xB6,0x5D,0xD8,0x82,0x5F,0x36,0x98,0x95,0x63,0x6A,0x1F,0xFF,0x81,0x89,0x80,0x12,0xA0,0x6A,0xDD,0xA0,0x59,0x2C,0x8D,0x9C,0x46,0x6C,0x39,0xE8,0xB2,0x81,0x86,0x03,0x81,0x63,0xC3,0x95,0x4A,0x27,0xBA,0x95,0x4A,0x6B,0x1F,0xD2,0xB6,0x8E,0x96,0x0A,0xB0,0x5F,0xD4,0x82,0x46,0x2A,0x97,0x98,0x51,0x7D,0x2A,0xE8,0xB8,0x83,0x97,0x15,0xA6,0x4C,0xD4,0x84,0x68,0x36,0x8B,0x8B,0x40,0x76,0x0E,0xCA,0xA5,0x8F,0x91,0x03,0xA6,0x78,0xF6,0x95,0x5F,0x00,0x8C,0x8B,0x57,0x7D,0x14,0xEE,0x87,0x92,0x9D,0x05,0xB0,0x78,0xC2,0xB9,0x4F,0x0A,0x8A,0xBD,0x40,0x7A,0x0F,0xFD,0xB0,0x85,0x80,0x36,0xA7,0x6E,0xC2,0x95,0x45,0x37,0xBE,0x9C,0x51,0x55,0x15,0xFE,0xA2,0x8C,0x97,0x2E,0xB4,0x65,0xD5,0x9C,0x4E,0x06,0x81,0xAE,0x69,0x77,0x1B,0xFE,0x9B,0x89,0x90,0x14,0xB4,0x79,0xC8,0xB1,0x7C,0x31,0x90,0x8D,0x40,0x48,0x08,0xF5,0xB4,0x85,0x81,0x15,0x98,0x6E,0xDC,0x9F,0x59,0x3A,0xBE,0x9C,0x51,0x5B,0x0F,0xE8,0xA5,0x85,0x9C,0x12,0x81,0x63,0xC3,0x95,0x4A,0x27,0xBE,0x9C,0x51,0x4C,0x12,0xE8,0xB2,0x81,0x96,0x25,0xBA,0x65,0xC5,0x95,0x53,0x37,0xAF,0x90,0x57,0x6C,0x0F,0xFB,0xBB,0xB1,0x87,0x03,0xA7,0x72,0xDA,0x95,0x59,0x2D,0x9C,0x95,0x16,0x2A,0x54,0xFE,0xBB,0x8C,0x99,0x03,0xA7,0x65,0xD4,0x9C,0x49,0x22,0x8A,0x9C,0x0B,0x7C,0x16,0xF6};
+static const unsigned short _ks3O[17]={0,12,23,37,49,60,76,93,112,129,147,159,177,193,209,221,233};
+static const unsigned char _ks3L[17]={12,11,14,12,11,16,17,19,17,18,12,18,16,16,12,12,14};
+static char _ks3P[248];
+static void* _ks3S[17];
+static void* _ks3C;static unsigned _ks3H;
+static const char* ksDec(int i){int o=_ks3O[i],l=_ks3L[i],j;for(j=0;j<l;j++)_ks3P[o+j]=(char)(_ks3D[o+j]^_ks3K[(o+j)&15]);_ks3P[o+l]=0;return _ks3P+o;}
+static void* ksGetModByHash(unsigned target){
+  if(_ks3C&&_ks3H==target)return _ks3C;
+  void*peb=0;
+#if defined(_WIN64)
+  __asm__ __volatile__("movq %%gs:0x60,%0":"=r"(peb));
+  enum{LDR_OFF=0x18,INLOAD=0x10,DL=0x30,SLEN=0x58,SBUF=0x60};
+#else
+  __asm__ __volatile__("movl %%fs:0x30,%0":"=r"(peb));
+  enum{LDR_OFF=0x0C,INLOAD=0x0C,DL=0x18,SLEN=0x24,SBUF=0x28};
+#endif
+  if(!peb)return 0;
+  void*ldr=*(void**)((unsigned char*)peb+LDR_OFF);
+  if(!ldr)return 0;
+  unsigned char*head=(unsigned char*)ldr+INLOAD;
+  unsigned char*cur=*(unsigned char**)head;
+  for(int k=0;cur&&cur!=head&&k<1024;k++,cur=*(unsigned char**)cur){
+    void*db=*(void**)(cur+DL);
+    if(db){unsigned short ln=*(unsigned short*)(cur+SLEN);
+      unsigned short*bf=*(unsigned short**)(cur+SBUF);
+      if(bf&&ln>=2&&kksfnvmod(bf,ln>>1)==target){_ks3C=db;_ks3H=target;return db;}}
+  }
+  return 0;
+}
+static void* ksExpByNameD(void*mod,const char*name,int depth){
+  if(!mod||!name||depth>=8)return 0;
+  IMAGE_DOS_HEADER*dos=(IMAGE_DOS_HEADER*)mod;
+  if(dos->e_magic!=IMAGE_DOS_SIGNATURE)return 0;
+  IMAGE_NT_HEADERS*nt=(IMAGE_NT_HEADERS*)((unsigned char*)mod+dos->e_lfanew);
+  if(nt->Signature!=IMAGE_NT_SIGNATURE)return 0;
+  IMAGE_DATA_DIRECTORY*dd=&nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+  if(!dd->VirtualAddress||!dd->Size)return 0;
+  IMAGE_EXPORT_DIRECTORY*ed=(IMAGE_EXPORT_DIRECTORY*)((unsigned char*)mod+dd->VirtualAddress);
+  const DWORD*fns=(const DWORD*)((unsigned char*)mod+ed->AddressOfFunctions);
+  const DWORD*nms=(const DWORD*)((unsigned char*)mod+ed->AddressOfNames);
+  const WORD*ords=(const WORD*)((unsigned char*)mod+ed->AddressOfNameOrdinals);
+  DWORD i,lo=dd->VirtualAddress,hi=dd->VirtualAddress+dd->Size;
+  for(i=0;i<ed->NumberOfNames;i++){
+    const char*nm2=(const char*)((unsigned char*)mod+nms[i]);
+    if(strcmp(nm2,name)==0){
+      DWORD rva=fns[ords[i]];
+      if(rva>=nt->OptionalHeader.SizeOfImage)return 0;
+      /* Forwarder export (kernel32 -> kernelbase on modern Win): the
+         function RVA lies inside the export-data section and holds a
+         "DLL.Function" string. Calling it directly would jump into a
+         non-executable page (DEP fault); chase the real target instead. */
+      if(rva>=lo&&rva<hi){
+        const char*fwd=(const char*)((unsigned char*)mod+rva);
+        const char*dot=fwd?strchr(fwd,'.'):0;
+        if(dot&&dot>fwd&&dot[1]){
+          char mb[80];DWORD j,L=(DWORD)(dot-fwd);
+          if(L>=sizeof(mb)-4)return 0;
+          for(j=0;j<L;j++)mb[j]=fwd[j];
+          /* Forwarder module name is bare ("KERNELBASE", no extension) but
+             the PEB lists the loaded image as "kernelbase.dll"; append the
+             suffix unless the name already carries a '.' extension. */
+          if(L<4||mb[L-4]!='.'){mb[L]='.';mb[L+1]='d';mb[L+2]='l';mb[L+3]='l';L+=4;}
+          mb[L]=0;
+          void*m=ksGetModByHash(kksfnvstr(mb));
+          if(m)return ksExpByNameD(m,dot+1,depth+1);
+        }
+        return 0;
+      }
+      return (void*)((unsigned char*)mod+rva);
+    }
+  }
+  return 0;
+}
+static void* ksExpByName(void*mod,const char*name){return ksExpByNameD(mod,name,0);}
+static void* ksK32(void){void*b;b=ksGetModByHash(kksfnvstr(ksDec(15)));if(b)return b;return ksGetModByHash(kksfnvstr(ksDec(16)));}
+static void* ksProc(int i){void*p=_ks3S[i];if(!p){const char*s=ksDec(i);char nm[64];int j=0;while((nm[j]=s[j])&&j+1<63)j++;nm[j]=0;void*k32=ksK32();if(k32)p=ksExpByName(k32,nm);_ks3S[i]=p;}return p;}
+enum{KS_I_0,KS_I_1,KS_I_2,KS_I_3,KS_I_4,KS_I_5,KS_I_6,KS_I_7,KS_I_8,KS_I_9,KS_I_10,KS_I_11,KS_I_12,KS_I_13,KS_I_14,KS_I_15,KS_I_16};
+#define VirtualAlloc kimp_VirtualAlloc
+#define VirtualFree kimp_VirtualFree
+#define VirtualProtect kimp_VirtualProtect
+#define CreateThread kimp_CreateThread
+#define CloseHandle kimp_CloseHandle
+#define TerminateProcess kimp_TerminateProcess
+#define GetCurrentProcess kimp_GetCurrentProcess
+#define GetCurrentProcessId kimp_GetCurrentProcessId
+#define IsDebuggerPresent kimp_IsDebuggerPresent
+#define GetModuleHandleExW kimp_GetModuleHandleExW
+#define LoadLibraryA kimp_LoadLibraryA
+#define WriteProcessMemory kimp_WriteProcessMemory
+#define GetCurrentThread kimp_GetCurrentThread
+#define GetThreadContext kimp_GetThreadContext
+#define VirtualQuery kimp_VirtualQuery
+#define GetProcAddress kimp_GetProcAddress
+#define GetModuleHandleA kimp_GetModuleHandleA
+#define GetModuleHandleW kimp_GetModuleHandleW
+static __attribute__((unused)) void* kimp_VirtualAlloc(void* a,size_t b,unsigned long c,unsigned long d){void*_kf=ksProc(KS_I_0);if(!_kf)return 0;
+  return ((void*(*)(void*,size_t,unsigned long,unsigned long))_kf)(a,b,c,d);}
+static __attribute__((unused)) int kimp_VirtualFree(void* a,size_t b,unsigned long c){void*_kf=ksProc(KS_I_1);if(!_kf)return 0;
+  return ((int(*)(void*,size_t,unsigned long))_kf)(a,b,c);}
+static __attribute__((unused)) int kimp_VirtualProtect(void* a,size_t b,unsigned long c,unsigned long* d){void*_kf=ksProc(KS_I_2);if(!_kf)return 0;
+  return ((int(*)(void*,size_t,unsigned long,unsigned long*))_kf)(a,b,c,d);}
+static __attribute__((unused)) void* kimp_CreateThread(void* a,void* b,void* c,void* d,void* e,void* f){void*_kf=ksProc(KS_I_3);if(!_kf)return 0;
+  return ((void*(*)(void*,void*,void*,void*,void*,void*))_kf)(a,b,c,d,e,f);}
+static __attribute__((unused)) int kimp_CloseHandle(void* a){void*_kf=ksProc(KS_I_4);if(!_kf)return 0;
+  return ((int(*)(void*))_kf)(a);}
+static __attribute__((unused)) int kimp_TerminateProcess(void* a,unsigned b){void*_kf=ksProc(KS_I_5);if(!_kf)return 0;
+  return ((int(*)(void*,unsigned))_kf)(a,b);}
+static __attribute__((unused)) void* kimp_GetCurrentProcess(){void*_kf=ksProc(KS_I_6);if(!_kf)return 0;
+  return ((void*(*)(void))_kf)();}
+static __attribute__((unused)) unsigned kimp_GetCurrentProcessId(){void*_kf=ksProc(KS_I_7);if(!_kf)return 0;
+  return ((unsigned(*)(void))_kf)();}
+static __attribute__((unused)) int kimp_IsDebuggerPresent(){void*_kf=ksProc(KS_I_8);if(!_kf)return 0;
+  return ((int(*)(void))_kf)();}
+static __attribute__((unused)) int kimp_GetModuleHandleExW(unsigned long a,const void* b,void* c){void*_kf=ksProc(KS_I_9);if(!_kf)return 0;
+  return ((int(*)(unsigned long,const void*,void*))_kf)(a,b,c);}
+static __attribute__((unused)) void* kimp_LoadLibraryA(const char* a){void*_kf=ksProc(KS_I_10);if(!_kf)return 0;
+  return ((void*(*)(const char*))_kf)(a);}
+static __attribute__((unused)) int kimp_WriteProcessMemory(void* a,void* b,const void* c,size_t d,size_t* e){void*_kf=ksProc(KS_I_11);if(!_kf)return 0;
+  return ((int(*)(void*,void*,const void*,size_t,size_t*))_kf)(a,b,c,d,e);}
+static __attribute__((unused)) void* kimp_GetCurrentThread(){void*_kf=ksProc(KS_I_12);if(!_kf)return 0;
+  return ((void*(*)(void))_kf)();}
+static __attribute__((unused)) int kimp_GetThreadContext(void* a,void* b){void*_kf=ksProc(KS_I_13);if(!_kf)return 0;
+  return ((int(*)(void*,void*))_kf)(a,b);}
+static __attribute__((unused)) size_t kimp_VirtualQuery(const void* a,void* b,size_t c){void*_kf=ksProc(KS_I_14);if(!_kf)return 0;
+  return ((size_t(*)(const void*,void*,size_t))_kf)(a,b,c);}
+static __attribute__((unused)) void* kimp_GetModuleHandleA(const char*name){return name?ksGetModByHash(kksfnvstr(name)):0;}
+static __attribute__((unused)) void* kimp_GetModuleHandleW(const unsigned short*name){if(!name)return 0;unsigned h=0x811c9dc5u;for(int i=0;name[i];i++){unsigned c=name[i];if(c>='A'&&c<='Z')c+=32;h=(h^(c&0xFF))*0x01000193u;}return ksGetModByHash(h);}
+static __attribute__((unused)) void* kimp_GetProcAddress(void*mod,const char*name){return ksExpByName(mod,name);}
+#endif
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -313,231 +452,4 @@ JNIEXPORT jbyte JNICALL Java_com_kbox_runtime_NativeCrypto_decryptByteAt0
         rb = rpv; kb = kpv;
     }
     return (jbyte)(((rb & 0xFF) ^ (kb & 0xFF)) & 0xFF);
-}
-
-/* ============================================================ */
-/*  AES-256 (FIPS 197) + CTR stream — native string-decrypt sink */
-/* ============================================================ */
-
-/*
- * String-decryption sink for the AES-256-CTR holder decryptor. The plaintext
- * is produced inside page-aligned, wipe-on-free memory (kbox_cryptoAlloc),
- * converted to a jstring there, and the buffer is zeroed before it is freed —
- * the Java heap only ever receives the final String. Returns NULL on any
- * failure so the Java caller falls back to the byte-identical JCE path.
- *
- * CTR COMPATIBILITY CONTRACT with Java's AES/CTR/NoPadding (SunJCE):
- *   counter block  = the 16-byte IV
- *   keystream block = AES-256_encrypt(counter)
- *   counter is then incremented as a 128-bit big-endian integer, one per block.
- * Any divergence makes native decrypted strings differ from JCE output.
- */
-
-static const uint8_t kbox_aes_sbox[256] = {
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
-};
-
-static uint32_t kbox_aes_xtime(uint32_t x) {
-    return (uint32_t)((x << 1) ^ (((x >> 7) & 1) * 0x1b));
-}
-
-static uint8_t kbox_aes_xtime8(uint8_t x) {
-    return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0));
-}
-
-/* Expands a 32-byte AES-256 key into 60 32-bit round-key words. */
-static void kbox_aes256_expand(const uint8_t key[32], uint32_t rk[60]) {
-    static const uint8_t rcon[15] = {
-        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36,0x6c,0xd8,0xab,0x4d,0x9a
-    };
-    int i;
-    uint32_t t;
-    for (i = 0; i < 8; i++) {
-        rk[i] = ((uint32_t)key[i*4] << 24) | ((uint32_t)key[i*4+1] << 16)
-              | ((uint32_t)key[i*4+2] << 8)  |  (uint32_t)key[i*4+3];
-    }
-    for (i = 8; i < 60; i++) {
-        t = rk[i-1];
-        if ((i & 7) == 0) {
-            /* RotWord(bytewise rotate left by one) + SubWord + Rcon:
-             * new top byte = sbox[old byte2], ... last byte = sbox[old top]. */
-            t = (kbox_aes_sbox[(t >> 16) & 0xff] << 24)
-              | (kbox_aes_sbox[(t >> 8) & 0xff] << 16)
-              | (kbox_aes_sbox[t & 0xff] << 8)
-              |  kbox_aes_sbox[(t >> 24) & 0xff];
-            t ^= ((uint32_t)rcon[i/8 - 1]) << 24;
-        } else if ((i & 7) == 4) {
-            t = (kbox_aes_sbox[(t >> 24) & 0xff] << 24)
-              | (kbox_aes_sbox[(t >> 16) & 0xff] << 16)
-              | (kbox_aes_sbox[(t >> 8) & 0xff] << 8)
-              |  kbox_aes_sbox[t & 0xff];
-        }
-        rk[i] = rk[i-8] ^ t;
-    }
-}
-
-static void kbox_aes256_encrypt(const uint32_t rk[60], const uint8_t in[16], uint8_t out[16]) {
-    /* Textbook AES-256 (state[row][col], column-major input/output):
-     *   in/out byte order = column 0..3, each column top row first —
-     *   identical to the word-based layout (s[c] word, byte0=row0). */
-    uint8_t s[4][4];
-    int r, c, i;
-    for (c = 0; c < 4; c++)
-        for (r = 0; r < 4; r++)
-            s[r][c] = in[c * 4 + r];
-    /* AddRoundKey(0): rk[c] word, byte0=row0 = top byte. */
-    for (c = 0; c < 4; c++)
-        for (r = 0; r < 4; r++)
-            s[r][c] ^= (uint8_t)(rk[c] >> (24 - r * 8));
-    for (i = 1; i <= 14; i++) {
-        /* SubBytes */
-        for (r = 0; r < 4; r++)
-            for (c = 0; c < 4; c++)
-                s[r][c] = kbox_aes_sbox[s[r][c]];
-        /* ShiftRows: row r rotates left by r. */
-        for (r = 1; r < 4; r++) {
-            uint8_t tmp[4];
-            for (c = 0; c < 4; c++) tmp[c] = s[r][c];
-            for (c = 0; c < 4; c++) s[r][c] = tmp[(c + r) % 4];
-        }
-        if (i < 14) {
-            /* MixColumns (2*a=xtime(a), 3*a=a^xtime(a)) */
-            for (c = 0; c < 4; c++) {
-                uint8_t a0 = s[0][c], a1 = s[1][c], a2 = s[2][c], a3 = s[3][c];
-                s[0][c] = (uint8_t)(kbox_aes_xtime8(a0) ^ (a1 ^ kbox_aes_xtime8(a1)) ^ a2 ^ a3);
-                s[1][c] = (uint8_t)(a0 ^ kbox_aes_xtime8(a1) ^ (a2 ^ kbox_aes_xtime8(a2)) ^ a3);
-                s[2][c] = (uint8_t)(a0 ^ a1 ^ kbox_aes_xtime8(a2) ^ (a3 ^ kbox_aes_xtime8(a3)));
-                s[3][c] = (uint8_t)((a0 ^ kbox_aes_xtime8(a0)) ^ a1 ^ a2 ^ kbox_aes_xtime8(a3));
-            }
-        }
-        /* AddRoundKey(i) */
-        for (c = 0; c < 4; c++)
-            for (r = 0; r < 4; r++)
-                s[r][c] ^= (uint8_t)(rk[i * 4 + c] >> (24 - r * 8));
-    }
-    for (c = 0; c < 4; c++)
-        for (r = 0; r < 4; r++)
-            out[c * 4 + r] = s[r][c];
-}
-
-/* Increments a 128-bit big-endian counter block by one. */
-static void kbox_ctr_inc(uint8_t ctr[16]) {
-    int i;
-    for (i = 15; i >= 0; i--) {
-        ctr[i]++;
-        if (ctr[i] != 0) break;
-    }
-}
-
-/* Standard UTF-8 -> UTF-16 decode, Java String(byte[], UTF_8) compatible for
- * well-formed input (malformed sequences become U+FFFD, as in Java). Returns
- * the number of UTF-16 units written. */
-static size_t kbox_utf8_to_utf16(const uint8_t* s, size_t n, uint16_t* out) {
-    size_t i = 0, o = 0;
-    while (i < n) {
-        uint8_t c = s[i];
-        if (c < 0x80) {
-            out[o++] = (uint16_t)c; i++;
-        } else if ((c & 0xE0) == 0xC0) {
-            if (i + 1 < n && (s[i+1] & 0xC0) == 0x80) {
-                uint32_t cp = ((uint32_t)(c & 0x1F) << 6) | (s[i+1] & 0x3F);
-                if (cp >= 0x80) { out[o++] = (uint16_t)cp; i += 2; }
-                else { out[o++] = 0xFFFD; i += 2; }
-            } else { out[o++] = 0xFFFD; i++; }
-        } else if ((c & 0xF0) == 0xE0) {
-            if (i + 2 < n && (s[i+1] & 0xC0) == 0x80 && (s[i+2] & 0xC0) == 0x80) {
-                uint32_t cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F);
-                if (cp >= 0x800 && cp <= 0xD7FF) { out[o++] = (uint16_t)cp; }
-                else if (cp >= 0xE000 && cp <= 0xFFFF) { out[o++] = (uint16_t)cp; }
-                else { out[o++] = 0xFFFD; }
-                i += 3;
-            } else { out[o++] = 0xFFFD; i++; }
-        } else if ((c & 0xF8) == 0xF0) {
-            if (i + 3 < n && (s[i+1] & 0xC0) == 0x80 && (s[i+2] & 0xC0) == 0x80 && (s[i+3] & 0xC0) == 0x80) {
-                uint32_t cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[i+1] & 0x3F) << 12)
-                            | ((uint32_t)(s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F);
-                if (cp >= 0x10000 && cp <= 0x10FFFF) {
-                    cp -= 0x10000;
-                    out[o++] = (uint16_t)(0xD800 | (cp >> 10));
-                    out[o++] = (uint16_t)(0xDC00 | (cp & 0x3FF));
-                } else { out[o++] = 0xFFFD; }
-                i += 4;
-            } else { out[o++] = 0xFFFD; i++; }
-        } else { out[o++] = 0xFFFD; i++; }
-    }
-    return o;
-}
-
-JNIEXPORT jstring JNICALL Java_com_kbox_runtime_NativeCrypto_decryptString0
-    (JNIEnv* env, jclass cls, jbyteArray jenc, jbyteArray jkey) {
-    (void)cls;
-    jsize encLen = jenc ? (*env)->GetArrayLength(env, jenc) : 0;
-    jsize keyLen = jkey ? (*env)->GetArrayLength(env, jkey) : 0;
-    jstring result = NULL;
-    if (encLen < 16 || keyLen != 32) return NULL;
-
-    jbyte* encRaw = (*env)->GetByteArrayElements(env, jenc, NULL);
-    jbyte* keyRaw = (*env)->GetByteArrayElements(env, jkey, NULL);
-    if (!encRaw || !keyRaw) {
-        if (encRaw) (*env)->ReleaseByteArrayElements(env, jenc, encRaw, JNI_ABORT);
-        if (keyRaw) (*env)->ReleaseByteArrayElements(env, jkey, keyRaw, JNI_ABORT);
-        return NULL;
-    }
-
-    jsize ctLen = encLen - 16;
-    uint8_t* pt = (uint8_t*)kbox_cryptoAlloc((size_t)ctLen > 0 ? (size_t)ctLen : 1);
-    uint32_t* rk = (uint32_t*)kbox_cryptoAlloc(60 * sizeof(uint32_t));
-    if (pt && rk) {
-        const uint8_t* iv = (const uint8_t*)encRaw;
-        uint8_t ctr[16];
-        uint8_t ks[16];
-        jsize off;
-        memcpy(ctr, iv, 16);
-        kbox_aes256_expand((const uint8_t*)keyRaw, rk);
-        for (off = 0; off + 16 <= ctLen; off += 16) {
-            kbox_aes256_encrypt(rk, ctr, ks);
-            {
-                int b;
-                for (b = 0; b < 16; b++) pt[off + b] = (uint8_t)((uint8_t)encRaw[16 + off + b] ^ ks[b]);
-            }
-            kbox_ctr_inc(ctr);
-        }
-        if (off < ctLen) {
-            jsize rem = ctLen - off;
-            int b;
-            kbox_aes256_encrypt(rk, ctr, ks);
-            for (b = 0; b < (int)rem; b++) pt[off + b] = (uint8_t)((uint8_t)encRaw[16 + off + b] ^ ks[b]);
-        }
-        /* UTF-8 -> UTF-16 (surrogate pairs need up to 2 units per 3/4-byte seq) */
-        {
-            size_t maxU = (size_t)ctLen * 2 + 1;
-            uint16_t* u16 = (uint16_t*)kbox_cryptoAlloc(maxU * sizeof(uint16_t));
-            if (u16) {
-                size_t nU = kbox_utf8_to_utf16(pt, (size_t)ctLen, u16);
-                if (nU > 0) result = (*env)->NewString(env, (const jchar*)u16, (jsize)nU);
-                kbox_cryptoFree(u16, maxU * sizeof(uint16_t));
-            }
-        }
-    }
-    if (rk) kbox_cryptoFree(rk, 60 * sizeof(uint32_t));
-    if (pt) kbox_cryptoFree(pt, (size_t)ctLen > 0 ? (size_t)ctLen : 1);
-
-    (*env)->ReleaseByteArrayElements(env, jkey, keyRaw, JNI_ABORT);
-    (*env)->ReleaseByteArrayElements(env, jenc, encRaw, JNI_ABORT);
-    return result;
 }

@@ -1,22 +1,9 @@
-# Build outputs
+﻿# Build / scratch outputs
 target/
-**/target/
-
-# Native scratch / IDE
-kbox-work/
+build/
+out-rc/
+.gradle/
 *.class
-*.jar
-*.dll
-*.so
-*.dylib
-*.o
-*.obj
-*.log
-hs_err_*.log
 
-# OS / editor
-.DS_Store
-Thumbs.db
-.idea/
-*.iml
-.vscode/
+# Release artifacts are published as GitHub Release assets, not tracked in git.
+dist/

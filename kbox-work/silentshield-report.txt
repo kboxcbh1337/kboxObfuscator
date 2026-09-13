@@ -1,0 +1,525 @@
+================================================================
+SilentShield — 其他混淆器适配性弱点加固审查报告
+================================================================
+弱点目录: WeaknessCatalog 内置 52 条弱点条目，覆盖 15 个混淆器源（ZKM, ProGuard, generic, Allatori, JNIC, ProGuard/Allatori, R8/D8, JNIC/商用混淆, DashO, Kotlin, Jackson, Spring, Jakarta, GraalVM, Stringer）
+支柱分布: CONTRACT=29 SPEC=17 DEGRADE=1 ENV=5 
+审计耗时: 13 ms
+发现数  : 原始 103 条（去重后），其中需落地动作 33 条
+风险分布: INFO=0 LOW=40 MEDIUM=51 HIGH=12 CRITICAL=0
+----------------------------------------------------------------
+逐条明细（仅列出 risk >= MEDIUM）:
+  #1 [HIGH] SERVICE_LOADER com.kbox.fulltest.spi.Calculator
+      source  : Allatori
+      pillar  : CONTRACT
+      weakness: SPI provider 类名/无参构造被重命名，ServiceLoader 按 META-INF/services 文本加载失败
+      symptom : ServiceConfigurationError / 功能静默缺失
+      trigger : ServiceLoader.load(com/kbox/fulltest/spi/Calculator) in com/kbox/fulltest/tests/ServiceTests.run
+      hardening: 解析 services 文件 provider FQN 并保留其无参构造
+      action  : KEEP_NOARG_CTOR (applied)
+  #2 [HIGH] REFLECTION_FOR_NAME com/kbox/fulltest/tests/ReflectTests
+      source  : ZKM
+      pillar  : CONTRACT
+      weakness: Class.forName 的类名字符串与类重命名/字符串加密不同步：字符串变了而目标类已被改名，动态加载断裂
+      symptom : ClassNotFoundException / NoClassDefFoundError 于运行期动态加载点
+      trigger : Class.forName("java.util.ArrayList") in com/kbox/fulltest/tests/ReflectTests.classInfo
+      hardening: 反射字符串感知：命中 fully.qualified 类名格式的 LDC 即联动 keep 或同步重映射
+      action  : KEEP_CLASS (applied)
+  #3 [HIGH] REFLECTION_MEMBER_LOOKUP com/kbox/fulltest/tests/ReflectTests :: MAX_VALUE
+      source  : ProGuard
+      pillar  : CONTRACT
+      weakness: getDeclaredMethod/getMethod/getField 的成员名字符串不参与 keep 推导，成员改名后查找失败
+      symptom : NoSuchMethodException / NoSuchFieldException
+      trigger : Class.getField lookup on com/kbox/fulltest/tests/ReflectTests for "MAX_VALUE"
+      hardening: 成员级反射名播种 keep 集（__anykept__），命中即保留成员原名
+      action  : KEEP_MEMBER (applied)
+  #4 [HIGH] REFLECTION_MEMBER_LOOKUP com/kbox/fulltest/tests/ReflectTests :: err
+      source  : ProGuard
+      pillar  : CONTRACT
+      weakness: getDeclaredMethod/getMethod/getField 的成员名字符串不参与 keep 推导，成员改名后查找失败
+      symptom : NoSuchMethodException / NoSuchFieldException
+      trigger : Class.getDeclaredField lookup on com/kbox/fulltest/tests/ReflectTests for "err"
+      hardening: 成员级反射名播种 keep 集（__anykept__），命中即保留成员原名
+      action  : KEEP_MEMBER (applied)
+  #5 [HIGH] REFLECTION_FIELD_ACCESS com/kbox/fulltest/tests/ReflectTests :: fieldAccess ()V
+      source  : generic
+      pillar  : CONTRACT
+      weakness: Field.get/set 按名字符串访问字段，字段名被混淆后访问断裂
+      symptom : NoSuchFieldException / IllegalAccessException
+      trigger : Field.get/set in com/kbox/fulltest/tests/ReflectTests.fieldAccess()V
+      hardening: 检测 Field.get/set 作用域并保留对应字段名
+      action  : KEEP_MEMBER (applied)
+  #6 [HIGH] STACK_MAP_FRAMES com/kbox/fulltest/tests/LambdaStreamTests :: switchTests ()V
+      source  : ProGuard/Allatori
+      pillar  : SPEC
+      weakness: 控制流平坦化/注入后 StackMapTable 未重算，JVM 验证器拒绝加载
+      symptom : VerifyError at class load
+      trigger : com/kbox/fulltest/tests/LambdaStreamTests.switchTests()V has switch/table frames
+      hardening: 所有变换后 COMPUTE_FRAMES + CheckClassAdapter 自检
+      action  : NONE (recorded)
+  #7 [HIGH] STACK_MAP_FRAMES com/kbox/fulltest/tests/LambdaStreamTests :: classify (Lcom/kbox/fulltest/tests/LambdaStreamTests$Color;)I
+      source  : ProGuard/Allatori
+      pillar  : SPEC
+      weakness: 控制流平坦化/注入后 StackMapTable 未重算，JVM 验证器拒绝加载
+      symptom : VerifyError at class load
+      trigger : com/kbox/fulltest/tests/LambdaStreamTests.classify(Lcom/kbox/fulltest/tests/LambdaStreamTests$Color;)I has switch/table frames
+      hardening: 所有变换后 COMPUTE_FRAMES + CheckClassAdapter 自检
+      action  : NONE (recorded)
+  #8 [HIGH] STACK_MAP_FRAMES com/kbox/fulltest/tests/LambdaStreamTests :: classifyInt (I)I
+      source  : ProGuard/Allatori
+      pillar  : SPEC
+      weakness: 控制流平坦化/注入后 StackMapTable 未重算，JVM 验证器拒绝加载
+      symptom : VerifyError at class load
+      trigger : com/kbox/fulltest/tests/LambdaStreamTests.classifyInt(I)I has switch/table frames
+      hardening: 所有变换后 COMPUTE_FRAMES + CheckClassAdapter 自检
+      action  : NONE (recorded)
+  #9 [HIGH] STACK_MAP_FRAMES com/kbox/fulltest/tests/LambdaStreamTests :: switchDay (Ljava/lang/String;)Ljava/lang/String;
+      source  : ProGuard/Allatori
+      pillar  : SPEC
+      weakness: 控制流平坦化/注入后 StackMapTable 未重算，JVM 验证器拒绝加载
+      symptom : VerifyError at class load
+      trigger : com/kbox/fulltest/tests/LambdaStreamTests.switchDay(Ljava/lang/String;)Ljava/lang/String; has switch/table frames
+      hardening: 所有变换后 COMPUTE_FRAMES + CheckClassAdapter 自检
+      action  : NONE (recorded)
+  #10 [HIGH] ENTRY_POINT com/kbox/fulltest/Main :: main ([Ljava/lang/String;)V
+      source  : generic
+      pillar  : CONTRACT
+      weakness: Main-Class 入口被重命名，jar 无法启动
+      symptom : Error: Main method not found in class
+      trigger : main / entry com/kbox/fulltest/Main.main
+      hardening: Manifest Main-Class + main 签名保留
+      action  : KEEP_CLASS (applied)
+  #11 [HIGH] SERVICE_LOADER com/kbox/fulltest/spi/impl/BasicCalculator
+      source  : Allatori
+      pillar  : CONTRACT
+      weakness: SPI provider 类名/无参构造被重命名，ServiceLoader 按 META-INF/services 文本加载失败
+      symptom : ServiceConfigurationError / 功能静默缺失
+      trigger : ServiceLoader provider com.kbox.fulltest.spi.impl.BasicCalculator from META-INF/services/com.kbox.fulltest.spi.Calculator
+      hardening: 解析 services 文件 provider FQN 并保留其无参构造
+      action  : KEEP_NOARG_CTOR (applied)
+  #12 [HIGH] CLASS_FILE_VERSION <resource> :: 61
+      source  : DashO
+      pillar  : ENV
+      weakness: 类文件主版本跨度 Java 8(52)..Java 25(69)，解析/重写必须按输入版本精确保留，否则高版本类被降级或拒绝
+      symptom : ClassFormatError / Unsupported class file major version
+      trigger : input max class file version 61 (Java 17)
+      hardening: 按输入类文件版本解析+重写（ASM 支持 52..69），不擅自升降版本
+      action  : NONE (recorded)
+  #13 [MEDIUM] RESOURCE_PATH com/kbox/fulltest/tests/ResourceTests :: config/app.properties
+      source  : generic
+      pillar  : CONTRACT
+      weakness: getResourceAsStream 的路径字符串被加密或资源被重命名，资源加载失败
+      symptom : 资源返回 null / 配置缺失
+      trigger : getResourceAsStream("config/app.properties") in com/kbox/fulltest/tests/ResourceTests.properties
+      hardening: 资源路径字符串不加密或与资源重命名保持一致
+      action  : KEEP_RESOURCE (applied)
+  #14 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ResourceTests :: properties ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ResourceTests.properties()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #15 [MEDIUM] RESOURCE_PATH com/kbox/fulltest/tests/ResourceTests :: data/sample.json
+      source  : generic
+      pillar  : CONTRACT
+      weakness: getResourceAsStream 的路径字符串被加密或资源被重命名，资源加载失败
+      symptom : 资源返回 null / 配置缺失
+      trigger : getResourceAsStream("data/sample.json") in com/kbox/fulltest/tests/ResourceTests.json
+      hardening: 资源路径字符串不加密或与资源重命名保持一致
+      action  : KEEP_RESOURCE (applied)
+  #16 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ResourceTests :: json ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ResourceTests.json()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #17 [MEDIUM] RESOURCE_PATH com/kbox/fulltest/tests/ResourceTests :: /config/app.properties
+      source  : generic
+      pillar  : CONTRACT
+      weakness: getResourceAsStream 的路径字符串被加密或资源被重命名，资源加载失败
+      symptom : 资源返回 null / 配置缺失
+      trigger : getResourceAsStream("/config/app.properties") in com/kbox/fulltest/tests/ResourceTests.classResource
+      hardening: 资源路径字符串不加密或与资源重命名保持一致
+      action  : KEEP_RESOURCE (applied)
+  #18 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ResourceTests :: classResource ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ResourceTests.classResource()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #19 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/CollectionTests :: lambda$mapOps$0 (Ljava/lang/String;)Ljava/lang/Integer;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/CollectionTests.lambda$mapOps$0(Ljava/lang/String;)Ljava/lang/Integer;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #20 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/CollectionTests :: lambda$sortOps$1 (Ljava/lang/Integer;Ljava/lang/Integer;)I
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/CollectionTests.lambda$sortOps$1(Ljava/lang/Integer;Ljava/lang/Integer;)I
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #21 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/IoTests :: byteIo ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/IoTests.byteIo()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #22 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/IoTests :: charIo ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/IoTests.charIo()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #23 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/IoTests :: streamIo ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/IoTests.streamIo()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #24 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/IoTests :: gzipIo ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/IoTests.gzipIo()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #25 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/IoTests :: serialization ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/IoTests.serialization()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #26 [MEDIUM] SERIALIZABLE_CLASS com/kbox/fulltest/model/Person
+      source  : Allatori
+      pillar  : CONTRACT
+      weakness: 字段改名破坏 Java 序列化按名匹配，serialVersionUID 不保留导致反序列化失配
+      symptom : InvalidClassException / 序列化流失配
+      trigger : class com/kbox/fulltest/model/Person implements Serializable
+      hardening: 保留 serialVersionUID + 可序列化字段名
+      action  : KEEP_SERIALIZATION (applied)
+  #27 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ReflectTests :: classInfo ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ReflectTests.classInfo()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #28 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ReflectTests :: methodInvoke ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ReflectTests.methodInvoke()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #29 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ReflectTests :: fieldAccess ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ReflectTests.fieldAccess()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #30 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ReflectTests :: ctorAndNewInstance ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ReflectTests.ctorAndNewInstance()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #31 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ReflectTests :: modifiers ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ReflectTests.modifiers()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #32 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$lambdas$0 (Ljava/lang/Integer;Ljava/lang/Integer;)Ljava/lang/Integer;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$lambdas$0(Ljava/lang/Integer;Ljava/lang/Integer;)Ljava/lang/Integer;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #33 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$lambdas$1 (Ljava/lang/String;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$lambdas$1(Ljava/lang/String;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #34 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$lambdas$2 ()Ljava/lang/String;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$lambdas$2()Ljava/lang/String;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #35 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$lambdas$3 ([I)V
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$lambdas$3([I)V
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #36 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$streams$4 (Ljava/lang/Integer;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$streams$4(Ljava/lang/Integer;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #37 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$streams$5 (Ljava/lang/Integer;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$streams$5(Ljava/lang/Integer;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #38 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$streams$6 (Ljava/lang/Integer;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$streams$6(Ljava/lang/Integer;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #39 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$streams$7 (Ljava/lang/Integer;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$streams$7(Ljava/lang/Integer;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #40 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$optional$8 ()Ljava/lang/Object;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$optional$8()Ljava/lang/Object;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #41 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$optional$9 (Ljava/lang/String;)Z
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$optional$9(Ljava/lang/String;)Z
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #42 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/LambdaStreamTests :: lambda$optional$10 (Ljava/lang/String;)Ljava/util/Optional;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/LambdaStreamTests.lambda$optional$10(Ljava/lang/String;)Ljava/util/Optional;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #43 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/LambdaStreamTests$1 :: <clinit> ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/LambdaStreamTests$1.<clinit>()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #44 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$threads$0 ([I)V
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$threads$0([I)V
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #45 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: threads ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.threads()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #46 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$executor$1 (Ljava/util/concurrent/atomic/AtomicInteger;)V
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$executor$1(Ljava/util/concurrent/atomic/AtomicInteger;)V
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #47 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: executor ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.executor()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #48 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$latch$2 (Ljava/util/concurrent/CountDownLatch;)V
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$latch$2(Ljava/util/concurrent/CountDownLatch;)V
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #49 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: latch ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.latch()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #50 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$syncState$3 (Ljava/util/List;I)V
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$syncState$3(Ljava/util/List;I)V
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #51 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: syncState ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.syncState()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #52 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$futures$4 ()Ljava/lang/Integer;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$futures$4()Ljava/lang/Integer;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #53 [MEDIUM] LAMBDA_CAPTURE com/kbox/fulltest/tests/ConcurrentTests :: lambda$futures$5 ()Ljava/lang/Integer;
+      source  : ProGuard
+      pillar  : SPEC
+      weakness: invokedynamic bootstrap 中 MethodHandle 目标被重命名，LambdaMetafactory 解析失败
+      symptom : LambdaConversionException / NoSuchMethodError at lambda site
+      trigger : invokedynamic captures com/kbox/fulltest/tests/ConcurrentTests.lambda$futures$5()Ljava/lang/Integer;
+      hardening: bootstrap 参数内 Handle 目标加入强制关联 keep 集
+      action  : KEEP_MEMBER (applied)
+  #54 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: futures ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.futures()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #55 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: lambda$latch$2 (Ljava/util/concurrent/CountDownLatch;)V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.lambda$latch$2(Ljava/util/concurrent/CountDownLatch;)V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #56 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ConcurrentTests :: lambda$threads$0 ([I)V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ConcurrentTests.lambda$threads$0([I)V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #57 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: basicCatch ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.basicCatch()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #58 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: finallyExec ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.finallyExec()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #59 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: multiCatch ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.multiCatch()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #60 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: customException ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.customException()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #61 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: causeChain ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.causeChain()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #62 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: tryWithResources ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.tryWithResources()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+  #63 [MEDIUM] EXCEPTION_TABLE com/kbox/fulltest/tests/ExceptionTests :: unchecked ()V
+      source  : JNIC
+      pillar  : SPEC
+      weakness: 异常表 start/end/handler 语义在转换后错位，异常被吞或错误捕获（JNIC 原生转换尤其高危）
+      symptom : 异常被错误捕获 / finally 未执行 / 原生崩溃
+      trigger : com/kbox/fulltest/tests/ExceptionTests.unchecked()V has try/catch/finally handler table
+      hardening: 异常表目标随控制流变换一致重算，native 转换遵循 JNI Throw 语义
+      action  : NONE (recorded)
+----------------------------------------------------------------
+自动分配的防护动作汇总:
+  [NONE                  ] x 70
+  [KEEP_CLASS            ] x 3
+  [KEEP_MEMBER           ] x 22
+  [KEEP_NOARG_CTOR       ] x 2
+  [KEEP_SERIALIZATION    ] x 1
+  [KEEP_SIGNATURE        ] x 2
+  [KEEP_RESOURCE         ] x 3
+  applied total = 32 项已写入配置/keep 集
+================================================================

@@ -65,17 +65,19 @@ public final class CallGraphHider {
         if (!cfg.isHideCallGraph()) return;
         decoyClass = randomDecoyName();
         decoyPrefix = decoyClass;
-        int injected = 0;
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (!cfg.shouldProtectClass(cn.name)) continue;
-            if (cn.name.startsWith("com/kbox/runtime/")) continue;
+        // Decoy hub must exist BEFORE parallel bait injection (workers only read
+        // decoyPrefix; the class is added to the graph first, single-threaded).
+        injectDecoyClass();
+        java.util.concurrent.atomic.AtomicInteger injected = new java.util.concurrent.atomic.AtomicInteger();
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.name.startsWith("com/kbox/runtime/")) return;
+            if (cn.name.equals(decoyClass)) return;
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if (mn.instructions == null || mn.instructions.size() == 0) continue;
-                injected += injectBait(mn);
+                injected.addAndGet(injectBait(mn));
             }
-        }
-        injectDecoyClass();
-        KBoxLog.info(TAG, "Call graph hidden: " + injected + " decoy calls injected into "
+        }, cfg.getParallelThreads());
+        KBoxLog.info(TAG, "Call graph hidden: " + injected.get() + " decoy calls injected into "
                 + graph.getClasses().size() + " classes (decoy=" + decoyClass + ")");
     }
 

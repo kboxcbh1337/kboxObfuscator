@@ -1,0 +1,221 @@
+# DevLog — 2026-09-06
+
+> KBox Obfuscator（kboxObfuscator v2.0 之后）
+> 本日工作：native 反注入/反篡改增强（Frida/.NET CLR/注册表 watchdog）、HTML UI 浏览修复、HTML UI 自适应配置、混淆速度深度优化。
+
+---
+
+## 一、Native 反注入 / 反篡改增强（Brainfuck 分支）
+
+落地载体：`kbox-core/src/main/resources/kbox_bf_loader.c`（BF 原生解码器，编译为 kbox_bf_loader.dll → native.bin）+ `BfNativeBuilder.java`（构建期注入加密模块表）+ `BfSecureLoader.java` / `TamperShield.java`（运行时 seam）。
+
+| 需求 | 落地 |
+|---|---|
+| Frida 注入 | BfNativeBuilder.java 模块表新增 frida-agent/frida-gadget/frida-core/frida-helper（构建期 XOR 加密注入）+ kbox_bf_loader.c 明文 fallback 同步 |
+| .NET CLR（mscoree.dll）注入 | 同模块表加 mscoree/mscoreei/coreclr/clrjit/clr/mscordacwks（纯 JVM 进程出现即判注入） |
+| 注册表篡改 watchdog | 新 `kbox_probeRegTamper()`：AppInit_DLLs+LoadAppInit_DLLs、AppCertDlls、IFEO Debugger（当前 exe/java/javaw）——即 Frida/.NET/COM 宿主做进程级注入必须武装的注册表载体 |
+| 周期心跳复查 | 已并入 native W1/W1p watchdog tick（命中 → kbox_epochBump 强杀，码 0x61/0x62）；每 define 的 gateCheck 亦复查 |
+| nativeTerminate 强杀 | 新注册 JNI `BfSecureLoader.terminate(int)` → 清明文窗口 + TerminateProcess（epochBump） |
+| 补充检测 | `BfSecureLoader.probeEnv()`（位掩码：1=注入模块 2=注册表篡改 4=Frida 内存特征 8=调试器强信号）；Frida 私有内存特征扫描（gum-js-loop / LIBFRIDA / frida:rpc） |
+| TamperShield | 反射并入 `probeEnv`，BF 产物字符串解码在注入环境同样静默乱码 |
+| Ghidra | 如实标注 non-issue（静态分析器不注入进程，无运行时检测目标） |
+
+实现要点：
+- `kbox_probeRegTamper`/`kbox_probeFridaMem` 仅 Windows 实现，其余平台 stub 返回 0；advapi32 全部运行时 `GetProcAddress` 动态解析（不污染 IAT）。
+- 编译产物字符串经 NativeShellGuard M1 擦除（`.c` 源内明文仅限 fallback/注释，与既有 instrument.dll 等表同级）。
+- 踩坑：① M1 无法处理相邻字符串字面量拼接与 static 数组初始化器 → 全部改为单行字面量/实参传针；② `dbghelp.dll` 会被 JVM 自身加载（hs_err/minidump）导致误杀 → 从模块表剔除。
+
+验证：`gcc -c` 0 错误 0 警告；BF allMax helloworld 干净环境运行 exit 0（无误杀）；BF 产物内 `probeEnv()=0 / TamperShield.isTampered()=false`（native 注册链路通）；mvn 单测 19/19。
+
+---
+
+## 二、HTML UI 浏览无法打开的修复
+
+文件：`kbox-gui/src/main/java/com/kbox/gui/ProtectorGui.java`
+
+1. **根因（真实 bug）**：HTTP 线程池用 `Executors.newCachedThreadPool`（corePoolSize=0）。UI 空闲 >60s 无任何请求时全部 worker 被回收 → 无非 daemon 线程 → JVM 退出 → 浏览器/页面再也打不开。
+   修复：改为 `newFixedThreadPool(4)`，常驻非 daemon worker 保活。
+
+2. **浏览器无法自动打开**：`Desktop.browse` 在受限/无桌面会话下静默失败（原实现只打印一行手动 URL）。
+   修复：`openBrowser` 多级兜底链 —— `Desktop.browse` → Windows `rundll32 url.dll,FileProtocolHandler` / `cmd /c start` → macOS `open` → Linux `xdg-open` → 全失败才打印手动 URL。
+
+验证：`GET /` → 200；服务空闲保持可访问。
+
+---
+
+## 三、HTML UI 自适应配置（智能适配）
+
+文件：`ProtectorGui.java`（后端）+ `web/index.html`（前端）。
+
+- 新增 `POST /api/analyze`：传入输入 jar，扫描 manifest（Main-Class / TweakClass）、`BOOT-INF/`（Spring Boot）、`fabric.mod.json`、`META-INF/mods.toml`、`plugin.yml`、`mixins.json`、`kotlin*/kotlinx*`、`META-INF/services/*`，统计类/资源数，返回 `{ok,label,classes,resources,checks[],sets{},note}`。
+- 前端「⚡ 智能适配」按钮：把输入路径发给后端 → 自动回填推荐开关/滑杆（checkbox/select 通用映射，关掉冲突的 allMax 档），并展示识别结果与建议说明。
+- 推荐策略分四档：可执行 Java 应用（BF+VMP/JNIC+常量白盒）、Spring Boot（关 BF/VMP，开类加密）、Minecraft mod / Mixin（开 autoAdaptMc，关类加密/资源/BF）、Java 库（关 BF，开类加密+资源）。
+
+验证（curl smoke）：helloworld.jar → `可执行 Java 应用`；kbox-core-1.0.0.jar → `Java 库（无 Main-Class）`，sets 回填正确。
+
+---
+
+## 四、混淆速度深度优化（CF 并行化）
+
+文件：`ControlFlowObfuscator.java`、`ClassGraph.java`。
+
+- 背景：字符串/常量/类型混淆等 per-class pass 早已经 `ParallelClassProcessor` 并行（threads=0 即 auto=CPU 核）；**控制流（CF）是最后一个仍单核跑的重型 pass**（对 CF3 大 jar 常占几分钟到几十分钟）。
+- CF 并行化：`obfuscate()` 在类数 >8 时改走 `ParallelClassProcessor.processAll`（每类独立改写，graph/config 只读）；`parallelThreads=0`（默认）自动按 CPU 核数，`1` 强制原确定性串行路径，`N` 固定线程池。per-class 回滚与 neverFail 语义保留，protect 类一律 `markCfModified` 保证 frames 重算。
+- `ClassGraph.cfModifiedClasses` 由 `HashSet` 改为 `ConcurrentHashMap.newKeySet()`（并行 mark 线程安全）。
+
+实测（kbox-core-1.0.0.jar，203 类，CF strength=3，24 核）：
+- 串行（parallelThreads=1）：**421.7s**
+- 并行（默认 auto）：**59.5s** → 约 **7.1× 加速**；产物均正常生成。
+
+---
+
+## 验证汇总
+
+- `gcc -c` BF loader 0 错误 0 警告
+- mvn 单测 19/19 全绿
+- BF allMax helloworld 端到端：保护成功 + 运行 exit 0、输出与基线一致
+- GUI smoke：根路由 200、analyze 两种项目类型识别正确、空闲保活
+- CF 并行 / 串行产物均正常
+
+---
+
+# 同日补记（第二轮）：相对短板修复
+
+## 五、混淆阶段全并行化（补全剩余 per-class pass）
+
+背景：字符串/常量/类型混淆 + CF 已并行；本批把其余**逐类独立**的 pass 全部接入 `ParallelClassProcessor`（`parallelThreads`：0=auto 核、1=强制串行、N=固定池），并逐个做线程安全处理：
+
+| Pass | 文件 | 处理 |
+|---|---|---|
+| 注解擦除 | AnnotationEraser | 直接 processAll |
+| 调试信息伪造 | DebugInfoForger | processAll + 原子计数 |
+| 异常跳转 | ExceptionJumpObfuscator | carrier 已前置注入 → processAll |
+| 空值守卫 | ResourceNullGuardTransformer | processAll + 原子计数 |
+| 方法内联/抽取 | MethodObfuscator | 两遍分别 processAll |
+| 调用图隐藏 | CallGraphHider | decoy 合成类改为**并行前**注入，再 processAll bait |
+| 反射门 | ReflectionGateInjector | holder 前置已建 → processAll |
+| Kotlin @Metadata | KotlinMetadataFixer | processAll + fixedClasses 改 AtomicInteger |
+
+保守保留串行并注明原因：`StringScatterer`（跨类共享字段分配）、`NameObfuscator.compute`（全局 union-find）、`AutoKeepDeriver`、`JnicOrchestrator`、`BfvmMethodInjector`（编译链共享静态态）、`AntiDecompiler/Watermarker/Honeypot`（非逐类，合成类注入）。
+
+实测：204 类 CF3 段耗时从早期单核路径的 ~400s+ 量级压缩到并行 48.9s（24 核）。
+
+## 六、HTML UI 打开即自动适配（零手动）
+
+- 后端 `launch(--gui -i/-o)` 把输入/输出注入页面 `window._pf`（routeRoot 拼入 script）。
+- 前端：页面加载自动（有输入即防抖 500ms analyze 并回填）；输入 jar 失焦/更换自动重分析；带过期响应丢弃（_adaptSeq）与手动「⚡ 智能适配」按钮并存。全程无需点击即可得到按项目类型（应用/库/Spring Boot/Minecraft mod）推荐的配置。
+
+## 七、控制流平坦化深度（向完整平坦图靠近）
+
+Flattener 三处增强（在 CF 已并行、成本被多核摊薄的前提下）：
+- 整方法 flatten 预算 700ms → **1000ms**
+- 资格 Analyzer 预算 500ms → **800ms**
+- 方法体大小上限 1000 → **1600 指令**
+作用：之前大量真实业务方法在 700ms 内放弃、退化为"只见不透明谓词"；现在更多方法产出完整 switch 状态机分发图。实测总时长 59.5s→70.1s（+18%）换取显著更深的平坦覆盖；对比一次性拉满（1600/1100ms → 113s）性价比不如中档，取中档定案。
+
+## 八、JVMTI define 抓取短板的务实处理
+
+见 `docs/SECURITY-HARDENING.md` §9。结构性结论：define 明文在 JVM 可见空间必然出现，Java 侧无法阻止 define 瞬间读取；在位的缓解（define 前全探针 / W1/W1p 周期复查 / probeEnv 并入 TamperShield / Integrity+VM self-hash 反重打包）继续加固；真正根治方向=JNIC(full)/VMP(full) 让 define 明文无完整逻辑，已在 allMax 默认推荐中体现。纯字节码模式可被 CFR 还原属预期边界。
+
+## 验证（第二轮）
+
+- mvn 单测 19/19 全绿
+- BF allMax helloworld e2e：保护成功 + 运行 exit 0 输出一致
+- CF 203 类（CF3）：并行 48.9s / 总 70.1s（平坦覆盖加深）
+- GUI：prefill 注入 + 自动 analyze 路径 curl 验证
+
+---
+
+# 同日补记（第三轮）：HTML 原生文件选择 / loader 完整性 / CPU·内存 / 极致提速
+
+## 九、HTML UI 文件选择改为纯 HTML（不再调 Java 对话框）
+
+- 后端：删除 routeBrowse（JFileChooser + Swing 依赖全移除），新增 POST /api/upload —— 零依赖手写 multipart 解析，保存到 kbox-work/uploads/<ts>-<name>，返回真实绝对路径（防目录穿越）。
+- 前端：三个"浏览…"按钮改为触发隐藏 input[type=file]（浏览器原生选择框）→ 选中即 FormData 上传 → 丝滑动画（按钮 loading 流光、成功 okPulse 闪光、拖拽 drop-hover 高亮）→ 回填并触发自动适配；输出路径自动推导（输入名-protected.jar）。
+- 验证：curl multipart 上传 helloworld.jar 成功（size 799）。
+
+## 十、BfSecureLoader 完整性（堵"ASM 修补 loader 绕过 agent 检测"）
+
+- 构建侧（BfNativeBuilder）：对 BfSecureLoader.class 走与 Packager 相同的 reSerializeRuntimeClass（提为 public 保同源），手写 class 解析提取 agent 门方法 failIfAgentPresent()V 的 code[]，FNV-1a64 → KBOX_LOADER_HASH 宏。
+- native：JNI_OnLoad 里 JVMTI GetBytecodes(gate) 重算对比，任何字节漂移 → epochBump(0x6C) 启动即自毁。
+- 踩坑：GetBytecodes 参数是 jmethodID（非 jclass）；NativeShellGuard M3 把 Win32 API 宏化（GetCurrentThread→kimp_*）污染 JVMTI 成员名——本实现 4 参版无需 GetCurrentThread 规避。
+- 验证：干净 BF 产物运行 exit 0（无误杀）。
+- 诚实边界：Zig 原生 agent 不碰 loader、define 瞬间抓字节结构性无法在 Java 侧杜绝（见 SECURITY-HARDENING §9）；根治=JNIC(full)/VMP(full)。
+
+## 十一、运行时 CPU / 内存高占用修复
+
+| 根因 | 修复 |
+|---|---|
+| 每字符串解密→TamperShield→probeEnv→全地址空间 Frida 扫描（12000 区段×RPM） | Java 1s 时间闸缓存 + C 侧 800ms 节流锁存 + 预算 6000 区段/4KB 采样 |
+| 双 watchdog 每 tick（40–140ms）全镜像 hash×2 | 轮询 40–140ms → 300–800ms |
+| probeRegTamper 每 tick LoadLibraryA | HMODULE 静态缓存 |
+
+内存说明：6TiB dump-trap 为虚拟地址预留（不占物理）；物理大头=native blob 常驻 + JVM heap（-Xmx 控制）。
+
+## 十二、极致提速：in.jar 全开 ≤30s
+
+- 实测 _fulltest/in.jar（19 类）allMax 全开总耗时 9.3s（CF 并行 1.0s + 各 pass 并行 + 4 次 gcc native 编译 + 打包），目标 ≤30s 达成；产物 11/11 全 PASS、exit 0。
+
+## 验证（第三轮）
+
+- mvn 单测 19/19；BF allMax helloworld e2e exit 0；GUI multipart 上传 curl 通过；in.jar 全开 9.3s 产物全 PASS
+
+---
+
+# 同日补记（第四轮）：封堵 -agentpath / ASM 修补两洞
+
+## 十三、任意 JVMTI 检测（capability 探测）
+
+用户评估表两洞：原生 JVMTI agent（-agentpath）可破、ASM 修补绕过检测。
+
+- **loader 完整性（堵 ASM 修补）**：上轮已落地（failIfAgentPresent code[] FNV → JVMTI GetBytecodes 对比，0x6C 自毁），本轮补全挂载点说明。
+- **capability 探测（堵 ClassFileLoadHook/retransform 型 agent）**：新增 `kbox_probeJvmtiHook()` —— 任何 agent 要抓 define 字节（ClassFileLoadHook）或改活类（retransform）必须 AddCapabilities(all_class_hook/retransform*)，干净 JVM 全 false。挂载：JNI_OnLoad（启动即查 0x6D 自毁）、gateCheck（每 define 前 selfDie）、W1/W1p（周期复查，堵 boot 后 attach）、probeEnv bit16（TamperShield 1s 复查）。
+- **仍为结构性盲区（文档化）**：GetBytecodes 型 agent（只读已加载类字节、零 capability 零 hook）无可观察 JVMTI 痕迹，capability 抓不到；但其只能在 define 后读，BF 按需 define + 明文只驻 native 窗口 + define 前全探针兜底。根治=JNIC(full)/VMP(full)。
+
+验证：干净 BF 产物运行 exit 0（capability 探针无误杀）；SECURITY-HARDENING §9.1 已更新。
+
+---
+
+# 同日补记（第五轮）：loader 全方法完整性 + 任意 agentpath 导出签名扫描
+
+用户对最新 sealed（in-protected.jar，19:21）做 5 手段实破复测并回传报告：CFR/javaagent/attach 均已拦，剩 -agentpath 部分抓类与 ASM 修补两处。经实测确认：当前 sealed 产物对 BfSecureLoader 任意方法 ASM 修改已是 exit 108（0x6C），但源码里 BfNativeBuilder 只烘焙了 4 个"关键方法"——覆盖不完整、且无方法增删防护。本轮改为全方法表 + 方法总数 + 任意 agentpath 导出签名扫描：
+
+## 十四、loader 完整性升级：全方法 code[] 表 + 声明方法总数
+
+- BfNativeBuilder：`loaderMethodHashes()` 手写 class 解析改为收集**每个带 Code attribute 的方法**（含 <init>/<clinit>/findClass/readBlob/…），跳过 Code 剩余 attribute 字节（alen-8-clen）防流错位；`emitLoaderMethodTable` 再单独烘焙 `KBOX_LDCOUNT`（声明方法总数）。加密注入（KBOX_LDN/LDD/LDH 同前）。
+- native `kbox_verifyLoader`：GetBytecodes 逐方法比对（任一方法漂移 → 0x6C）之外，先用 `GetClassMethods` 比对**声明方法总数**（增/删方法 → 0x6C）。
+- 实测（当前源码重建 repro-protected.jar，allMax）：clean exit 0 全 PASS；ASM 对 main / findClass / readBlob / getResourceAsStream / <clinit> 各自插 NOP 后全部 exit 108。
+
+## 十五、任意 -agentpath / attach agent 导出签名扫描（重命名 agent DLL 免疫）
+
+- 现状缺口：模块表按**名字**匹配（instrument/jdwp/frida/…），重命名 agent DLL 可绕。capability 探针只能抓需要 hook/retransform 的 agent。
+- 新增 `kbox_probeAgentExports()`：Windows Toolhelp32 快照遍历进程全部模块，对每个非自模块 GetProcAddress 探测 `Agent_OnLoad / Agent_OnAttach / Agent_OnUnload`（真实 JVMTI agent 必导出其一；干净 JVM 全无）。导出名经 KBOX_AGENT_EXPS 加密注入。
+- 挂载：safeBoot（启动即查）、gateCheck（每 define 前 0x6C）、W1/W1p（周期复查 0x6E=110）、probeEnv bit5。
+- 实测：BF 产物内 System.load 一个导出 Agent_OnLoad 的 stub DLL → 进程 exit 110（0x6E）硬杀；同 jar 不注入 / 旧版 jar 均不产生 110。POSIX 无便携进程内模块枚举 → 返回 0。
+
+## 验证汇总（第五轮）
+
+- kbox-core/kbox-cli 重建（offline mvn 3.9.6）：编译 0 错，mvn test 19/19 全绿
+- repro-protected.jar（allMax，in.jar→re-seal）：clean exit 0 输出与基线一致；5 个 loader 方法逐一 ASM 插 NOP → 全 exit 108
+- stubagent.dll（导出 Agent_OnLoad/OnAttach）动态注入 → exit 110（0x6E）
+- kboxObfPro/dist 4 jar + 源码/文档已同步
+
+---
+
+# 同日补记（第六轮）：L7 字符串密钥表用后即擦 + MC 真适配默认开
+
+- AesStringEncryptor holder <clinit>：派生 _key 后把 T(256B 盲化表)/S(salt)/D(域 tag) 置 null/0 —— 解密器只引用 _key(32B)+_cache(弱引用)，表与盐不再长期驻堆；_key 为运行时必需最小密钥面（堆扫描无法再取表/盐交叉验证）。验证：all-everything 重密封 19 类 EXIT=0，11 项输出与基线逐行一致。
+- MC 真适配默认开启：ProtectionConfig.autoAdaptMinecraft=true（detector 对普通 jar no-op）；ProtectionPipeline BF 块对 fabric.mod.json/mods.toml/neoforge.mods.toml 显式降级并说明原因；MinecraftModDetector.apply 补 keep：*.accesswidener / *.accesstransformer.cfg / META-INF/jars/（嵌套 mod jar 永不改名加密）。
+- mvn test 19/19 全绿；dist 4 jar + 源码已同步。
+
+---
+
+# 同日补记（第七轮）：L8 字符串解密下沉 native 瞬时消费（AES-256-CTR 全 C 实现）
+
+- NativeCrypto 新增 decryptString(byte[] enc, byte[] key)：enc=IV(16)||ct，AES-256-CTR 在 C 内解密；明文 pt 在 kbox_cryptoAlloc 页对齐缓冲中生成、UTF-8→UTF-16 解码成 jstring 后立即 wipe+free——Java 堆只拿到最终 String，中间明文/key schedule 只在 native 瞬态。
+- kbox_vmp_crypto.c 新增完整 AES-256(FIPS-197)：sbox、key expansion、字节版 encrypt、CTR(big-endian counter) + UTF-8→UTF-16 解码（Java String(byte[],UTF_8) 兼容，malformed→U+FFFD）。踩坑：初版 word-based encrypt 的 ShiftRows/RotWord 字节序 bug 导致输出与 JCE 不一致（debug 后改用教科书 4x4 数组版）；NIST FIPS-197 C.3 向量验证 got=want（8ea2b7ca...）；JCE 对拍 14/14 PASS（ASCII/中文/emoji/单字节/31-33/47-49 多块边界/IV=ff counter-carry）。
+- AesStringEncryptor 新增 nativeCrypto 构造参数：decryptor 在 try 块内先调 NativeCrypto.decryptString(enc, _key.getEncoded())，非 null 则缓存+返回（明文不进 Java 堆），null/异常回退原 JCE 路径（字节一致）。blob 不存在时 holder 纯 Java 不引用 NativeCrypto（no-toolchain 构建安全）。
+- ProtectionPipeline Stage 8：把 nativeCryptoBlob!=null 传给 AesStringEncryptor（Stage 10b 在 Stage 8 前编译 blob，顺序天然满足）。
+- BF 模式修复（关键）：Packager.writeBrainfuck 原来只写 native.bin/jnic.bin/vmp.bin，漏掉 native-crypto.bin 与 NativeCrypto.class → BF 产物里 decryptor 引用 NativeCrypto 抛 NoClassDefFoundError → catch-all 全走 noise（运行乱码）。修复=writeBrainfuck 增参数 nativeCryptoBlob，写入 META-INF/kbox/native-crypto.bin + injectBoot NativeCrypto（与 KbnlKey 同款父级优先模式）。
+- 验证：all-everything BF 全开重密封 ns-str5.jar EXIT=0、11 项与基线逐行一致（native sink 激活，日志 "native-crypto.bin (11491 bytes)" + "BF injected 9 bootstrap classes"）；mvn test 回归绿；dist 4 jar + 源码（AesStringEncryptor/ProtectionConfig/ProtectionPipeline/MinecraftModDetector/NativeCrypto/Packager/kbox_vmp_crypto.c）已同步。
+- 诚实边界：native 下沉消除的是"解密中间字节"在 Java 堆的驻留；被业务持有的最终 String 仍是 JVM 语义的明文驻堆（结构性无解）。

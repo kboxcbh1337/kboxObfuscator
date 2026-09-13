@@ -171,7 +171,11 @@ public final class HardwareKeyRing {
                     .getResourceAsStream("META-INF/kbox/seed.bin");
             if (in == null) return null;
             try {
-                byte[] b = in.readAllBytes();
+                java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[256];
+                int n;
+                while ((n = in.read(buf)) != -1) bo.write(buf, 0, n);
+                byte[] b = bo.toByteArray();
                 if (b != null && b.length == 32) return b;
                 return null;
             } finally {

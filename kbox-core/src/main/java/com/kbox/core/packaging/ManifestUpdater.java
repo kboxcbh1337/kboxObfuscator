@@ -22,8 +22,23 @@ public final class ManifestUpdater {
     private static final String TAG = "manifest";
     private final Map<String, String> classMap;
 
+    /** True when the input is a Spring Boot executable (fat) jar. */
+    private boolean springBootFatJar;
+
     public ManifestUpdater(Map<String, String> classMap) {
         this.classMap = classMap;
+    }
+
+    /**
+     * Marks the input as a Spring Boot executable jar. Such jars declare
+     * {@code Main-Class: org.springframework.boot.loader.launch.JarLauncher}
+     * (a class at the jar ROOT) plus {@code Start-Class: <app main>} (a class
+     * under {@code BOOT-INF/classes/}). The JVM's system classloader only sees
+     * the jar root, so the entry-point substitution must target
+     * {@code Start-Class} — see {@link #update(byte[], String, String, String)}.
+     */
+    public void setSpringBootFatJar(boolean v) {
+        this.springBootFatJar = v;
     }
 
     public byte[] update(byte[] manifest, String oldMainClass) {
@@ -56,31 +71,32 @@ public final class ManifestUpdater {
         String s = new String(manifest, StandardCharsets.UTF_8);
         String newMain = oldMainClass == null ? null : mapClass(oldMainClass);
 
-        // ---- Main-Class substitution (standalone jars) ----
+        // ---- Entry-point substitution ----
+        // Standalone jar  : replace Main-Class with the guard launcher.
+        // Spring Boot jar : KEEP Main-Class (it names the boot loader, which lives
+        //   at the jar ROOT and is the only thing the JVM can load directly) and
+        //   replace Start-Class instead. The boot loader resolves Start-Class
+        //   through its LaunchedClassLoader, whose root is BOOT-INF/classes/ —
+        //   exactly where the guard launcher is injected. Replacing Main-Class on
+        //   such a jar dies at startup with
+        //   ClassNotFoundException: com.kbox.runtime.ResourceGuardLauncher.
+        final String entryAttr = springBootFatJar ? "Start-Class" : "Main-Class";
         if (launcherClass != null && newMain != null) {
-            int i = s.indexOf("Main-Class:");
-            if (i >= 0) {
-                int end = s.indexOf('\n', i);
-                if (end < 0) end = s.length();
-                int afterEnd = end;
-                while (afterEnd < s.length() && (s.charAt(afterEnd) == '\r' || s.charAt(afterEnd) == '\n'))
-                    afterEnd++;
-                String replacement = "Main-Class: " + launcherClass + "\r\n"
-                        + "Original-Main-Class: " + newMain + "\r\n";
-                s = s.substring(0, i) + replacement + s.substring(afterEnd);
-                KBoxLog.info(TAG, "Substituted Main-Class -> " + launcherClass
-                        + " (Original-Main-Class=" + newMain + ")");
+            String replaced = replaceAttribute(s, entryAttr, launcherClass);
+            if (replaced != null) {
+                s = putAttributeAfter(replaced, entryAttr, "Original-Main-Class", newMain);
+                KBoxLog.info(TAG, "Substituted " + entryAttr + " -> " + launcherClass
+                        + " (Original-Main-Class=" + newMain + ")"
+                        + (springBootFatJar ? " [Spring Boot: Main-Class kept as the boot loader]" : ""));
+            } else {
+                KBoxLog.warn(TAG, "Manifest has no " + entryAttr + " attribute; "
+                        + "guard launcher not installed (principal class left untouched)");
             }
         } else if (newMain != null && !newMain.equals(oldMainClass)) {
-            int i = s.indexOf("Main-Class:");
-            if (i >= 0) {
-                int end = s.indexOf('\n', i);
-                if (end < 0) end = s.length();
-                int afterEnd = end;
-                while (afterEnd < s.length() && (s.charAt(afterEnd) == '\r' || s.charAt(afterEnd) == '\n'))
-                    afterEnd++;
-                s = s.substring(0, i) + "Main-Class: " + newMain + "\r\n" + s.substring(afterEnd);
-                KBoxLog.info(TAG, "Updated Main-Class: " + oldMainClass + " -> " + newMain);
+            String replaced = replaceAttribute(s, entryAttr, newMain);
+            if (replaced != null) {
+                s = replaced;
+                KBoxLog.info(TAG, "Updated " + entryAttr + ": " + oldMainClass + " -> " + newMain);
             }
         }
 
@@ -116,5 +132,43 @@ public final class ManifestUpdater {
     private String mapClass(String dotted) {
         String mapped = classMap.get(dotted);
         return mapped != null ? mapped : dotted;
+    }
+
+    /**
+     * Finds the start index of an attribute line. Matching is anchored at a line
+     * start so {@code Main-Class} can never match inside
+     * {@code Original-Main-Class} (which we may have injected on an earlier run).
+     */
+    private static int findAttributeLine(String s, String attr) {
+        String needle = attr + ":";
+        int from = 0;
+        while (true) {
+            int i = s.indexOf(needle, from);
+            if (i < 0) return -1;
+            if (i == 0 || s.charAt(i - 1) == '\n') return i;
+            from = i + 1;
+        }
+    }
+
+    /** Replaces an attribute's value, preserving the original line ending.
+     *  Returns {@code null} when the attribute is absent. */
+    private static String replaceAttribute(String s, String attr, String value) {
+        int i = findAttributeLine(s, attr);
+        if (i < 0) return null;
+        int end = s.indexOf('\n', i);
+        if (end < 0) end = s.length();
+        String eol = (end > i && s.charAt(end - 1) == '\r') ? "\r\n" : "\n";
+        int next = (end < s.length()) ? end + 1 : end;
+        return s.substring(0, i) + attr + ": " + value + eol + s.substring(next);
+    }
+
+    /** Inserts {@code newAttr: newValue} directly after the {@code afterAttr} line. */
+    private static String putAttributeAfter(String s, String afterAttr,
+                                            String newAttr, String newValue) {
+        int i = findAttributeLine(s, afterAttr);
+        if (i < 0) return s;
+        int end = s.indexOf('\n', i);
+        int insertAt = (end < 0) ? s.length() : end + 1;
+        return s.substring(0, insertAt) + newAttr + ": " + newValue + "\r\n" + s.substring(insertAt);
     }
 }

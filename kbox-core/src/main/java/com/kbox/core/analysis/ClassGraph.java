@@ -38,14 +38,30 @@ public final class ClassGraph {
     /** Original main-class from manifest (Spring Boot executable jars have their own layout). */
     private String manifestMainClass;
 
+    /** Original Start-Class from manifest. Set only for Spring Boot executable
+     *  jars, where Main-Class is the boot loader and Start-Class names the real
+     *  application entry point. */
+    private String manifestStartClass;
+
     /** True if input was a Spring Boot fat jar (BOOT-INF/classes + BOOT-INF/lib). */
     private boolean springBootFatJar;
+
+    /** Internal names read out of nested {@code BOOT-INF/lib/*.jar} archives.
+     *  They are in the graph purely so rename/inheritance/reference analysis sees
+     *  the library side of every edge. Their bytes ship verbatim inside the
+     *  nested jar, so the packager must not re-emit them into
+     *  {@code BOOT-INF/classes/} — that duplicates every library class (a real
+     *  60 MB -> 121 MB bloat) and shadows the nested jars on the classpath. */
+    private final Set<String> nestedJarClasses =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** Classes whose instruction stream was modified by control-flow transforms
      *  (obfuscation, anti-decompiler, exception-jump, etc.). Their StackMapTable
      *  frames are stale and need COMPUTE_FRAMES recomputation during packaging.
-     *  Non-CF classes (only ClassRemapper) keep their existing frames. */
-    private final Set<String> cfModifiedClasses = new java.util.HashSet<>();
+     *  Non-CF classes (only ClassRemapper) keep their existing frames.
+     *  Concurrent set: markCfModified is called from the parallel CF workers. */
+    private final Set<String> cfModifiedClasses =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public Map<String, ClassNode> getClasses() { return classes; }
     public Map<String, Set<String>> getReferences() { return references; }
@@ -57,8 +73,13 @@ public final class ClassGraph {
     public void setManifest(byte[] manifest) { this.manifest = manifest; }
     public String getManifestMainClass() { return manifestMainClass; }
     public void setManifestMainClass(String c) { this.manifestMainClass = c; }
+    public String getManifestStartClass() { return manifestStartClass; }
+    public void setManifestStartClass(String c) { this.manifestStartClass = c; }
     public boolean isSpringBootFatJar() { return springBootFatJar; }
     public void setSpringBootFatJar(boolean v) { springBootFatJar = v; }
+
+    /** Internal names that came from a nested {@code BOOT-INF/lib} jar. */
+    public Set<String> getNestedJarClasses() { return nestedJarClasses; }
 
     /** Mark a class as having its instruction stream modified by CF transforms. */
     public void markCfModified(String internalName) { cfModifiedClasses.add(internalName); }

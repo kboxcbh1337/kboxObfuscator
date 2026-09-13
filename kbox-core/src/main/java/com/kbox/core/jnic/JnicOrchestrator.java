@@ -114,7 +114,7 @@ public final class JnicOrchestrator {
                 KBoxLog.debug(TAG, "  skip " + cn.name + " (shouldTransform=false)");
                 continue;
             }
-            if (!cfg.isNativeEligible(cn.name)) {
+            if (!cfg.isJnicEligible(cn.name)) {
                 KBoxLog.debug(TAG, "  skip " + cn.name + " (native-excluded prefix)");
                 continue;
             }
@@ -164,26 +164,34 @@ public final class JnicOrchestrator {
             return new Result(null, null, true, failures);
         }
 
-        // Compile: generate stub source + interpreter source, compile together.
+        // Compile: generate sharded stub sources + interpreter source, compile
+        // all C files in parallel (-c) and link once. Sharding is the JNIC
+        // speedup: one monolithic stub file meant a single gcc -O2 run of tens
+        // of minutes on large jars.
         Path cDir = workDir.resolve("kbox-native-src");
         Files.createDirectories(cDir);
 
         // Write interpreter source.
         Path interpSrc = NativeCompiler.writeInterpreterSource(cDir);
 
-        // Write stub source.
-        String src = NativeCompiler.assembleInterpSource(fns, classMethodCounts);
-        // Native shell hardening: encrypt function-body literals (class names,
-        // method signatures) in the generated JNI stubs and mutate any matched
-        // guard functions. Fail-safe — unknown contexts are left verbatim.
-        src = com.kbox.core.nativeshell.NativeShellGuard.guardSource(src);
-        Path stubSrc = NativeCompiler.writeSource(cDir, LIB_NAME, src);
-
+        // Write sharded stub sources. The main file (index 0) carries
+        // JNI_OnLoad + registerNatives0; each shard carries a part of the
+        // stubs + its JNI exports. shardCount = cores (or configured threads).
+        int shardCount = cfg.getParallelThreads();
+        if (shardCount <= 0) shardCount = Runtime.getRuntime().availableProcessors();
+        java.util.List<String> shardSources =
+                NativeCompiler.assembleInterpSourceSharded(fns, classMethodCounts, shardCount);
         List<Path> srcFiles = new ArrayList<>();
-        srcFiles.add(stubSrc);
+        for (int i = 0; i < shardSources.size(); i++) {
+            // Native shell hardening: encrypt function-body literals (class names,
+            // method signatures) in the generated JNI stubs and mutate any matched
+            // guard functions. Fail-safe — unknown contexts are left verbatim.
+            String hardened = com.kbox.core.nativeshell.NativeShellGuard.guardSource(shardSources.get(i));
+            srcFiles.add(NativeCompiler.writeSource(cDir, LIB_NAME + "_p" + i, hardened));
+        }
         if (interpSrc != null) srcFiles.add(interpSrc);
 
-        NativeCompiler.Result cres = compiler.compileMulti(srcFiles, cDir, LIB_NAME);
+        NativeCompiler.Result cres = compiler.compileSharded(srcFiles, cDir, LIB_NAME);
         if (!cres.success) {
             KBoxLog.error(TAG, "Native compilation failed: " + cres.log);
             try {
@@ -264,6 +272,17 @@ public final class JnicOrchestrator {
         UNSUPPORTED_JNIC_OPCODES.add(Opcodes.RET);    // 0xA9
         UNSUPPORTED_JNIC_OPCODES.add(0xC8);           // GOTO_W (not in ASM Opcodes)
         UNSUPPORTED_JNIC_OPCODES.add(0xC9);           // JSR_W  (not in ASM Opcodes)
+        // INVOKEDYNAMIC: the interpreter has to leave native code, rebuild the
+        // bootstrap arguments (boxing every primitive by hand), call back into
+        // com.kbox.runtime.JnicIndy, then unbox the result. That round trip is by
+        // far the most fragile path in the C interpreter and it is NOT worth
+        // sinking: inside a 1.8.9 Forge client it produced a hard JVM crash —
+        //   EXCEPTION_ACCESS_VIOLATION reading 0x0, native frames
+        //   <injected.dll> -> jvm.dll, Java frame "<renamed>()Ljava/util/concurrent/Future;+0"
+        // with the method reached straight from a Mixin handler on the game loop.
+        // Lambda-heavy (invokedynamic) bodies stay ordinary Java instead; every
+        // other protection still applies to them.
+        UNSUPPORTED_JNIC_OPCODES.add(Opcodes.INVOKEDYNAMIC); // 0xBA
     }
 
     /**

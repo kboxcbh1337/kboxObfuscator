@@ -20,4 +20,19 @@
             <version>1.0.0</version>
         </dependency>
     </dependencies>
+
+    <!-- The GUI is a developer-side tool that runs on JDK 17+, so it is allowed
+         to use Java 9+ APIs (e.g. InputStream.readAllBytes). Keep release 8
+         for kbox-core/kbox-cli so the protected runtime injected into targets
+         stays Java 8 compatible. -->
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>17</release>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

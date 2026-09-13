@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -163,6 +164,27 @@ public final class ProtectionPipeline {
             }
         }
 
+        // Spring Boot executable jars: class-body encryption degrades to "off"
+        // instead of shipping a jar that cannot start.
+        //
+        // The boot loader's component scan resolves "classpath*:com/example/**/*.class"
+        // and reads each candidate as a RESOURCE, parsing it with Spring's own ASM
+        // reader. It never calls loadClass, and PathMatchingResourcePatternResolver
+        // reaches the raw nested-jar entry directly, so the guard loader never gets a
+        // chance to decrypt. Ciphertext (masked-KBCE header) therefore reaches
+        // Spring's ClassReader and the context aborts during scanning, losing every
+        // @Component/@Service/@Repository bean — observed as
+        // "ClassFormatException: ASM ClassReader failed to parse class file".
+        // Everything else (renaming, string encryption, control flow, anti-decompiler,
+        // anti-debug, resource obfuscation and the guard loader itself) stays on.
+        if (graph.isSpringBootFatJar() && cfg.isEncryptClasses()) {
+            cfg.setEncryptClasses(false);
+            KBoxLog.warn(TAG, "  [SPRING-BOOT] encryptClasses forced off: the component scan "
+                    + "parses class files as resources (never via loadClass), so encrypted "
+                    + "bodies make the scan fail and the app loses all its beans. "
+                    + "All other protections stay at full strength.");
+        }
+
         // ---- Route① hardening: per-build random key seed ---------------------
         // Generate a 32-byte CSPRNG seed for THIS build and make it the factor
         // feed for every key derivation (HardwareKeyRing). The packager embeds
@@ -187,7 +209,19 @@ public final class ProtectionPipeline {
         if (cfg.isBrainfuckLoader()) {
             KBoxLog.stage(++stage, TOTAL_STAGES, "Brainfuck chaos (防内存Dump)");
             String reason = null;
-            if (graph.getManifestMainClass() == null) {
+            boolean mcMod = false;
+            if (graph.getResources().containsKey("fabric.mod.json")
+                    || graph.getResources().containsKey("META-INF/mods.toml")
+                    || graph.getResources().containsKey("META-INF/neoforge.mods.toml")) {
+                // MC metadata checked FIRST: a Fabric/Forge mod often ships no
+                // Main-Class at all, and hybrid mode must be reachable for it
+                // (the loader discovers the mod via metadata, not Main-Class).
+                mcMod = true;
+                reason = "MC mod loader metadata present (fabric.mod.json / mods.toml / "
+                        + "neoforge.mods.toml — the loader reads these + the entry classes "
+                        + "straight from the jar; a single opaque Brainfuck payload is "
+                        + "incompatible, keep + string/VMP/JNIC protection still apply)";
+            } else if (graph.getManifestMainClass() == null) {
                 reason = "input jar has no Main-Class (library / mod / plugin — "
                         + "not a standalone executable jar)";
             } else if (graph.isSpringBootFatJar()) {
@@ -196,7 +230,19 @@ public final class ProtectionPipeline {
                     graph.getManifest(), StandardCharsets.UTF_8).contains("TweakClass:")) {
                 reason = "Forge/Fabric mod loader detected (loader scans raw jar bytes)";
             }
-            if (reason != null) {
+            if (mcMod && cfg.isBrainfuckMcHybrid()) {
+                // BF-MC hybrid (opt-in): keep the RLE blob for the bulk of the
+                // classes but preserve the loader-critical surface as plaintext
+                // (metadata + entry classes + mixin package). The packer detects
+                // the loader again and splits the jar accordingly; BfSecureLoader
+                // is attached from each entry class' <clinit>.
+                KBoxLog.info(TAG, "  [BF] MC-mod HYBRID mode: loader metadata / entry "
+                        + "classes / mixin package stay plaintext; remaining classes "
+                        + "hide inside the Brainfuck-RLE blob. (Only classes reachable "
+                        + "from the plaintext entry surface can resolve blob classes.)");
+                // Class-encryption / resource-obfuscation stay force-disabled: the
+                // blob replaces the jar layout either way in BF mode.
+            } else if (reason != null) {
                 KBoxLog.warn(TAG, "  [BF] Brainfuck mode incompatible: " + reason);
                 KBoxLog.warn(TAG, "  [BF] Degrading to non-BF full protection "
                         + "(rename+strings+VMP+JNIC+BFVM+BrainfuckShield+Shield remain active). "
@@ -258,6 +304,77 @@ public final class ProtectionPipeline {
         for (String c : mixinResult.targetClasses) {
             cfg.getKeepPrefixes().add(c.replace('/', '.'));
         }
+        // ...but keepPrefixes only blocks RENAMING. shouldProtectClass() ignores it,
+        // so Mixin classes were still eligible for VMP/JNIC body sinking — and those
+        // two passes change how fields/methods are RESOLVED. A Mixin's @Shadow
+        // members do not exist in the Mixin class at all: Mixin rewrites those
+        // references to the target class at load time. Sinking them into the VMP
+        // interpreter bakes the *Mixin* class name into the metadata, so the very
+        // first execution dies with
+        //   RuntimeException: VMP: field resolve failed <Mixin>#<shadowField>
+        //   Caused by: ClassNotFoundException: <Mixin>
+        // (seen on LiquidBounce's MixinMixinItemStack#itemDelay inside
+        // ItemStack.<init>). Exclude Mixin classes from both native paths.
+        for (String c : mixinResult.mixinClasses) {
+            String dotted = c.replace('/', '.');
+            cfg.getVmpExcludePrefixes().add(dotted);
+            cfg.getJnicExcludePrefixes().add(dotted);
+            // Keep the bodies verbatim too: Mixin merges an @Inject handler into the
+            // target class at load time, renumbering locals and wrapping it in its own
+            // try/catch, so any pass that rewrites frames/locals/exception tables
+            // corrupts the handler (see ProtectionConfig#bodyProtectExcludePrefixes).
+            cfg.getBodyProtectExcludePrefixes().add(dotted);
+        }
+        for (String c : mixinResult.targetClasses) {
+            String dotted = c.replace('/', '.');
+            cfg.getVmpExcludePrefixes().add(dotted);
+            cfg.getJnicExcludePrefixes().add(dotted);
+            cfg.getBodyProtectExcludePrefixes().add(dotted);
+        }
+        // A Mixin @Inject handler is MERGED into the target class at load time but
+        // keeps calling the types its original body references. Those calls must
+        // resolve and behave exactly as in vanilla Java, so every type a mixin body
+        // touches is excluded from VMP/JNIC native down-sinking too. Without this,
+        // a handler that calls e.g. ClientUtils.getLOGGER() hits a NATIVE-translated
+        // accessor and the interpreter misbehaves (returns null), NPEing inside the
+        // merged handler:
+        //   NullPointerException
+        //     at net.minecraft.server.MinecraftServer.handler$onInit$zdd000(...)
+        //     at net.minecraft.server.MinecraftServer.<init>
+        // (seen on LiquidBounce's MixinMinecraftServer#onInit calling
+        // net/ccbluex/liquidbounce/utils/client/ClientUtils.getLOGGER).
+        for (String c : mixinResult.mixinClasses) {
+            ClassNode mcn = graph.getClasses().get(c);
+            if (mcn == null || mcn.methods == null) continue;
+            for (Object mo : mcn.methods) {
+                MethodNode mn = (MethodNode) mo;
+                if (mn.instructions == null) continue;
+                for (org.objectweb.asm.tree.AbstractInsnNode insn = mn.instructions.getFirst();
+                     insn != null; insn = insn.getNext()) {
+                    String owner = null;
+                    if (insn instanceof org.objectweb.asm.tree.MethodInsnNode) {
+                        owner = ((org.objectweb.asm.tree.MethodInsnNode) insn).owner;
+                    } else if (insn instanceof org.objectweb.asm.tree.FieldInsnNode) {
+                        owner = ((org.objectweb.asm.tree.FieldInsnNode) insn).owner;
+                    } else if (insn instanceof org.objectweb.asm.tree.TypeInsnNode) {
+                        int op = insn.getOpcode();
+                        if (op == org.objectweb.asm.Opcodes.NEW
+                                || op == org.objectweb.asm.Opcodes.ANEWARRAY
+                                || op == org.objectweb.asm.Opcodes.CHECKCAST
+                                || op == org.objectweb.asm.Opcodes.INSTANCEOF) {
+                            owner = ((org.objectweb.asm.tree.TypeInsnNode) insn).desc;
+                        }
+                    }
+                    if (owner == null || owner.startsWith("[")) continue;
+                    if (cfg.isBodyProtectExcluded(owner)) continue; // already excluded
+                    if (!cfg.getNativeEligiblePrefixes().isEmpty()
+                            && !cfg.isJnicEligible(owner)) continue; // not in JNIC scope anyway
+                    String od = owner.replace('/', '.');
+                    cfg.getJnicExcludePrefixes().add(od);
+                    cfg.getVmpExcludePrefixes().add(od);
+                }
+            }
+        }
         // Seed keepMembers with the exact method signatures that Mixin
         // injects into. This ensures the NameObfuscator does not rename
         // these methods (which would break @Inject method target resolution).
@@ -288,7 +405,7 @@ public final class ProtectionPipeline {
             KBoxLog.stage(++stage, TOTAL_STAGES, "SilentShield adaptability audit (intelligent)");
             try {
                 Path ssReport = cfg.getSilentShieldReport() != null
-                        ? Path.of(cfg.getSilentShieldReport()) : workDir.resolve("silentshield-report.txt");
+                        ? Paths.get(cfg.getSilentShieldReport()) : workDir.resolve("silentshield-report.txt");
                 ss = new com.kbox.core.silentshield.SilentShield().run(graph, cfg, ssReport);
                 KBoxLog.info(TAG, "  SilentShield: " + ss.findings.size() + " findings, "
                         + ss.appliedActions + " actions applied, weakness catalog="
@@ -317,7 +434,7 @@ public final class ProtectionPipeline {
             if (anyAdapt) {
                 try {
                     Path reportPath = cfg.getAdaptabilityReport() != null
-                            ? Path.of(cfg.getAdaptabilityReport())
+                            ? Paths.get(cfg.getAdaptabilityReport())
                             : workDir.resolve("adaptability-report.txt");
                     int applied = ss != null ? ss.appliedActions : 0;
                     com.kbox.core.silentshield.AdaptabilityReport.render(graph, cfg,
@@ -445,16 +562,56 @@ public final class ProtectionPipeline {
 
         // Apply renames to every class via ClassRemapper.
         KBoxLog.progress(33, "Applying renames via ClassRemapper");
-        Map<String, ClassNode> remappedClasses = new HashMap<>();
-        int renameIdx = 0;
-        int renameTotal = graph.getClasses().size();
-        for (Map.Entry<String, ClassNode> e : graph.getClasses().entrySet()) {
-            ClassNode remapped = nameObfuscator.apply(e.getValue());
-            remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
-            renameIdx++;
-            if (renameTotal > 100 && renameIdx % (renameTotal / 10 + 1) == 0) {
-                KBoxLog.progress(33 + (66 * renameIdx / renameTotal),
-                        "Remapped " + renameIdx + "/" + renameTotal + " classes");
+        Map<String, ClassNode> remappedClasses = new java.util.concurrent.ConcurrentHashMap<>();
+        java.util.List<java.util.Map.Entry<String, ClassNode>> allClasses =
+                new ArrayList<>(graph.getClasses().entrySet());
+        int renameTotal = allClasses.size();
+        int renameThreads = cfg.getParallelThreads();
+        if (renameThreads != 1 && renameTotal > 8) {
+            // Parallel remap: ClassRemapper rewrites each class independently and
+            // the Mapping is read-only once computed, so the apply loop fans out
+            // across cores. (Previously serial — a ~20min stage on 8k-class jars.)
+            int poolSize = renameThreads > 0 ? renameThreads
+                    : Runtime.getRuntime().availableProcessors();
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newFixedThreadPool(poolSize);
+            java.util.concurrent.atomic.AtomicInteger renameDone =
+                    new java.util.concurrent.atomic.AtomicInteger();
+            try {
+                java.util.List<java.util.concurrent.Future<?>> renameFutures = new ArrayList<>();
+                for (final java.util.Map.Entry<String, ClassNode> e : allClasses) {
+                    renameFutures.add(pool.submit(() -> {
+                        try {
+                            ClassNode remapped = nameObfuscator.apply(e.getValue());
+                            remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
+                        } finally {
+                            int d = renameDone.incrementAndGet();
+                            if (renameTotal > 100 && d % (renameTotal / 10 + 1) == 0) {
+                                KBoxLog.progress(33 + (66 * d / renameTotal),
+                                        "Remapped " + d + "/" + renameTotal + " classes");
+                            }
+                        }
+                    }));
+                }
+                for (java.util.concurrent.Future<?> f : renameFutures) f.get();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                KBoxLog.warn(TAG, "Parallel remap interrupted: " + ie.getMessage());
+            } catch (java.util.concurrent.ExecutionException ee) {
+                KBoxLog.warn(TAG, "Parallel remap failed for a class: " + ee.getMessage());
+            } finally {
+                pool.shutdownNow();
+            }
+        } else {
+            int renameIdx = 0;
+            for (Map.Entry<String, ClassNode> e : allClasses) {
+                ClassNode remapped = nameObfuscator.apply(e.getValue());
+                remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
+                renameIdx++;
+                if (renameTotal > 100 && renameIdx % (renameTotal / 10 + 1) == 0) {
+                    KBoxLog.progress(33 + (66 * renameIdx / renameTotal),
+                            "Remapped " + renameIdx + "/" + renameTotal + " classes");
+                }
             }
         }
         graph.getClasses().clear();
@@ -500,8 +657,16 @@ public final class ProtectionPipeline {
         // ---- Stage 8: String encryption ----
         KBoxLog.stage(++stage, TOTAL_STAGES, "String encryption");
         if (cfg.getStringEncryptionStrength() >= 3) {
-            KBoxLog.info(TAG, "  Mode: AES-256-CTR (per-string IV, centralized decryptor, lazy cache)");
-            new com.kbox.core.stringenc.AesStringEncryptor(graph, cfg).apply();
+            KBoxLog.info(TAG, "  Mode: AES-256-CTR (per-string IV, centralized decryptor, lazy cache"
+                    + (nativeCryptoBlob != null ? ", native-decrypt sink" : "") + ")");
+            // Native string-decrypt sink: when the native crypto layer is present the
+            // decryptor first asks NativeCrypto to decrypt in C (plaintext lives only
+            // on the native heap, transiently, and is wiped before the jstring is
+            // returned); on null/unavailable it falls back to the byte-identical
+            // JCE path. When the blob is absent the decryptor stays pure Java and
+            // never references the NativeCrypto class (which the packager injects
+            // only alongside the blob), so a no-toolchain build is still safe.
+            new com.kbox.core.stringenc.AesStringEncryptor(graph, cfg, nativeCryptoBlob != null).apply();
         } else if (cfg.isWhiteboxStrings()) {
             KBoxLog.info(TAG, "  Mode: white-box (lookup-table decryption)");
             new com.kbox.core.stringenc.WhiteboxStringEncryptor(graph, cfg).apply();
@@ -658,7 +823,8 @@ public final class ProtectionPipeline {
                     .build(workDir, cfg.getCc(), bfSym).packedBlob;
             Packager packager = new Packager();
             packager.writeBrainfuck(inputJar, outputJar, graph, mapping,
-                    bfNativeBlob, jnicResult.packedBlob, cfg, bfSym, vmpBlob, epdManifest);
+                    bfNativeBlob, jnicResult.packedBlob, cfg, bfSym, vmpBlob,
+                    nativeCryptoBlob, epdManifest);
         } else {
             Packager packager = new Packager();
             packager.write(inputJar, outputJar, graph, mapping, jnicResult.libraryPath,
@@ -734,12 +900,36 @@ public final class ProtectionPipeline {
                 ? com.kbox.core.brainfuckshield.BfMethodInjector.newBuildSalt() : 0;
         VmpMethodInjector injector = new VmpMethodInjector(bfLevel, bfBuildSalt);
         Map<String, VmpTranslator.Result> perMethod = new HashMap<>();
-        int total = cfg.getVmpMethods().size();
+        // Recompute total after dropping methods whose owner class is excluded
+        // from VMP, so progress reaches 100% instead of stalling.
+        int total = 0;
+        for (String key : cfg.getVmpMethods()) {
+            int hash = key.indexOf('#');
+            String owner = hash > 0 ? key.substring(0, hash) : key;
+            if (cfg.isExcludedFromVmp(owner)) continue;
+            ClassNode ownerNode = graph.getClasses().get(owner);
+            // Interfaces / annotation types cannot host VMP's mutable state fields
+            // (interface fields must be public static final) — see VmpMethodInjector.
+            if (ownerNode != null
+                    && (ownerNode.access & (0x0200 /* INTERFACE */ | 0x2000 /* ANNOTATION */)) != 0) {
+                continue;
+            }
+            total++;
+        }
         int idx = 0;
         KBoxLog.info(TAG, "  VMP methods to find: " + total
                 + " keys: " + new ArrayList<>(cfg.getVmpMethods()));
         for (Map.Entry<String, ClassNode> e : graph.getClasses().entrySet()) {
             ClassNode cn = e.getValue();
+            // Honor the VMP exclusion lists even for explicitly configured
+            // vmpMethod entries: a class listed in vmpExcludePrefix (or the shared
+            // nativeExcludePrefix) is never virtualized.
+            if (cfg.isExcludedFromVmp(cn.name)) continue;
+            // Interfaces and annotation types are skipped: their fields must be
+            // public static final, so injecting the private static `$vmp_*` state
+            // produces ClassFormatError: Illegal field modifiers ... : 0xA at load
+            // (seen on com/formdev/flatlaf/FlatSystemProperties).
+            if ((cn.access & (0x0200 /* INTERFACE */ | 0x2000 /* ANNOTATION */)) != 0) continue;
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 String key = ProtectionConfig.memberKey(cn.name, mn.name, mn.desc);
                 boolean isVmp = cfg.getVmpMethods().contains(key);

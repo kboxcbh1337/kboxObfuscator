@@ -58,22 +58,21 @@ public final class MethodObfuscator {
 
     public void apply() {
         if (!cfg.isMethodInlineExtract()) return;
-        int inlined = 0;
-        int extracted = 0;
-        // Inline pass.
-        for (ClassNode cn : new ArrayList<>(graph.getClasses().values())) {
-            if (!cfg.shouldProtectClass(cn.name)) continue;
-            if (cn.name.startsWith("com/kbox/runtime/")) continue;
-            inlined += inlineInClass(cn);
-        }
-        // Extraction pass.
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (!cfg.shouldProtectClass(cn.name)) continue;
-            if (cn.name.startsWith("com/kbox/runtime/")) continue;
-            extracted += extractInClass(cn);
-        }
-        KBoxLog.info(TAG, "Method obfuscation: " + inlined + " methods inlined, "
-                + extracted + " methods extracted");
+        int thr = cfg.getParallelThreads();
+        java.util.concurrent.atomic.AtomicInteger inlined = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger extracted = new java.util.concurrent.atomic.AtomicInteger();
+        // Inline pass — per-class independent (only same-class static callees).
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.name.startsWith("com/kbox/runtime/")) return;
+            inlined.addAndGet(inlineInClass(cn));
+        }, thr);
+        // Extraction pass — runs after inline so it sees the post-inline bodies.
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.name.startsWith("com/kbox/runtime/")) return;
+            extracted.addAndGet(extractInClass(cn));
+        }, thr);
+        KBoxLog.info(TAG, "Method obfuscation: " + inlined.get() + " methods inlined, "
+                + extracted.get() + " methods extracted");
     }
 
     // ================= Inlining =================

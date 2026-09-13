@@ -54,10 +54,9 @@ public final class DebugInfoForger {
 
     public void apply() {
         if (!cfg.isFakeDebugInfo()) return;
-        int injected = 0;
-        for (ClassNode cn : graph.getClasses().values()) {
-            if (!cfg.shouldProtectClass(cn.name)) continue;
-            if (cn.name.startsWith("com/kbox/runtime/")) continue;
+        java.util.concurrent.atomic.AtomicInteger injected = new java.util.concurrent.atomic.AtomicInteger();
+        com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg, cn -> {
+            if (cn.name.startsWith("com/kbox/runtime/")) return;
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if (mn.instructions == null || mn.instructions.size() == 0) continue;
                 // Strip any real debug info first.
@@ -66,10 +65,10 @@ public final class DebugInfoForger {
                 mn.invisibleLocalVariableAnnotations = null;
                 // Inject fake info.
                 mn.localVariables = forgeVariables(mn);
-                injected++;
+                injected.incrementAndGet();
             }
-        }
-        KBoxLog.info(TAG, "Forged debug info for " + injected + " methods");
+        }, cfg.getParallelThreads());
+        KBoxLog.info(TAG, "Forged debug info for " + injected.get() + " methods");
     }
 
     private List<LocalVariableNode> forgeVariables(MethodNode mn) {

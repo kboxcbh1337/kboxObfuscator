@@ -128,6 +128,10 @@ autoKeepRules = true
 | `cc` | string | 自动 | C 编译器路径（如 `C:/msys64/mingw64/bin/gcc.exe`）。留空则自动发现（`CC` 环境变量 → gcc/clang/cl.exe）。 |
 | `failOnNativeError` | bool | `false` | native 编译失败时：`true`= 抛异常中止；`false`= 记录日志并将对应方法回退回 Java 混淆（优雅降级）。 |
 | `nativeEligiblePrefix` | CSV | 空 | 允许 native 化的类名前缀白名单。 |
+| `nativeExcludePrefix` | CSV | 空 | **native 硬排除前缀**：命中前缀的类既不参与 JNIC 也不参与 VMP（VMP/JNIC 共用黑名单，优先级高于白名单）。 |
+| `vmpExcludePrefix` | CSV | 空 | **VMP 排除类（虚拟化豁免）**：命中前缀的类不参与 VMP 方法体下沉，保留 Java 混淆体。支持点分或斜杠形式、`.*` 通配（自动归一化）。GUI「VMP 排除类」文本框（需勾选 VMP 才可选/可见）。 |
+| `jnicExcludePrefix` | CSV | 空 | **JNIC 排除类（原生化豁免）**：命中前缀的类不参与 JNIC native 翻译，保留 Java 混淆体。GUI「JNIC 排除类」文本框（需勾选 JNIC 才可选/可见）。 |
+| `bodyExcludePrefix` | CSV | 空 | **方法体保持原样豁免**：命中前缀的类所有方法体一律不改写（控制流/字符串/常量/MBA/类型混淆/异常跳转/DedeobfShield 全套跳过），仅参与重命名与打包。用于 Mixin 类/其目标类，或自带复杂 try/catch 的框架解析类（如 FlatLaf `UIDefaultsLoader`）。`autoAdaptMinecraft` 会自动把 mixin 类与目标类写入该集合。 |
 | `nativeAntiHook` | bool | `false` | 见 §3，JNIC 原生反 hook。 |
 | `brainfuckLoader` | bool | `false` | **Brainfuck 终极混沌加载（防内存 Dump / 防静态分析）**。开启后整个输出 jar 的类与资源被 Deflate → Brainfuck → RLE 打包进 `META-INF/kbox/classes.bf.rle` + `index.dat`，由 native 解码器（`kbox_bf_loader.c`，打包进 `native.bin`）在 **Native 堆**内完成 RLE→BF→Deflate 还原并直接 `DefineClass`。磁盘与 Java 堆中不存在明文用户类字节码；`Main-Class` 换为 `com.kbox.runtime.BfSecureLoader`，通过 `Original-Main-Class` 引导原入口。与 JNIC / VMP / 类加密 / 资源混淆不兼容（自动强制关闭），重命名 / 字符串 / 控制流等 Java 层混淆保持生效。 |
 | `brainfuckShield` | bool | `false` | **BrainfuckShield 二次虚拟化**。在 `enableVmp` 之上再套一层：每个 VMP 方法的 ChaCha20 密文流 `encVmp` 被按 per-build/per-method 私有方言重编码成「磁带程序」（KBFT 头 + 码点流 + FNV-1a trailer）存进 `$vmp_<n>` 字段；运行期 `BfInterpreter` 先把磁带程序逐格回放解码回 `encVmp` 才交给 VMP 解释器执行。属性：私有方言（每构建随机 `buildSalt`+每方法 `K` 派生）、磁带指纹自修改指令流（dump 静态得密文 / dump trace 得一次性序列）、膨胀+语义抵消对+诱饵（剥离诱饵即破坏解码）、完整性绑定（静态补丁磁带 → fail-closed 返回 null）、反插桩无声诱饵（命中 `-javaagent/-Xrun/-agentlib` 时破坏种子解码出语义全错的假流，不报错不打日志）。需 `enableVmp=true` 生效。 |
@@ -339,10 +343,12 @@ nativeMethod = com.example.License#check#(Ljava/lang/String;)Z
 2. **`exceptionJumpObf` + Mixin**：`new+invokespec+athrow` 模式会导致 `VerifyError`；Mixin 项目请关闭，且只对非热点方法使用。
 3. **`encryptClasses` 的影响**：开启后会破坏 MixinTweaker 字节码分析，Mixin 项目需关闭。
 4. **`excludeControlFlow` 保留规则**：对 ASM-heavy / 高复杂度 CFG 类建议 `excludeControlFlow=com.example.asm.`；`typeConfusion` 与 `exceptionJumpObf` 也可能破坏复杂 body，需按类排除或置 0。
-5. **字符串加密强度**：`stringEncryptionStrength=2` 的 AES/CTR 要求 IV 恒等于 AES 块大小（16 字节），勿设为 12（那是 GCM 的 IV 长度）。
-6. **`encode`/日志乱码**：GBK 控制台中文乱码可用 CLI `--log <file>` 让 KBoxLog 额外写一份 UTF-8 日志文件。
-7. **结构性开关**：`renamePackages` 只影响包名；若同时不想要任何重命名，需将 `renameIdentifiers=false` 并且不配置 `renamePackages=true`。
-8. **`integrityCheck` 的签名一致性**：`Packager.writeIntegrityHash` 与运行时 `IntegrityChecker` 必须用同一公式——按入口名升序 hash `(clsRoot+internal+".class", 实际写入 jar 的字节)`，且**两边都要**：仅算非 runtime `.class`、跳过路径含 `/META-INF/` 的反解包诱饵伪类。任一改动破坏公式都会让"未篡改产物被误判篡改"（字符串在干净运行时也变乱码）。
+5. **`typeConfusion` / `mbaConstants` / `stackFrameRedirect`（D1）的载体异常改写**：三者都用「抛载体异常 → 自己接住 → 还原参数/局部」的机制，与**自带 try/catch、复杂分支的解析类**（如 FlatLaf `UIDefaultsLoader`、Kotlin 协程状态机）天然冲突——会把方法原本能接住的异常（如 `NumberFormatException`）改到逃逸。已内置守卫：`TypeConfusionObfuscator` 与 `ExceptionJumpObfuscator` 现在自动跳过自带 try/catch 的方法；仍不保险时用 `bodyExcludePrefix=com.example.parse.` 整类豁免方法体改写。
+6. **Mixin 类与其目标类**：`autoAdaptMinecraft` 会自动把 mixin 类/目标类/mixin 直接引用的类加入 `keepPrefixes`（防改名）+ `bodyExcludePrefixes`（防方法体改写）+ VMP/JNIC 排除（防解释器把 `@Shadow` 字段解析错 / 原生访问器返回 null）。不要手动从这些集合中移除，否则 1.8.x Forge 启动期会 `ClassFormatError` / `VerifyError` / `AbstractMethodError`。
+7. **字符串加密强度**：`stringEncryptionStrength=2` 的 AES/CTR 要求 IV 恒等于 AES 块大小（16 字节），勿设为 12（那是 GCM 的 IV 长度）。
+8. **`encode`/日志乱码**：GBK 控制台中文乱码可用 CLI `--log <file>` 让 KBoxLog 额外写一份 UTF-8 日志文件。
+9. **结构性开关**：`renamePackages` 只影响包名；若同时不想要任何重命名，需将 `renameIdentifiers=false` 并且不配置 `renamePackages=true`。
+10. **`integrityCheck` 的签名一致性**：`Packager.writeIntegrityHash` 与运行时 `IntegrityChecker` 必须用同一公式——按入口名升序 hash `(clsRoot+internal+".class", 实际写入 jar 的字节)`，且**两边都要**：仅算非 runtime `.class`、跳过路径含 `/META-INF/` 的反解包诱饵伪类。任一改动破坏公式都会让"未篡改产物被误判篡改"（字符串在干净运行时也变乱码）。
 
 ---
 

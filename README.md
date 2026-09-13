@@ -223,10 +223,35 @@ Stage C（native 自修改/数据依赖寄存器分配）需要把 JNIC 的 C �
 
 ---
 
+## MCMOD 兼容与运行时可靠性工程（2026-09）
+
+针对 1.8.9 Forge + Mixin 类 mod（LiquidBounce 系）全量实测，固化了一整套「混淆器 × Mixin / 启动器 / Java 8 老运行时」兼容层。任何一个缺失都会在启动期以不同方式崩溃（`NoSuchMethodError` / `AbstractMethodError` / `ClassFormatError` / `VerifyError` / Mixin NPE）：
+
+- **Java 8 链接正确性**：所有注入到产物的代码改用 `--release 8` 编译——仅写 `source/target=8` 只改字节码版本号、不锁 API，javac 仍会把 Java 9+ 符号（如 `ByteBuffer.rewind()` 的协变返回）链接进去，老 JVM 加载即 `NoSuchMethodError`。
+- **外部接口覆写永不改名**：继承/实现 jar 外类型（如 LaunchWrapper `IClassTransformer`）的方法保持原名，避免 `AbstractMethodError`。
+- **Mixin 三层保护（`autoAdaptMinecraft` 自动完成）**：mixin 类与其目标类自动加入 ① `keepPrefixes`（防改名）② `bodyExcludePrefixes`（方法体不改写——Mixin 注入处理器合并进目标类时会重排局部槽并外包 try/catch，任何改写帧/局部/异常表的 pass 都会破坏它）③ VMP/JNIC 排除（`@Shadow` 字段在 mixin 类里根本不存在，下沉进解释器必然解析失败）。
+- **mixin 直接引用的类排除 JNIC**：处理器合并进目标类后仍会调用其原引用类（如 `ClientUtils.getLOGGER()`），这些类也被排除 JNIC 原生下沉——原生解释器对静态字段访问器返回 null 的问题已在多个类复现。
+- **`@Shadow` 等 Mixin 注解按包前缀整体保留**：注解擦除对 `Lorg/spongepowered/asm/mixin/` 前缀整体豁免（逐条列举曾因包路径写错而误删 `@Shadow`，导致 Mixin 应用期 NPE）。
+- **Cheat Engine / 内存扫描对抗（native 层）**：新增 `\\.\DBK` 内核驱动设备探测、进程内 `cheatengine-*.dll` 模块探测、CE 窗口/进程扫描；任一命中即 `epochBump` 内存自毁。配合既有 Dr7 硬件断点、调试端口、JVMTI agent 能力探测。
+- **可靠性基线（safe-base）**：`typeConfusion` / `mbaConstants` / `stackFrameRedirect(D1)` / `exceptionJumpObf` 这类「载体异常重写」pass 与自带 try/catch 的复杂解析类冲突（FlatLaf `UIDefaultsLoader` 曾把 `"0.5"` 路由进 `Integer.parseInt` 直接崩）；已内置「跳过自带 try/catch 方法」守卫。大型 mod 建议先用安全基线（关闭这 4 项，其余全开）拿可用产物，再按需逐个加回。
+
+**VMP / JNIC 排除类**（新配置键，GUI 同步支持）：
+```ini
+# 点分/斜杠均可，支持 .* 通配（自动归一化）；每行一个
+vmpExcludePrefix  = com.example.ui, com/example/netty.NettyHandler
+jnicExcludePrefix = com.example.io
+bodyExcludePrefix = com.example.parse      # 方法体整体豁免（框架解析类）
+nativeExcludePrefix = com.example.legacy   # VMP+JNIC 共用硬排除
+```
+GUI 中「VMP 排除类」「JNIC 排除类」文本框仅在勾选 VMP / JNIC 时显示与可选。
+
+---
+
 ## 已有能力与诚实边界
 
 **默认关闭、需显式开启的高风险项**（原因：字节码重写风险，关闭可保产物稳定）：
 `enableVmp`、`enableJnic`、`encryptClasses`、`typeConfusion>0`、`mbaConstants>0`。
+`typeConfusion` / `mbaConstants` / `stackFrameRedirect(D1)` / `exceptionJumpObf` 已内置「跳过自带 try/catch 方法」守卫，但复杂解析类仍建议用 `bodyExcludePrefix` 整类豁免。
 
 **诚实的边界**——请勿相信任何「绝对不可破解」营销话术：
 - 只要程序能在攻击者控制的机器上运行，就存在被逆向的语义信息（动态度量、JIT、仿真必然泄漏）。

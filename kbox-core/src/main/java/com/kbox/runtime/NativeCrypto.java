@@ -138,10 +138,33 @@ public final class NativeCrypto {
         }
     }
 
+    /**
+     * Native AES-256-CTR string decryption sink: {@code enc = IV(16) || ct}, keyed
+     * by the caller-supplied 32-byte AES key. The plaintext is decrypted in C into
+     * a secure (page-aligned, wipe-on-free) buffer, converted to a jstring there,
+     * and the buffer is wiped before returning — the Java heap only ever sees the
+     * final {@code String}, never the intermediate plaintext bytes. Returns
+     * {@code null} on unavailable/native-failure so callers fall back to the
+     * byte-identical JCE path. The keystream MUST match Java's
+     * {@code AES/CTR/NoPadding} (16-byte big-endian counter incremented per block),
+     * otherwise protected output diverges between native and Java builds.
+     */
+    public static String decryptString(byte[] enc, byte[] key) {
+        if (!available() || enc == null || key == null || enc.length < 16 || key.length != 32) {
+            return null;
+        }
+        try {
+            return decryptString0(enc, key);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     // --- batch native declarations ---
 
     private static native byte[] hkdfSha2560(byte[] ikm, byte[] salt, byte[] info, int len);
     private static native byte decryptByteAt0(byte[] res, int pos, byte[] ks);
+    private static native String decryptString0(byte[] enc, byte[] key);
 
     // --- blob loading (mirrors NativeLoader.unpack, self-contained) ---
 

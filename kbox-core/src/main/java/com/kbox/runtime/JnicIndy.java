@@ -90,7 +90,31 @@ public final class JnicIndy {
     /** A lookup with access to the caller class's own (including private) members. */
     private static MethodHandles.Lookup callerLookup(String internal) throws Throwable {
         Class<?> c = Class.forName(internal.replace('/', '.'), false, callerLoader());
-        return MethodHandles.privateLookupIn(c, LOOKUP);
+        return privateLookupIn(c);
+    }
+
+    /**
+     * Java-8-safe equivalent of {@code MethodHandles.privateLookupIn(c, LOOKUP)}.
+     *
+     * <p>On Java 9+ the public API is invoked reflectively (so this class still
+     * compiles under {@code --release 8}); it keeps the exact same semantics —
+     * including its {@code IllegalAccessException} when the target module does
+     * not open the package. On Java 8 there is no public API to obtain a private
+     * lookup for another class, so the {@code Lookup(Class, int)} constructor is
+     * opened and called with the trusted mode ({@code -1} = all access modes),
+     * granting the same private/synthetic-member access the Java 9+ API does.</p>
+     */
+    private static MethodHandles.Lookup privateLookupIn(Class<?> c) throws Exception {
+        try {
+            java.lang.reflect.Method m = MethodHandles.class.getMethod(
+                    "privateLookupIn", Class.class, MethodHandles.Lookup.class);
+            return (MethodHandles.Lookup) m.invoke(null, c, LOOKUP);
+        } catch (NoSuchMethodException java8) {
+            java.lang.reflect.Constructor<MethodHandles.Lookup> ctor =
+                    MethodHandles.Lookup.class.getDeclaredConstructor(Class.class, int.class);
+            ctor.setAccessible(true);
+            return ctor.newInstance(c, Integer.valueOf(-1)); // -1 == trusted: all modes
+        }
     }
 
     /**

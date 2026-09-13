@@ -355,10 +355,90 @@ public final class AutoKeepDeriver {
             }
         }
 
+        // ---- 8. Jackson polymorphic type ids ----
+        // @JsonSubTypes.Type(X.class) WITHOUT an explicit name makes Jackson use X's
+        // SIMPLE NAME as the JSON type discriminator, and @JsonTypeInfo(use = NAME)
+        // resolves incoming ids the same way. Renaming X therefore silently rewrites
+        // the emitted JSON ("type":"Circle" -> "type":"tsd") and breaks
+        // round-tripping across services/versions, with nothing in the error
+        // pointing at the rename as the cause. Keep the class names of every
+        // sub-type Jackson is told about, unless the discriminator is pinned by a
+        // literal instead (@Type(name = "...") or @JsonTypeName on the sub-type).
+        keptClasses += keepJsonSubTypes(cn);
+
         if (keepClass) {
             graph.keep(MemberRef.ofClass(cn.name));
             keptClasses++;
         }
+    }
+
+    /**
+     * Keeps the class name of every {@code @JsonSubTypes.Type} target whose JSON
+     * discriminator is the sub-type's simple name. Returns how many classes were
+     * kept.
+     */
+    @SuppressWarnings("unchecked")
+    private int keepJsonSubTypes(ClassNode cn) {
+        if (cn.visibleAnnotations == null) return 0;
+        int n = 0;
+        for (org.objectweb.asm.tree.AnnotationNode ann : cn.visibleAnnotations) {
+            if (ann == null
+                    || !"Lcom/fasterxml/jackson/annotation/JsonSubTypes;".equals(ann.desc)
+                    || ann.values == null) {
+                continue;
+            }
+            for (int i = 0; i + 1 < ann.values.size(); i += 2) {
+                if (!"value".equals(ann.values.get(i))) continue;
+                Object v = ann.values.get(i + 1);
+                List<org.objectweb.asm.tree.AnnotationNode> types;
+                if (v instanceof List) {
+                    types = (List<org.objectweb.asm.tree.AnnotationNode>) v;
+                } else if (v instanceof org.objectweb.asm.tree.AnnotationNode) {
+                    types = java.util.Collections.singletonList((org.objectweb.asm.tree.AnnotationNode) v);
+                } else {
+                    continue;
+                }
+                for (org.objectweb.asm.tree.AnnotationNode t : types) {
+                    if (t == null || t.values == null) continue;
+                    if (hasAnnotationMember(t, "name")) continue;   // literal discriminator
+                    for (int j = 0; j + 1 < t.values.size(); j += 2) {
+                        if (!"value".equals(t.values.get(j))) continue;
+                        Object tv = t.values.get(j + 1);
+                        if (!(tv instanceof org.objectweb.asm.Type)) continue;
+                        String internal = ((org.objectweb.asm.Type) tv).getInternalName();
+                        ClassNode target = graph.getClasses().get(internal);
+                        // @JsonTypeName pins the discriminator on the sub-type side.
+                        if (target != null
+                                && hasAnnotation(target, "Lcom/fasterxml/jackson/annotation/JsonTypeName;")) {
+                            continue;
+                        }
+                        graph.keep(MemberRef.ofClass(internal));
+                        n++;
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
+    /** True when the annotation carries a non-empty String member with this name. */
+    private static boolean hasAnnotationMember(org.objectweb.asm.tree.AnnotationNode ann, String member) {
+        if (ann == null || ann.values == null) return false;
+        for (int i = 0; i + 1 < ann.values.size(); i += 2) {
+            if (!member.equals(ann.values.get(i))) continue;
+            Object v = ann.values.get(i + 1);
+            return v instanceof String && !((String) v).isEmpty();
+        }
+        return false;
+    }
+
+    /** True when the class carries the given annotation descriptor. */
+    private static boolean hasAnnotation(ClassNode cn, String desc) {
+        if (cn == null || cn.visibleAnnotations == null) return false;
+        for (org.objectweb.asm.tree.AnnotationNode a : cn.visibleAnnotations) {
+            if (a != null && desc.equals(a.desc)) return true;
+        }
+        return false;
     }
 
     /** True if the descriptor looks like a known framework annotation type. */

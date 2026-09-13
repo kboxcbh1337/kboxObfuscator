@@ -40,7 +40,15 @@ public final class BfInterpreter {
     /** Execute a BF program and capture its {@code .} output. */
     public static String executeToOutput(String src) {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        PrintStream ps = new PrintStream(bos, true, StandardCharsets.UTF_8);
+        PrintStream ps;
+        try {
+            // PrintStream(OutputStream, boolean, Charset) is Java 10+; the
+            // String-encoding overload exists since Java 1.1 and encodes
+            // identically ("UTF-8" is the canonical name of StandardCharsets.UTF_8).
+            ps = new PrintStream(bos, true, StandardCharsets.UTF_8.name());
+        } catch (java.io.UnsupportedEncodingException e) {
+            throw new BfVmException("UTF-8 unavailable", e);
+        }
         run(src, ps, null);
         ps.flush();
         return new String(bos.toByteArray(), StandardCharsets.UTF_8);

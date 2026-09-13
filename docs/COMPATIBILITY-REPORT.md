@@ -122,15 +122,17 @@ KBox 混淆器在全部 7 个兼容性测试模块 + 4 个 JDK 版本下 **全�
 
 ## 四、Minecraft Mod 兼容性
 
-| 加载器 | 预设 | 状态 |
+| 加载器 | 机制 | 状态 |
 |--------|------|------|
-| NeoForge | `--mc-preset NEOFORGE` | ✅ 支持（保留 `net/neoforge/`、`@Mod` 注解） |
-| Forge | `--mc-preset FORGE` | ✅ 支持（保留 `net/minecraftforge/`、`@Mod`） |
-| Fabric | `--mc-preset FABRIC` | ✅ 支持（保留 `net/fabricmc/`、Mixin） |
-| Bukkit/Spigot | `--mc-preset BUKKIT` | ✅ 支持（保留 `org/bukkit/`、`@EventHandler`） |
-| Mixin | `--mc-preset MIXIN` | ✅ 支持（保留 `@Mixin`、`@Inject`、`@Shadow`） |
+| Forge（1.8.9 实测） | `autoAdaptMinecraft=true` 自动检测 `TweakClass`/`mixins.json` | ✅ 全量实测（LiquidBounce 1.8.9 + OptiFine） |
+| NeoForge / Forge 新版 | 自动保留 `net/neoforge/`、`net/minecraftforge/`、`@Mod` | ✅ 支持 |
+| Fabric | 自动保留 `net/fabricmc/`、Mixin、`fabric.mod.json` | ✅ 支持 |
+| Bukkit/Spigot | 自动保留 `org/bukkit/`、`@EventHandler`、`plugin.yml` | ✅ 支持 |
+| Mixin | 自动保留全部 `org/spongepowered/asm/mixin/` 注解 | ✅ 支持 |
 
-使用: `java -jar kbox-protector.jar -i mod.jar -o mod-protected.jar --mc-preset NEOFORGE`
+使用: `java -jar kbox-protector.jar --input mod.jar --output mod-protected.jar --config mod.conf`（配置里写 `autoAdaptMinecraft=true`，无需手动预设）。
+
+**Mixin 兼容层（2026-09 全量实测固化）**：mixin 类与其目标类自动加入 `keepPrefixes`（防改名）+ `bodyExcludePrefixes`（方法体不改写，因 Mixin 注入处理器合并进目标类时会重排局部槽并外包 try/catch）+ VMP/JNIC 排除（`@Shadow` 字段在 mixin 类中不存在，下沉进解释器必然解析失败）；mixin 直接引用的类（如 `ClientUtils`）同样排除 JNIC。**注意**：对 1.8.x 老 Forge（Java 8 运行时）必须保证产物所有注入代码用 `--release 8` 编译，否则 Java 9+ 符号链接会导致 `NoSuchMethodError`。完整机制见 [README.md](../README.md)「MCMOD 兼容与运行时可靠性工程」。
 
 ---
 

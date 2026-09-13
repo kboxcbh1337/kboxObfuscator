@@ -41,53 +41,58 @@ public final class BfSecureLoader extends ClassLoader {
     private static final String _RP = "META-INF/kbox/classes.bf.rle";
     private static final String _MP = "META-INF/MANIFEST.MF";
 
-    /** StackWalker used to verify the <b>root entry frame</b> of
+    /** Caller-frame walk used to verify the <b>direct caller</b> of
      *  reflective-vulnerable entry points (constructor +
      *  {@link #defineClassFromBF}).
      *
      *  <p>Window of attack: an attacker who runs the protected jar on its own
      *  classpath (not via {@code -jar}) could {@code setAccessible(true)} a
-     *  private convenience wrapper and reach the native define. Unlike the
-     *  bootstrap classes, the loader (precisely its {@link #main}) is never
-     *  obfuscated, but the forged entry point is detectable: a genuine launch
-     *  always roots the call stack in {@code com.kbox.BfSecureLoader.main}
-     *  (the {@code -jar} Main-Class, invoked first by the VM), whereas a
-     *  reflective attacker roots the stack in its own class. So the gate
-     *  walks the full hidden stack and refuses the sensitive entry when the
-     *  outermost (thread-root) frame is not inside the {@code com.kbox.}
-     *  package. Fail-closed on any walker anomaly.</p>
+     *  private convenience wrapper and reach the native define. The legit
+     *  loading path always goes through this loader's own methods
+     *  ({@link #findClass} / the constructor / {@link #attach}), so the gate
+     *  checks the <b>immediate caller</b> is inside {@code com.kbox.runtime.} —
+     *  NOT the thread root: a worker thread's root frame is always
+     *  {@code java.lang.Thread.run}, and refusing it would break every
+     *  application thread that loads classes through this loader (the
+     *  pre-fix "KBox-BF: external define refused" in thread pools).</p>
      *
-     *  <p>Note that app classes are loaded by the VM below this loader, so
-     *  the root is always {@code com.kbox.BfSecureLoader.main} regardless of
-     *  how deeply the define is buried under the application's own frames.</p>
+     *  <p>Fail-closed on any frame-walk anomaly.</p>
      */
-    private static final java.lang.StackWalker _SW =
-            java.lang.StackWalker.getInstance(java.util.EnumSet.of(
-                    java.lang.StackWalker.Option.RETAIN_CLASS_REFERENCE,
-                    java.lang.StackWalker.Option.SHOW_HIDDEN_FRAMES));
+    /** Frame kinds {@link java.lang.StackWalker#getCallerClass()} filters out
+     *  (reflection, MethodHandle internals, hidden frames) regardless of the
+     *  configured options. {@code Throwable.getStackTrace()} already omits
+     *  hidden frames on Java 9+, so only the named packages need skipping. */
+    private static boolean isFilteredFrame(String className) {
+        return className.startsWith("java.lang.reflect.")
+                || className.startsWith("jdk.internal.reflect.")
+                || className.startsWith("sun.reflect.")
+                || className.startsWith("java.lang.invoke.");
+    }
 
-    /** Returns true iff the outermost (thread-root) frame of the current call
-     *  stack — skipping reflection plumbing — is inside the {@code com.kbox.}
-     *  package. A genuine {@code -jar} launch stacks the root at
-     *  {@code com.kbox.BfSecureLoader.main}; a reflective attacker stacks the
-     *  root at its own (external) class and is refused. */
+    /** Returns true iff the immediate caller of this method is this loader
+     *  itself (or another {@code com.kbox.runtime.} helper). A genuine
+     *  {@code -jar} launch defines classes through {@link #findClass}; a
+     *  reflective attacker calling {@code defineClassFromBF} directly roots
+     *  the immediate caller in its own (external) class and is refused.
+     *
+     *  <p>Java-8-safe equivalent of {@code StackWalker#getCallerClass()}: walk
+     *  the frames and return the first one above this method that is not a
+     *  reflection / MethodHandle / hidden frame — the same resolver rule the
+     *  original walker used (a reflective {@code Method.invoke} of
+     *  {@code defineClassFromBF} therefore resolves to the attacker's class,
+     *  not to the reflect machinery).</p> */
     private static boolean callerIsKbox() {
         try {
-            java.util.ArrayList<String> chain = new java.util.ArrayList<>();
-            _SW.walk(frames -> {
-                frames.forEach(f -> {
-                    String n = f.getClassName();
-                    if (n != null) chain.add(n);
-                });
-                return null;
-            });
-            // chain is ordered from the current method outward; the LAST
-            // element is the thread root.
-            if (chain.isEmpty()) return true;
-            String root = chain.get(chain.size() - 1);
-            return root != null && root.startsWith("com.kbox.");
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            // st[0] is this method's own frame; start at the caller.
+            for (int i = 1; i < st.length; i++) {
+                String n = st[i].getClassName();
+                if (isFilteredFrame(n)) continue;
+                return n.startsWith("com.kbox.runtime.");
+            }
+            return false;
         } catch (Throwable t) {
-            return false; // fail-closed on any walker anomaly
+            return false; // fail-closed on any frame-walk anomaly
         }
     }
 
@@ -131,7 +136,14 @@ public final class BfSecureLoader extends ClassLoader {
         if (!callerIsKbox()) {
             throw new SecurityException("KBox-BF: external define refused");
         }
-        return defineClassFromBFImpl(name);
+        // The native blob decoder keeps mutable scratch state (decode buffers,
+        // KBF2 index cursors). Application/analysis threads define classes
+        // concurrently through this loader, so serialize the native define to
+        // avoid a data race in kbox_bf_loader.c (seen as 0xC0000005 during
+        // multi-threaded class analysis).
+        synchronized (this) {
+            return defineClassFromBFImpl(name);
+        }
     }
 
     /** Native define: name resolved through the embedded KBF2 index, decoded
@@ -219,6 +231,71 @@ public final class BfSecureLoader extends ClassLoader {
      *  light scrub (icache flush + scratch wipe). Best-effort; fail-open. */
     static native int nativeSelfWipe(int mask);
 
+    /** Environment re-probe by the resident native decoder. Returns a bitmask:
+     *  <pre>
+     *    bit0 = agent / injection module mapped (Frida / .NET-CLR mscoree /
+     *           coreclr / debugger helper — see the decoder's module table)
+     *    bit1 = registry tamper vector armed (AppInit_DLLs / AppCertDlls / IFEO)
+     *    bit2 = Frida in-memory feature found (private-memory scan)
+     *    bit3 = strong debugger signal (PEB / debug port / hardware BP)
+     *    bit4 = JVMTI hook capability present (ClassFileLoadHook / retransform)
+     *    bit5 = any loaded module exports a JVMTI agent entry point
+     *           (Agent_OnLoad / Agent_OnAttach / Agent_OnUnload) — a renamed /
+     *           arbitrary -agentpath or attach DLL the module-name table cannot
+     *           match, detected name-independently by export signature.
+     *  </pre>
+     *  0 means a clean environment. Only meaningful in Brainfuck mode (the
+     *  resident decoder is present); callers outside BF must treat it as 0.
+     *  Registered by the decoder's {@code JNI_OnLoad}. */
+    static native int probeEnv();
+
+    /** Native hard-kill. Wipes every live plaintext window (the same
+     *  fail-closed path the native W1/W2 watchdogs use) then terminates the
+     *  process with {@code code}. Never returns on success. */
+    static native void terminate(int code);
+
+    /** Periodic environment re-check ("runtime watchdog"): every
+     *  {@code intervalMs} (clamped to &ge; 500) asks the resident native decoder
+     *  for a fresh injection / tamper probe and hard-kills the process on any
+     *  signal (bit0..3 non-zero). Complements the native W1/W2 mutual-sentinel
+     *  threads with an application-visible heartbeat. Idempotent: only the
+     *  first call starts the single shared daemon thread. No-op when the native
+     *  decoder is absent (non-BF jar / already shutting down). */
+    static void startRuntimeWatchdogs(long intervalMs) {
+        if (intervalMs < 500) intervalMs = 500;
+        final long iv = intervalMs;
+        synchronized (BfSecureLoader.class) {
+            if (_runtimeWd != null) return;
+            _runtimeWd = new Thread(() -> {
+                for (;;) {
+                    try {
+                        Thread.sleep(iv);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    int m;
+                    try {
+                        m = probeEnv();
+                    } catch (Throwable ignored) {
+                        return;   // decoder unloaded / shutdown — stop probing
+                    }
+                    if (m != 0) {
+                        try {
+                            terminate(0x6B);   // 0x6B = runtime-watchdog kill
+                        } catch (Throwable ignored) {
+                            // native side never returns; ignore if already gone
+                        }
+                        return;
+                    }
+                }
+            }, "kbox-watchdog-java");
+            _runtimeWd.setDaemon(true);
+            _runtimeWd.start();
+        }
+    }
+
+    private static volatile Thread _runtimeWd;
+
     /** Whether a JNIC native lib was loaded (enables per-class native registration). */
     private final boolean _jl;
 
@@ -257,6 +334,40 @@ public final class BfSecureLoader extends ClassLoader {
         // load it now so native methods on blob classes can be registered later.
         _jl = NativeLoader.loadJnic();
         Runtime.getRuntime().addShutdownHook(new Thread(BfSecureLoader::wipe));
+    }
+
+    // ------------------------------------------------------------------
+    // MC-mod hybrid attach point
+    // ------------------------------------------------------------------
+
+    /** Singleton holder for BF-MC hybrid mode (no Main-Class execution: the mod
+     *  loader instantiates the entry classes directly, so an entry class' <clinit>
+     *  calls {@link #attach()} to decode the blob once). */
+    private static volatile BfSecureLoader _hybrid;
+
+    /**
+     * Attaches the BF loader from a plaintext MC entry class. Idempotent.
+     * In hybrid mode the loader-critical surface (metadata / entry classes /
+     * mixin package) is plaintext, so the default parent-first {@code loadClass}
+     * resolves those from the mod loader and {@code findClass} only serves the
+     * blob — exactly the mixed jar layout the packer produces.
+     */
+    public static void attach() {
+        if (_hybrid != null) return;
+        synchronized (BfSecureLoader.class) {
+            if (_hybrid != null) return;
+            _hybrid = new BfSecureLoader();
+        }
+    }
+
+    /** Loads a class through the hybrid loader (parent first, blob fallback). */
+    public static Class<?> loadHybrid(String name) throws ClassNotFoundException {
+        BfSecureLoader l = _hybrid;
+        if (l == null) {
+            attach();
+            l = _hybrid;
+        }
+        return l.loadClass(name);
     }
 
     // ------------------------------------------------------------------

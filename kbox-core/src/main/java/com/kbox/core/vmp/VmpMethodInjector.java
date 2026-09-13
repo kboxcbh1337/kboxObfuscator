@@ -313,6 +313,18 @@ public final class VmpMethodInjector {
     }
 
     public void rewrite(ClassNode cn, Map<String, VmpTranslator.Result> perMethod) {
+        // Interfaces cannot host the mutable `$vmp_*` state this pass injects:
+        // every interface field MUST be `public static final`, and the JVM rejects
+        // anything else while parsing the class:
+        //   ClassFormatError: Illegal field modifiers in class <iface>: 0xA
+        // (0xA = private|static; seen on com/formdev/flatlaf/FlatSystemProperties,
+        // a FlatLaf interface that holds constants only). Static methods with
+        // bodies are legal in an interface since Java 8, so this is a real case —
+        // leave those methods as ordinary Java and drop them from the VMP plan.
+        if ((cn.access & (Opcodes.ACC_INTERFACE | 0x2000 /* ACC_ANNOTATION */)) != 0) {
+            perMethod.keySet().removeIf(k -> k.startsWith(cn.name + "#"));
+            return;
+        }
         @SuppressWarnings("unchecked")
         java.util.List<MethodNode> snapshot = new java.util.ArrayList<>(cn.methods);
         int idx = 0;

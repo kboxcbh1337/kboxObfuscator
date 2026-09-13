@@ -325,9 +325,15 @@ public final class ProtectorCli {
             Class<?> guiCls = Class.forName("com.kbox.gui.ProtectorGui");
             guiCls.getMethod("launch", String.class, String.class, String.class, boolean.class)
                     .invoke(null, in, out, cfgPath, verbose);
-        } catch (Exception e) {
-            System.err.println("GUI unavailable: " + e.getMessage()
-                    + " (headless? use the CLI with --input/--output)");
+        } catch (Throwable e) {
+            // Obfuscated self-output (esp. Brainfuck mode) may rename the GUI
+            // reflection entry or run headless. Give actionable CLI usage
+            // instead of the misleading "(headless?)" guess.
+            System.err.println("[KBox] GUI 启动失败: " + e);
+            System.err.println("[KBox] 提示: 混淆产物（尤其 BF 模式）无参启动需要 GUI 组件可用;"
+                    + " 请用 CLI 模式: --input <jar> --output <jar> [--config <conf>]");
+            System.err.println();
+            printHelp();
             System.exit(2);
         }
     }

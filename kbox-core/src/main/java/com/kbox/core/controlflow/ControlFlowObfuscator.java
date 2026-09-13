@@ -95,6 +95,47 @@ public final class ControlFlowObfuscator {
         KBoxLog.info(TAG, "Starting control-flow obfuscation: " + total
                 + " classes, strength=" + cfg.getControlFlowStrength()
                 + (verboseCf ? " [DEBUG-CF enabled: per-file output to stdout]" : ""));
+        int thr = cfg.getParallelThreads();
+        boolean parallelCf = (thr != 1) && total > 8;
+        if (parallelCf) {
+            // Deep speedup: control flow was the last heavy pass still running on
+            // one core. Each class is transformed independently (graph + config
+            // are read-only during CF), so the class list fans out over the
+            // configured workers — 0 (default) = auto (CPU cores), 1 = force the
+            // deterministic serial path below, N = fixed pool. Per-class
+            // rollback + neverFail semantics are preserved inside
+            // obfuscateClass(); every protected class is marked CF-modified so
+            // the Packager recomputes frames (identical to the serial path,
+            // which marks whenever any predicate/transform fired).
+            final long pStart = System.currentTimeMillis();
+            // Bound in-flight transformations: CF is memory-heavy (lazy rollback
+            // deep-clone snapshots + COMPUTE_FRAMES validation buffers). Let the
+            // pool fan out over all cores but only run ~4 concurrently, so a
+            // 10k-class allMax run's peak transient heap stays bounded instead
+            // of 16 simultaneous snapshots OOM-ing the heap.
+            int cfConcurrent = Math.max(2, Math.min(4, cfg.getParallelThreads()));
+            com.kbox.core.concurrent.ParallelClassProcessor.processAll(graph, cfg,
+                    cn -> {
+                        try {
+                            obfuscateClass(cn);
+                        } catch (Throwable t) {
+                            if (cfg.isNeverFail()) {
+                                KBoxLog.warn(TAG, "Control-flow failed for " + cn.name + ": "
+                                        + t.getClass().getSimpleName() + ": " + t.getMessage()
+                                        + " — keeping original bytes (neverFail=true)");
+                                return;
+                            }
+                            throw new com.kbox.core.KBoxException(
+                                    "Control-flow obfuscation failed for " + cn.name, t);
+                        }
+                        graph.markCfModified(cn.name);
+                    }, thr, cfConcurrent);
+            double pSec = (System.currentTimeMillis() - pStart) / 1000.0;
+            KBoxLog.info(TAG, "Control-flow obfuscation complete (parallel, pool=" + thr
+                    + ") in " + pSec + "s over " + total + " classes at strength "
+                    + cfg.getControlFlowStrength());
+            return;
+        }
         for (ClassNode cn : graph.getClasses().values()) {
             // Single canonical decision: library classes, KBox runtime, and
             // out-of-scope classes are skipped uniformly. Kept classes are
@@ -177,18 +218,17 @@ public final class ControlFlowObfuscator {
         if (methodCount == 0) return;
         cfLog("  >> Processing class " + cn.name + " (" + methodCount + " methods with code)");
 
-        // Snapshot every method's instruction list BEFORE any mutation.
-        // If COMPUTE_FRAMES validation fails after CF transforms, we restore
-        // these snapshots so the class retains valid StackMapTable data.
+        // Lazy snapshot: clone a method's instruction list ONLY right before it
+        // is first mutated. If COMPUTE_FRAMES validation fails after CF
+        // transforms, we restore these snapshots so the class retains valid
+        // StackMapTable data. Classes where nothing changed skip both the
+        // snapshot cost (a deep clone per method) and the validation cost (a
+        // full COMPUTE_FRAMES serialization) entirely — on large jars the vast
+        // majority of classes/methods fail eligibility and were paying both.
         Map<MethodNode, InsnList> originalInsns = new HashMap<>();
         Map<MethodNode, Integer> originalMaxLocals = new HashMap<>();
         Map<MethodNode, Integer> originalMaxStack = new HashMap<>();
-        for (MethodNode mn : methods) {
-            if (mn.instructions == null || mn.instructions.size() == 0) continue;
-            originalInsns.put(mn, cloneInstructions(mn.instructions));
-            originalMaxLocals.put(mn, mn.maxLocals);
-            originalMaxStack.put(mn, mn.maxStack);
-        }
+        boolean mutated = false;
 
         for (MethodNode mn : methods) {
             if (mn.instructions == null || mn.instructions.size() == 0) continue;
@@ -220,7 +260,10 @@ public final class ControlFlowObfuscator {
                 // layout and produce an "Operand stack underflow" VerifyError.
                 // Here we substitute on the clean original body only.
                 if (!isCtor && cfg.getControlFlowStrength() >= 2) {
-                    substitutedThisClass += substituteIAddMba(mn, cfg.getControlFlowStrength());
+                    snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                    int n = substituteIAddMba(mn, cfg.getControlFlowStrength());
+                    substitutedThisClass += n;
+                    if (n > 0) mutated = true;
                 }
                 // Flatten BEFORE injecting opaque predicates. The predicates
                 // contain internal branches (IFEQ/GOTO around a dead branch).
@@ -256,14 +299,19 @@ public final class ControlFlowObfuscator {
                 // gains nothing from a dispatcher. This selects genuine business
                 // methods (the ZKM-style "EPL" bandwidth) and bounds the switch size.
                 if (!isCtor && !isVmpTarget && inFlattenWindow(mn)) {
+                    snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
                     flattened = Flattener.flatten(mn, cfg.getControlFlowStrength());
                     if (flattened) {
                         methodsFlattened++;
+                        mutated = true;
                     } else {
                         methodsSkipped++;
                     }
                 }
+                int predBefore = predicatesInserted;
+                snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
                 injectOpaquePredicates(mn, isCtor ? 1 : cfg.getControlFlowStrength(), cn.name, cfg.getControlFlowStrength());
+                if (predicatesInserted > predBefore) mutated = true;
                 cfLog("    << " + cn.name + "." + mn.name + mn.desc
                         + " insn=" + insnCount
                         + (isCtor ? " [ctor: pred-only]" : "")
@@ -283,7 +331,8 @@ public final class ControlFlowObfuscator {
         // throws (NullPointerException from ASM's analyzer), the class
         // would fail JVM verification at runtime.  We roll back ALL CF
         // transforms for this class and keep the original bytecode.
-        if (!validateClassForComputeFrames(cn)) {
+        // (Skipped entirely when nothing was mutated: no frames went stale.)
+        if (mutated && !validateClassForComputeFrames(cn)) {
             for (Map.Entry<MethodNode, InsnList> e : originalInsns.entrySet()) {
                 MethodNode mn = e.getKey();
                 mn.instructions = e.getValue();
@@ -293,6 +342,18 @@ public final class ControlFlowObfuscator {
             cfLog("  << " + cn.name + " [CF-rollback: COMPUTE_FRAMES failed, "
                     + methodCount + " methods reverted to original]");
         }
+    }
+
+    /** Deep-clones {@code mn}'s instruction list into the rollback snapshots
+     *  unless it was already snapshotted (lazy snapshot — see obfuscateClass). */
+    private void snapshotIfNeeded(MethodNode mn,
+                                  Map<MethodNode, InsnList> originalInsns,
+                                  Map<MethodNode, Integer> originalMaxLocals,
+                                  Map<MethodNode, Integer> originalMaxStack) {
+        if (originalInsns.containsKey(mn)) return;
+        originalInsns.put(mn, cloneInstructions(mn.instructions));
+        originalMaxLocals.put(mn, mn.maxLocals);
+        originalMaxStack.put(mn, mn.maxStack);
     }
 
     /** True when the method's real (non-label/frame/line) instruction count is

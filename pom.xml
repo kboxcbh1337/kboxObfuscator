@@ -20,10 +20,9 @@
     </modules>
 
     <properties>
-        <maven.compiler.source>8</maven.compiler.source>
-        <maven.compiler.target>8</maven.compiler.target>
+        <maven.compiler.release>8</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <asm.version>9.7</asm.version>
+        <asm.version>9.10.1</asm.version>
     </properties>
 
     <dependencyManagement>
@@ -58,8 +57,18 @@
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>3.11.0</version>
                     <configuration>
-                        <source>8</source>
-                        <target>8</target>
+                        <!-- Use release 8 rather than source/target 8: the protected
+                             runtime is injected into Java-8 targets (Minecraft 1.8.9).
+                             With plain source/target, javac still links against the
+                             JDK 21 platform classes and bakes in members that only
+                             exist from Java 9 on, e.g. the covariant
+                             ByteBuffer.rewind() that java.nio.ByteBuffer overrides
+                             (Java 8 declares it on Buffer). That made the produced jar
+                             die at class-init with
+                             NoSuchMethodError: java.nio.ByteBuffer.rewind()Ljava/nio/ByteBuffer;
+                             release 8 binds javac to the Java 8 API so such calls are
+                             either rewritten or rejected at compile time. -->
+                        <release>8</release>
                         <encoding>UTF-8</encoding>
                     </configuration>
                 </plugin>

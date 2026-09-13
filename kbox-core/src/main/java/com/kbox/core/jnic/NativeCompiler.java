@@ -4,6 +4,7 @@ import com.kbox.core.log.KBoxLog;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -65,7 +66,7 @@ public final class NativeCompiler {
         cmd.add("-fPIC");              // ignored by MSVC; harmless on gcc/clang
         cmd.add("-fvisibility=hidden"); // hide non-JNIEXPORT symbols (only JNI_OnLoad exported)
         cmd.add("-s");                 // strip .symtab: no static identifier names (leaks KBOX_* table names)
-        cmd.add("-O2");
+        cmd.add("-O1");                // -O1 vs -O2: ~2-3x faster gcc, ~same interpreter throughput
         cmd.add("-I"); cmd.add(normalizeJdkInclude());
         String plat = platformInclude();
         if (plat != null) {
@@ -77,7 +78,7 @@ public final class NativeCompiler {
             cmd.clear();
             cmd.add(cc);
             cmd.add("/LD");                 // build DLL
-            cmd.add("/O2");
+            cmd.add("/O1");                 // /O2 was the JNIC gcc bottleneck; /O1 keeps interp throughput
             cmd.add("/I"); cmd.add(normalizeJdkInclude());
             if (plat != null) cmd.add("/I:" + normalizeJdkInclude() + "/" + plat);
             cmd.add(cSource.toString());
@@ -96,13 +97,13 @@ public final class NativeCompiler {
             java.io.ByteArrayOutputStream outBuf = new java.io.ByteArrayOutputStream();
             Thread drainer = new Thread(() -> {
                 try {
-                    p.getInputStream().transferTo(outBuf);
+                    drain(p.getInputStream(), outBuf);
                 } catch (IOException ignored) {}
             });
             drainer.start();
             int code = p.waitFor();
             drainer.join(5000);
-            String out = outBuf.toString(StandardCharsets.UTF_8);
+            String out = new String(outBuf.toByteArray(), StandardCharsets.UTF_8);
             if (code == 0 && Files.exists(libOut)) {
                 KBoxLog.info(TAG, "Native lib built: " + libOut);
                 return new Result(true, libOut, out);
@@ -204,6 +205,20 @@ public final class NativeCompiler {
         return sb.toString();
     }
 
+    /** Java-8-safe {@code InputStream.transferTo(OutputStream)} replacement. */
+    private static void drain(InputStream in, java.io.ByteArrayOutputStream out) throws IOException {
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+    }
+
+    /** Java-8-safe {@code InputStream.readAllBytes()} replacement. */
+    private static byte[] readAll(InputStream in) throws IOException {
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+        drain(in, bo);
+        return bo.toByteArray();
+    }
+
     /**
      * Assembles C source for interpreter-based stubs (no JNI_OnLoad needed —
      * the interpreter is linked directly). Each stub is a self-contained C
@@ -221,18 +236,7 @@ public final class NativeCompiler {
     public static String assembleInterpSource(List<JniBytecodeInterp.InterpFn> fns,
                                               java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts) {
         StringBuilder sb = new StringBuilder();
-        sb.append("/* KBox-JNIC interpreter-based stubs. Do not edit. */\n");
-        sb.append("#include <jni.h>\n");
-        sb.append("#include <stdint.h>\n");
-        sb.append("#include <stdlib.h>\n");
-        sb.append("#include <string.h>\n");
-        sb.append("#include <stdio.h>\n");
-        // <math.h> supplies the NAN / INFINITY macros used by generated hex-float
-        // and special-value constant arrays (NaN, +-Infinity LDC constants).
-        sb.append("#include <math.h>\n\n");
-        // Forward-declare the v3 interpreter (encrypted bytecode + execution erasure).
-        sb.append("typedef union { jint i; jlong l; jfloat f; jdouble d; } kbox_value_t;\n");
-        sb.append("kbox_value_t kbox_jvm_interp_v3(JNIEnv*, jobject, const unsigned char*, int, void**, int, int, uint8_t*);\n\n");
+        appendInterpHeader(sb);
         for (JniBytecodeInterp.InterpFn fn : fns) {
             sb.append(fn.cBody).append("\n");
         }
@@ -383,6 +387,194 @@ public final class NativeCompiler {
         }
         sb.append("\n");
         return sb.toString();
+    }
+
+    /** Common include block + interpreter forward-declaration for JNIC C files. */
+    private static void appendInterpHeader(StringBuilder sb) {
+        sb.append("/* KBox-JNIC interpreter-based stubs. Do not edit. */\n");
+        sb.append("#include <jni.h>\n");
+        sb.append("#include <stdint.h>\n");
+        sb.append("#include <stdlib.h>\n");
+        sb.append("#include <string.h>\n");
+        sb.append("#include <stdio.h>\n");
+        // <math.h> supplies the NAN / INFINITY macros used by generated hex-float
+        // and special-value constant arrays (NaN, +-Infinity LDC constants).
+        sb.append("#include <math.h>\n\n");
+        // Forward-declare the v3 interpreter (encrypted bytecode + execution erasure).
+        sb.append("typedef union { jint i; jlong l; jfloat f; jdouble d; } kbox_value_t;\n");
+        sb.append("kbox_value_t kbox_jvm_interp_v3(JNIEnv*, jobject, const unsigned char*, int, void**, int, int, uint8_t*);\n\n");
+    }
+
+    /**
+     * Sharded variant of {@link #assembleInterpSource}: splits the interpreter
+     * stubs into {@code shards} independent C files (plus one main file holding
+     * {@code JNI_OnLoad} + {@code registerNatives0}). Each shard compiles in its
+     * own gcc process, so the JNIC stage scales across cores instead of gcc
+     * chewing on one giant file sequentially.
+     *
+     * <p>The main file declares one {@code void kbox_register_partN(JNIEnv*, jclass,
+     * const char* _targetName)} per shard; {@code registerNatives0} resolves the
+     * target class name once and fans out to every part, each of which matches its
+     * own class groups (same {@code strcmp} logic as the monolithic source). Stub
+     * functions stay {@code static} inside their shard; part functions are
+     * non-static but never JNIEXPORTed, so {@code -fvisibility=hidden} keeps them
+     * out of the dynamic symbol table.
+     *
+     * @return shards + 1 sources; index 0 is the main file, 1..shards the parts.
+     */
+    public static java.util.List<String> assembleInterpSourceSharded(
+            List<JniBytecodeInterp.InterpFn> fns,
+            java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts,
+            int shards) {
+        if (shards <= 1) {
+            return java.util.Collections.singletonList(
+                    assembleInterpSource(fns, classMethodCounts));
+        }
+        shards = Math.min(shards, Math.max(1, fns.size()));
+        // Deterministic round-robin split (build-reproducible).
+        @SuppressWarnings("unchecked")
+        java.util.List<JniBytecodeInterp.InterpFn>[] groups = new java.util.List[shards];
+        for (int i = 0; i < shards; i++) groups[i] = new java.util.ArrayList<>();
+        for (int i = 0; i < fns.size(); i++) groups[i % shards].add(fns.get(i));
+
+        java.util.List<String> out = new java.util.ArrayList<>();
+        // ---- Main file: header + part decls + JNI_OnLoad + registerNatives0. ----
+        StringBuilder main = new StringBuilder();
+        appendInterpHeader(main);
+        main.append("void kbox_register_part0(JNIEnv*, jclass, const char*);\n");
+        for (int i = 1; i < shards; i++) {
+            main.append("void kbox_register_part").append(i).append("(JNIEnv*, jclass, const char*);\n");
+        }
+        main.append("\n/* === JNI_OnLoad: minimal. === */\n");
+        main.append("JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {\n");
+        main.append("  (void)reserved;\n");
+        main.append("  return JNI_VERSION_1_8;\n");
+        main.append("}\n\n");
+        main.append("/* === registerNatives0 (called from Java). === */\n");
+        main.append("JNIEXPORT void JNICALL Java_com_kbox_runtime_NativeLoader_registerNatives0\n");
+        main.append("    (JNIEnv* env, jclass loaderClass, jclass targetClass) {\n");
+        main.append("  (void)loaderClass;\n");
+        main.append("  char _targetName[512] = {0};\n");
+        main.append("  {\n");
+        main.append("    jclass _clsCls = (*env)->GetObjectClass(env, targetClass);\n");
+        main.append("    jmethodID _nm = _clsCls ? (*env)->GetMethodID(env, _clsCls, \"getName\", \"()Ljava/lang/String;\") : NULL;\n");
+        main.append("    jstring _ns = _nm ? (jstring)(*env)->CallObjectMethod(env, targetClass, _nm) : NULL;\n");
+        main.append("    const char* _c = _ns ? (*env)->GetStringUTFChars(env, _ns, NULL) : NULL;\n");
+        main.append("    if (_c) { strncpy(_targetName, _c, sizeof(_targetName)-1); (*env)->ReleaseStringUTFChars(env, _ns, _c); }\n");
+        main.append("    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+        main.append("  }\n");
+        for (int i = 0; i < shards; i++) {
+            main.append("  kbox_register_part").append(i).append("(env, targetClass, _targetName);\n");
+        }
+        main.append("}\n\n");
+        out.add(main.toString());
+
+        // ---- Shard files: header + stubs + part register + JNI-named exports. ----
+        for (int i = 0; i < shards; i++) {
+            StringBuilder sb = new StringBuilder();
+            appendInterpHeader(sb);
+            for (JniBytecodeInterp.InterpFn fn : groups[i]) {
+                sb.append(fn.cBody).append("\n");
+            }
+            // Group this shard's fns by class and emit the part register fn.
+            java.util.Map<String, java.util.List<JniBytecodeInterp.InterpFn>> byClass = new java.util.LinkedHashMap<>();
+            for (JniBytecodeInterp.InterpFn f : groups[i]) {
+                byClass.computeIfAbsent(f.javaClass, k -> new java.util.ArrayList<>()).add(f);
+            }
+            sb.append("void kbox_register_part").append(i).append("(JNIEnv* env, jclass targetClass, const char* _targetName) {\n");
+            int regIdx = 0;
+            for (java.util.Map.Entry<String, java.util.List<JniBytecodeInterp.InterpFn>> e : byClass.entrySet()) {
+                java.util.List<JniBytecodeInterp.InterpFn> group = e.getValue();
+                String dotted = e.getKey().replace('/', '.');
+                sb.append("  static JNINativeMethod _m").append(regIdx).append("[] = {\n");
+                for (JniBytecodeInterp.InterpFn f : group) {
+                    sb.append("    { \"").append(escapeC(f.javaName)).append("\", \"")
+                            .append(escapeC(f.javaDesc)).append("\", (void*)").append(f.symbol).append(" },\n");
+                }
+                sb.append("  };\n");
+                sb.append("  if (strcmp(_targetName, \"").append(escapeC(dotted)).append("\") == 0) {\n");
+                sb.append("    if ((*env)->RegisterNatives(env, targetClass, _m").append(regIdx)
+                        .append(", ").append(group.size()).append(") != 0) {\n");
+                sb.append("      if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+                sb.append("    }\n");
+                sb.append("  }\n");
+                regIdx++;
+            }
+            sb.append("}\n\n");
+            // JNI-named exports for this shard (identical logic to the monolithic path).
+            sb.append("/* === JNI-named exports (correct param types). === */\n");
+            for (JniBytecodeInterp.InterpFn fn : groups[i]) {
+                emitShardExport(sb, fn, classMethodCounts);
+            }
+            sb.append("\n");
+            out.add(sb.toString());
+        }
+        return out;
+    }
+
+    /** Emits the JNI-named export (+ long-name wrapper) for one interp fn. */
+    private static void emitShardExport(StringBuilder sb, JniBytecodeInterp.InterpFn fn,
+                                        java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts) {
+        boolean overloaded = false;
+        java.util.Map<String, Integer> nameCounts = classMethodCounts.get(fn.javaClass);
+        if (nameCounts != null && nameCounts.getOrDefault(fn.javaName, 0) > 1) {
+            overloaded = true;
+        }
+        String shortSym = "Java_" + mangleJni(fn.javaClass) + "_" + mangleJni(fn.javaName);
+        String longSym = shortSym + jniSigSuffix(fn.javaDesc);
+        String bodySym = overloaded ? longSym : shortSym;
+        StringBuilder cParams = new StringBuilder("JNIEnv* env, jclass cls");
+        StringBuilder callArgs = new StringBuilder("env, NULL");
+        int argIdx = 0;
+        if (fn.javaDesc != null && fn.javaDesc.startsWith("(")) {
+            int endIdx = fn.javaDesc.indexOf(')');
+            for (int i = 1; i < endIdx; ) {
+                char ch = fn.javaDesc.charAt(i);
+                if (ch == '[') {
+                    cParams.append(", jobjectArray a").append(argIdx);
+                    while (i < endIdx && fn.javaDesc.charAt(i) == '[') i++;
+                    if (i < endIdx && fn.javaDesc.charAt(i) == 'L') {
+                        while (i < endIdx && fn.javaDesc.charAt(i) != ';') i++;
+                    }
+                    i++;
+                } else if (ch == 'L') {
+                    cParams.append(", jobject a").append(argIdx);
+                    while (i < endIdx && fn.javaDesc.charAt(i) != ';') i++;
+                    i++;
+                } else {
+                    if (ch == 'Z') cParams.append(", jboolean a").append(argIdx);
+                    else if (ch == 'B') cParams.append(", jbyte a").append(argIdx);
+                    else if (ch == 'C') cParams.append(", jchar a").append(argIdx);
+                    else if (ch == 'S') cParams.append(", jshort a").append(argIdx);
+                    else if (ch == 'I') cParams.append(", jint a").append(argIdx);
+                    else if (ch == 'J') cParams.append(", jlong a").append(argIdx);
+                    else if (ch == 'F') cParams.append(", jfloat a").append(argIdx);
+                    else if (ch == 'D') cParams.append(", jdouble a").append(argIdx);
+                    else cParams.append(", jobject a").append(argIdx);
+                    i++;
+                }
+                callArgs.append(", (").append(cArgType(fn.javaDesc, argIdx)).append(")a").append(argIdx);
+                argIdx++;
+            }
+        }
+        String returnPart = fn.javaDesc.substring(fn.javaDesc.indexOf(')') + 1);
+        String retC;
+        if ("V".equals(returnPart)) retC = "void";
+        else if ("I".equals(returnPart) || "Z".equals(returnPart)
+                || "B".equals(returnPart) || "C".equals(returnPart)
+                || "S".equals(returnPart)) retC = "jint";
+        else if ("J".equals(returnPart)) retC = "jlong";
+        else if ("F".equals(returnPart)) retC = "jfloat";
+        else if ("D".equals(returnPart)) retC = "jdouble";
+        else retC = "jobject";
+        emitJniExport(sb, retC, bodySym, cParams.toString(), callArgs.toString(), returnPart, fn.symbol);
+        if (!overloaded) {
+            if (!longSym.equals(shortSym)) {
+                emitJniWrapper(sb, retC, longSym, cParams.toString(), callArgs.toString(), shortSym, returnPart);
+            }
+        } else if (jniSigSuffix(fn.javaDesc).isEmpty()) {
+            emitJniWrapper(sb, retC, shortSym + "__", cParams.toString(), callArgs.toString(), shortSym, returnPart);
+        }
     }
 
     /** Emits a JNI-exported function body that forwards to the interpreter stub. */
@@ -542,7 +734,7 @@ public final class NativeCompiler {
             KBoxLog.warn(TAG, "No interpreter source found in resources");
             return null;
         }
-        byte[] data = is.readAllBytes();
+        byte[] data = readAll(is);
         is.close();
         String src = com.kbox.core.nativeshell.NativeShellGuard.guardSource(
                 new String(data, StandardCharsets.UTF_8));
@@ -565,7 +757,7 @@ public final class NativeCompiler {
             KBoxLog.warn(TAG, "kbox_vmp_core.c not found in resources (VM原生化 unavailable)");
             return null;
         }
-        byte[] data = is.readAllBytes();
+        byte[] data = readAll(is);
         is.close();
         String src = com.kbox.core.nativeshell.NativeShellGuard.guardSource(
                 new String(data, StandardCharsets.UTF_8));
@@ -622,7 +814,7 @@ public final class NativeCompiler {
         cmd.add("-fPIC");
         cmd.add("-fvisibility=hidden"); // hide non-JNIEXPORT symbols
         cmd.add("-s");                 // strip .symtab: no static identifier names
-        cmd.add("-O2");
+        cmd.add("-O1");                // -O1 vs -O2: ~2-3x faster gcc, ~same throughput
         cmd.add("-I"); cmd.add(normalizeJdkInclude());
         String plat = platformInclude();
         if (plat != null) {
@@ -633,7 +825,7 @@ public final class NativeCompiler {
         if (cc.toLowerCase(Locale.ROOT).endsWith("cl.exe") || cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
             cmd.clear();
             cmd.add(cc);
-            cmd.add("/LD"); cmd.add("/O2");
+            cmd.add("/LD"); cmd.add("/O1");
             cmd.add("/I"); cmd.add(normalizeJdkInclude());
             if (plat != null) { String p = normalizeJdkInclude() + "\\" + plat; cmd.add("/I"); cmd.add(p); }
             for (Path s : sources) cmd.add(s.toString());
@@ -658,13 +850,13 @@ public final class NativeCompiler {
             java.io.ByteArrayOutputStream outBuf = new java.io.ByteArrayOutputStream();
             Thread drainer = new Thread(() -> {
                 try {
-                    p.getInputStream().transferTo(outBuf);
+                    drain(p.getInputStream(), outBuf);
                 } catch (IOException ignored) {}
             });
             drainer.start();
             int code = p.waitFor();
             drainer.join(5000);
-            String out = outBuf.toString(StandardCharsets.UTF_8);
+            String out = new String(outBuf.toByteArray(), StandardCharsets.UTF_8);
             if (code == 0 && Files.exists(libOut)) {
                 KBoxLog.info(TAG, "Native lib built: " + libOut);
                 return new Result(true, libOut, out);
@@ -672,6 +864,128 @@ public final class NativeCompiler {
             return new Result(false, null, out);
         } catch (IOException | InterruptedException e) {
             return new Result(false, null, "Multi-compile failed: " + e);
+        }
+    }
+
+    /**
+     * Sharded compilation for JNIC: compiles every C file to an object file
+     * in parallel (one gcc process per file, capped at the CPU count), then
+     * links all objects into the shared library in a single gcc invocation.
+     *
+     * <p>This is the main JNIC speedup for large inputs: the previous path fed
+     * one multi-megabyte stub file into a single gcc at -O2 (50min for
+     * LiquidBounce-sized jars). Parallel -c at -O1 turns that into roughly one
+     * max-file compile plus link, i.e. minutes. MSVC keeps the monolithic path
+     * (the .obj link syntax differs and cl is rarely the configured compiler).
+     */
+    public Result compileSharded(List<Path> cFiles, Path outputDir, String libName) {
+        String cc = pickCompiler();
+        if (cc == null) {
+            return new Result(false, null, "No C compiler found.");
+        }
+        if (cc.toLowerCase(Locale.ROOT).endsWith("cl.exe") || cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
+            return compileMulti(cFiles, outputDir, libName);
+        }
+        Path libOut = outputDir.resolve(libFileName(libName));
+        List<String> base = new ArrayList<>();
+        base.add(cc);
+        base.add("-O1");
+        base.add("-fPIC");
+        base.add("-fvisibility=hidden");
+        base.add("-I"); base.add(normalizeJdkInclude());
+        String plat = platformInclude();
+        if (plat != null) {
+            Path p = Paths.get(normalizeJdkInclude()).resolve(plat);
+            base.add("-I"); base.add(p.toString());
+        }
+        int cores = Runtime.getRuntime().availableProcessors();
+        int workers = Math.max(1, Math.min(cores, cFiles.size()));
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(workers);
+        List<Path> objs = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+        final java.util.concurrent.atomic.AtomicReference<String> firstErr =
+                new java.util.concurrent.atomic.AtomicReference<>(null);
+        try {
+            for (final Path c : cFiles) {
+                futures.add(pool.submit(() -> {
+                    if (firstErr.get() != null) return;
+                    Path obj = outputDir.resolve(c.getFileName() + ".o");
+                    List<String> cmd = new ArrayList<>(base);
+                    cmd.add("-c");
+                    cmd.add(c.toString());
+                    cmd.add("-o"); cmd.add(obj.toString());
+                    try {
+                        ProcessBuilder pb = new ProcessBuilder(cmd);
+                        pb.redirectErrorStream(true);
+                        enrichPath(pb, cc);
+                        Process p = pb.start();
+                        java.io.ByteArrayOutputStream outBuf = new java.io.ByteArrayOutputStream();
+                        Thread drainer = new Thread(() -> {
+                            try { drain(p.getInputStream(), outBuf); }
+                            catch (IOException ignored) {}
+                        });
+                        drainer.start();
+                        int code = p.waitFor();
+                        drainer.join(5000);
+                        if (code != 0) {
+                            firstErr.compareAndSet(null, "shard compile failed for "
+                                    + c.getFileName() + ":\n" + new String(outBuf.toByteArray(), StandardCharsets.UTF_8));
+                            return;
+                        }
+                        objs.add(obj);
+                    } catch (IOException | InterruptedException e) {
+                        firstErr.compareAndSet(null, "shard compile error for "
+                                + c.getFileName() + ": " + e);
+                    }
+                }));
+            }
+            for (java.util.concurrent.Future<?> f : futures) f.get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return new Result(false, null, "Sharded compile interrupted: " + ie);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            firstErr.compareAndSet(null, "shard task failed: " + ee.getCause());
+        } finally {
+            pool.shutdownNow();
+        }
+        if (firstErr.get() != null) {
+            return new Result(false, null, firstErr.get());
+        }
+        if (objs.isEmpty()) {
+            return new Result(false, null, "No object files produced");
+        }
+        // Link all objects in one pass.
+        List<String> link = new ArrayList<>();
+        link.add(cc);
+        link.add("-shared");
+        link.add("-O1");
+        link.add("-s");
+        for (Path o : objs) link.add(o.toString());
+        link.add("-o"); link.add(libOut.toString());
+        KBoxLog.info(TAG, "Linking native lib from " + objs.size() + " objects: "
+                + String.join(" ", link));
+        try {
+            ProcessBuilder pb = new ProcessBuilder(link);
+            pb.redirectErrorStream(true);
+            enrichPath(pb, cc);
+            Process p = pb.start();
+            java.io.ByteArrayOutputStream outBuf = new java.io.ByteArrayOutputStream();
+            Thread drainer = new Thread(() -> {
+                try { drain(p.getInputStream(), outBuf); }
+                catch (IOException ignored) {}
+            });
+            drainer.start();
+            int code = p.waitFor();
+            drainer.join(5000);
+            String out = new String(outBuf.toByteArray(), StandardCharsets.UTF_8);
+            if (code == 0 && Files.exists(libOut)) {
+                KBoxLog.info(TAG, "Native lib built (sharded): " + libOut);
+                return new Result(true, libOut, out);
+            }
+            return new Result(false, null, out);
+        } catch (IOException | InterruptedException e) {
+            return new Result(false, null, "Sharded link failed: " + e);
         }
     }
 

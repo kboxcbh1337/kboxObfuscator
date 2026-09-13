@@ -52,8 +52,15 @@ public final class AutoJnicVmpSelector {
     private static final int VMP_MIN_SIZE = 5;
     private static final int VMP_MAX_SIZE = 50;
     // Layering boundary when BOTH coverage modes are full: JNIC takes
-    // size >= this, VMP takes size < this (JNIC_LAYER_MIN - 1 = VMP_MAX_SIZE).
-    private static final int JNIC_LAYER_MIN = VMP_MAX_SIZE;
+    // size >= this, VMP takes size < this.
+    //
+    // Was VMP_MAX_SIZE (50), which meant a jar needed methods of 50+
+    // instructions to get ANY native coverage: on an 8.6k-class Kotlin mod that
+    // yielded just 321 methods / 44 classes (~0.5%), so the "JNIC" feature looked
+    // absent from the produced jar. 20 moves the medium-bodied methods
+    // (the bulk of real application logic) into the native bucket while small
+    // helpers stay virtualized by VMP.
+    private static final int JNIC_LAYER_MIN = 20;
 
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
@@ -97,7 +104,7 @@ public final class AutoJnicVmpSelector {
                 ? Math.max(JNIC_MIN_SIZE, JNIC_LAYER_MIN)
                 : (cfg.isJnicFullCoverage() ? 1 : JNIC_MIN_SIZE);
         int maxCount = cfg.isJnicFullCoverage() ? Integer.MAX_VALUE : JNIC_MAX;
-        List<MethodEntry> candidates = collectCandidates(minSize, -1);
+        List<MethodEntry> candidates = collectCandidates(minSize, -1, true);
         // VMP selects FIRST; a method already virtualized by VMP must never be
         // sunk to native afterwards — otherwise it ends up BOTH marked native AND
         // re-wrapped with a VMP execute stub (a native method carrying a Code
@@ -166,7 +173,7 @@ public final class AutoJnicVmpSelector {
         int maxSize = layered ? JNIC_LAYER_MIN - 1
                 : (cfg.isVmpFullCoverage() ? -1 : VMP_MAX_SIZE);
         int maxCount = cfg.isVmpFullCoverage() ? Integer.MAX_VALUE : VMP_MAX;
-        List<MethodEntry> candidates = collectCandidates(minSizePlus0, maxSize);
+        List<MethodEntry> candidates = collectCandidates(minSizePlus0, maxSize, false);
         if (candidates.isEmpty()) {
             KBoxLog.warn(TAG, "VMP auto-select: no eligible methods found");
             return;
@@ -278,7 +285,7 @@ public final class AutoJnicVmpSelector {
 
     // ---- Candidate collection ----
 
-    private List<MethodEntry> collectCandidates(int minSize, int maxSize) {
+    private List<MethodEntry> collectCandidates(int minSize, int maxSize, boolean forJnic) {
         List<MethodEntry> out = new ArrayList<>();
         for (ClassNode cn : graph.getClasses().values()) {
             // VMP/JNIC only replace a method's BODY; they never rename the class
@@ -288,7 +295,10 @@ public final class AutoJnicVmpSelector {
             // zero VMP/JNIC coverage. Still excluded here: library, out-of-scope
             // and KBox-runtime classes (see shouldProtectClass).
             if (!cfg.shouldProtectClass(cn.name)) continue;
-            if (!cfg.isNativeEligible(cn.name)) continue;
+            // Split eligibility: JNIC honours jnicExcludePrefixes, VMP honours
+            // vmpExcludePrefixes; both honour the shared native blacklist.
+            boolean eligible = forJnic ? cfg.isJnicEligible(cn.name) : cfg.isVmpEligible(cn.name);
+            if (!eligible) continue;
             for (MethodNode mn : cn.methods) {
                 if (!isEligible(cn.name, mn)) continue;
                 int size = countInstructions(mn);
@@ -307,6 +317,16 @@ public final class AutoJnicVmpSelector {
      */
     @SuppressWarnings("unchecked")
     private boolean isEligible(String owner, MethodNode mn) {
+        // Interfaces and annotation types may only declare `public static final`
+        // fields, so neither VMP nor JNIC can inject the state they need
+        // (VMP's `$vmp_*` fields are private|static -> ClassFormatError: Illegal
+        // field modifiers ...: 0xA; seen on com/formdev/flatlaf/FlatSystemProperties).
+        // Their static methods therefore stay ordinary Java.
+        ClassNode ownerNode = graph.getClasses().get(owner);
+        if (ownerNode != null
+                && (ownerNode.access & (Opcodes.ACC_INTERFACE | 0x2000 /* ACC_ANNOTATION */)) != 0) {
+            return false;
+        }
         // Skip abstract/native/bridge — no body to protect
         int acc = mn.access;
         if ((acc & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) != 0)

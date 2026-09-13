@@ -11,6 +11,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -48,6 +49,21 @@ public final class ParallelClassProcessor {
      */
     public static int processAll(ClassGraph graph, ProtectionConfig cfg,
                                  ClassOp op, int threads) {
+        return processAll(graph, cfg, op, threads, 0);
+    }
+
+    /**
+     * Same as {@link #processAll(ClassGraph, ProtectionConfig, ClassOp, int)}
+     * but bounds how many transformations run at once via a semaphore. The
+     * {@code maxConcurrent} cap is orthogonal to {@code threads} (the pool
+     * size): a heavy memory-bound pass (control-flow obfuscation, whose lazy
+     * rollback snapshots + COMPUTE_FRAMES validation buffers dominate heap on
+     * big jars) can fan out over the full pool but only do {@code maxConcurrent}
+     * at any instant, keeping peak transient memory bounded so a 10k-class
+     * run does not OOM. {@code maxConcurrent <= 0} disables the cap.
+     */
+    public static int processAll(ClassGraph graph, ProtectionConfig cfg,
+                                 ClassOp op, int threads, int maxConcurrent) {
         int cores = Runtime.getRuntime().availableProcessors();
         int poolSize = threads > 0 ? threads : Math.max(1, cores);
         if (poolSize <= 1) {
@@ -68,13 +84,19 @@ public final class ParallelClassProcessor {
             if (cfg.shouldProtectClass(cn.name)) targets.add(cn);
         }
         ExecutorService pool = Executors.newFixedThreadPool(poolSize);
+        final Semaphore gate = maxConcurrent > 0 ? new Semaphore(maxConcurrent) : null;
         AtomicInteger done = new AtomicInteger();
         AtomicInteger failed = new AtomicInteger();
         List<Future<?>> futures = new ArrayList<>();
         for (final ClassNode cn : targets) {
             futures.add(pool.submit(() -> {
                 try {
-                    op.process(cn);
+                    if (gate != null) gate.acquireUninterruptibly();
+                    try {
+                        op.process(cn);
+                    } finally {
+                        if (gate != null) gate.release();
+                    }
                 } catch (Throwable t) {
                     failed.incrementAndGet();
                     KBoxLog.warn(TAG, "Class op failed for " + cn.name + ": " + t.getMessage());
@@ -91,7 +113,8 @@ public final class ParallelClassProcessor {
         }
         KBoxLog.info(TAG, "Processed " + done.get() + " classes in parallel"
                 + (failed.get() > 0 ? " (" + failed.get() + " failed)" : "")
-                + " — pool=" + poolSize);
+                + " — pool=" + poolSize
+                + (gate != null ? ", maxConcurrent=" + maxConcurrent : ""));
         return done.get();
     }
 }

@@ -109,6 +109,22 @@ public final class ResourceGuardLauncher {
         // 3b. Configure class decryption if class encryption is enabled.
         if (classSeed != null && encryptedClassNames != null) {
             guard.setClassDecryption(classSeed, encryptedClassNames);
+            // Tell Spring's classpath scanner to SKIP class files it cannot parse
+            // instead of aborting the whole scan.
+            //
+            // Encrypted class bodies (masked-KBCE header) are served as resources
+            // straight out of the jar, which is what a "classpath*:" component scan
+            // reads — it never calls loadClass, so the guard loader cannot decrypt
+            // for it. Spring's own ASM reader then rejects the ciphertext with
+            // "Incompatible class format ... during classpath scanning" and the
+            // context fails to start, losing every @Component/@Service/@Repository.
+            // With this flag the unparseable entries are ignored, so the classes
+            // that must be discoverable (framework annotations, Spring Data
+            // repositories — which the packager keeps in plaintext for exactly this
+            // reason) are found normally while everything else stays encrypted.
+            if (System.getProperty("spring.classformat.ignore") == null) {
+                System.setProperty("spring.classformat.ignore", "true");
+            }
         }
 
         // 3c. Configure JNIC class list from build-time metadata (already read above).

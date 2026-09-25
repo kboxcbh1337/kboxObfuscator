@@ -206,12 +206,14 @@ public final class JnicOrchestrator {
             return new Result(null, null, true, failures);
         }
 
-        // Pack the native lib.
+        // Pack the native lib. 先做 kboXShield PE 加壳（函数级虚拟化/变异/平坦化），
+        // 再 KBNL 打包 → 产物是「KBNL 外层容器 + 内层 PE 壳/VM」两层；加壳失败自动降级。
         byte[] blob = null;
         try {
-            NativePacker.Packed packed = NativePacker.pack(cres.library);
+            NativePacker.Packed packed = NativePacker.packShielded(cres.library, workDir, "jnic");
             blob = packed.blob;
-            KBoxLog.info(TAG, "Native lib packed: " + blob.length + " bytes (blob)");
+            KBoxLog.info(TAG, "Native lib packed: " + blob.length + " bytes (blob)"
+                    + (packed.shielded ? " [inner PE shell + VM]" : ""));
         } catch (Exception ex) {
             KBoxLog.warn(TAG, "Native packing failed: " + ex.getMessage()
                     + " — falling back to raw lib copy");

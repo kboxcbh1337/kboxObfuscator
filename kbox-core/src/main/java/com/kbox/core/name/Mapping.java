@@ -24,9 +24,18 @@ public final class Mapping {
 
     private int seq = 0;
 
+    /** 歧义哨兵：同一 owner#name 下不同描述符映射到不同新名时使用。 */
+    private static final String AMBIGUOUS = "\u0000AMBIGUOUS";
+    /** "owner#name" -> 新名（歧义时记 {@link #AMBIGUOUS}）。 */
+    private final Map<String, String> methodByOwnerName = new HashMap<>();
+
     public void mapClass(String oldName, String newName) { classes.put(oldName, newName); }
     public void mapMethod(String owner, String name, String desc, String newName) {
         methods.put(key(owner, name, desc), newName);
+        String k2 = owner + "#" + name;
+        String prev = methodByOwnerName.get(k2);
+        if (prev == null) methodByOwnerName.put(k2, newName);
+        else if (!prev.equals(newName)) methodByOwnerName.put(k2, AMBIGUOUS);
     }
     public void mapField(String owner, String name, String desc, String newName) {
         fields.put(key(owner, name, desc), newName);
@@ -43,6 +52,19 @@ public final class Mapping {
     public boolean hasClass(String n) { return classes.containsKey(n); }
     public boolean hasMethod(String owner, String n, String d) { return methods.containsKey(key(owner, n, d)); }
     public boolean hasField(String owner, String n, String d) { return fields.containsKey(key(owner, n, d)); }
+
+    /**
+     * 忽略描述符的方法改名查询：返回 {@code owner#name} 的新名。
+     *
+     * <p>用途：{@code invokedynamic}（LambdaMetafactory）把「函数式接口的 SAM 方法名」
+     * 放在 indy 的 name 上而<b>不在</b> bsmArgs 里，因此重命名阶段拿不到描述符，
+     * 只能用 (owner, name) 查表。若同一名字对应多个描述符且新名不一致，返回
+     * {@code null} 以避免误改。</p>
+     */
+    public String mapMethodByName(String owner, String name) {
+        String v = methodByOwnerName.get(owner + "#" + name);
+        return (v == null || AMBIGUOUS.equals(v)) ? null : v;
+    }
 
     public Map<String, String> getClassMap() { return classes; }
     public Map<String, String> getMethodMap() { return methods; }

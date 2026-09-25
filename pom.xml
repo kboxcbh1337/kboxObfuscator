@@ -16,7 +16,6 @@
         <module>kbox-cli</module>
         <module>kbox-gui</module>
         <module>kbox-maven-plugin</module>
-        <module>kbox-testapp</module>
     </modules>
 
     <properties>

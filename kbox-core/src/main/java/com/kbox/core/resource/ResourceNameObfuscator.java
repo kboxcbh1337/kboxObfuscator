@@ -56,7 +56,7 @@ public final class ResourceNameObfuscator {
 
         for (Map.Entry<String, byte[]> e : graph.getResources().entrySet()) {
             String path = e.getKey();
-            if (shouldSkip(path)) continue;
+            if (shouldSkip(path, e.getValue())) continue;
             if (matchesAny(path, excludePatterns)) {
                 // Keep original path + content verbatim.
                 mapping.map(path, path, false);
@@ -78,11 +78,17 @@ public final class ResourceNameObfuscator {
      * or container reads directly, plus the KBox-managed services entries that
      * {@code ResourceReferenceUpdater} already handles.
      */
-    private boolean shouldSkip(String path) {
+    private boolean shouldSkip(String path, byte[] bytes) {
         if (path.equals("META-INF/MANIFEST.MF")) return true;
         if (path.startsWith("META-INF/services/")) return true;       // handled by ResourceReferenceUpdater
         if (path.startsWith("META-INF/kbox/")) return true;          // KBox internal
         if (path.startsWith("org/springframework/boot/loader/")) return true;
+        // Jar 内自带原生库在 protectNativeLibs 开启时由 NativeLibPacker 接管：
+        // 保留原始路径（应用按原名 System.load 依赖它），整体加密进 natlib blob，
+        // 不再作为普通资源被重命名/加密（否则逻辑路径错位，运行时无法按名加载）。
+        // 识别按内容魔数（扩展名优先），故以 *.bin/*.dat 命名的原生库同样受保护。
+        if (cfg.isProtectNativeLibs()
+                && com.kbox.core.packaging.NativeLibPacker.isNativeLibResource(path, bytes)) return true;
         // spring.factories & AutoConfiguration.imports are handled by ResourceReferenceUpdater
         // (content rewritten), but their *file name* stays unchanged.
         if (path.endsWith("spring.factories")) return true;

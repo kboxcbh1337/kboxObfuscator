@@ -794,8 +794,13 @@ public final class NativeCompiler {
             } catch (Exception ignored) {}
             return null;
         }
-        byte[] blob = com.kbox.core.jnic.NativePacker.pack(cres.library).blob;
-        KBoxLog.info(TAG, "VMP native lib packed: " + blob.length + " bytes (vmp.bin)");
+        // 先过 kboXShield（函数级虚拟化/变异/平坦化）再 KBNL：VM 内核不再以明文形式
+        // 存在于 KBNL 载荷内。加壳失败自动降级为直接 KBNL。
+        com.kbox.core.jnic.NativePacker.Packed packed =
+                com.kbox.core.jnic.NativePacker.packShielded(cres.library, workDir, "vmp");
+        byte[] blob = packed.blob;
+        KBoxLog.info(TAG, "VMP native lib packed: " + blob.length + " bytes (vmp.bin)"
+                + (packed.shielded ? " [inner PE shell + VM]" : ""));
         return blob;
     }
 

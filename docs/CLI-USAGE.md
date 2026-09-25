@@ -36,6 +36,7 @@ java -jar kbox-protector.jar --gui
 | `--include`| —    | `PATTERN` | 类包含模式（可重复）。仅 `SELECTIVE` 模式下生效 |
 | `--exclude`| —    | `PATTERN` | 类排除模式（可重复）。`SELECTIVE` 与 `EXCLUDE` 模式下生效 |
 | `--list-presets` | — | flag | 列出所有可用的 Minecraft Mod 预设 |
+| `--shield` | — | `IN.exe OUT.exe` | **kboXShield 独立功能线**：对 Windows PE 加壳（不读 `--input/--output`，详见第 11 节） |
 | `--help`   | `-h` | flag   | 显示帮助 |
 
 > 字符串模式使用 Glob 语法：`**` = 任意多级包路径，`*` = 单层包内通配。
@@ -212,3 +213,78 @@ A：可以。KBox 会保留 `BOOT-INF/` 结构与 `Main-Class`，仅混淆 `BOOT
 
 **Q：Minecraft 模组用哪个预设？**
 A：NeoForge / Forge 选对应预设；Fabric 选 `FABRIC`；含 Mixin 的模组额外用 `--scope EXCLUDE --exclude <mixin 包路径>` 保护 mixin 类。
+
+---
+
+## 11. kboXShield PE 加壳（`--shield` / HTML UI）
+
+独立功能线：对 **Windows PE（PE32 / PE32+）** 加壳，输出仍可被 Windows 加载的可执行文件。
+与 jar 混淆完全独立，不读取 `--input/--output/--config`。
+
+**两种入口**：
+
+```powershell
+# 1) CLI（默认档：def_flags=0x0003FFFF、def_policy=7、跟随输入架构）
+java -jar kboxObfuscatorb3.jar --shield app.exe app-protected.exe
+
+# 2) HTML UI：页面内「kboXShield · PE 加壳」独立面板
+java -jar kboxObfuscatorb3.jar --gui
+```
+
+**编程入口**（可传选项）：
+
+```java
+ShieldOptions o = new ShieldOptions()
+        .arch(ShieldOptions.ARCH_AUTO)   // AUTO / ARCH_X64 / ARCH_X86（仅“限架构”，不支持跨架构）
+        .defFlags(0x0003FFFF)            // 18 项运行期检测位掩码，0 = 全关
+        .defPolicy(7)                    // bit0 延迟 / bit1 诱饵 / bit2 终止
+        .defDelayLoops(20000000)
+        .defTimingTicks(100000)
+        .virtualizeMarkedSections(true); // 虚拟化 .textvm* 标记节（x64 专用）
+boolean ok = ShieldPacker.pack("app.exe", "app-protected.exe", o, log);
+
+// 产物自检（只读，不执行）
+ShieldVerify.Report rep = ShieldVerify.verify("app-protected.exe", o);
+System.out.println(rep.toText());
+```
+
+### HTML UI 加壳面板
+
+- 输入 PE（`.exe/.dll/.sys`，支持拖拽）/ 输出 PE（留空自动推导 `*-protected.exe`）；
+- **⚡ 智能适配**（`/api/shield/analyze`）：解析 PE 后回填推荐档——
+  架构、`def_flags`、响应策略、延迟/时序阈值、是否虚拟化，并给出理由；
+- 架构（自动 / 仅 x64 / 仅 x86）、虚拟化 `.textvm*`、响应策略三项、延迟循环、时序阈值；
+- **18 项运行期检测位**按功能分组（L1/L2/L3/反VM/反hook/完整性/反注入）逐个开关，
+  并提供「全开 / 全关 / 仅 L1」快捷档，实时显示 `def_flags` 掩码；
+- 打包后自动跑 **PE 结构自检**（`/api/shield` 返回 `verify`），日志与结论一并显示在面板内。
+
+### 行为
+
+- 输入 PE 的原有节全部保留（代码/数据/资源节数据被逐节 ChaCha20 加密，每节独立 nonce）；
+- 追加两个随机命名节：RX 代码节（KboxConfig + stub）与 RWX 数据节（payload/导入表/VM 镜像组/引擎/VmRecs/防御报告/TLS 回调表）；
+- 入口点改写为 stub；`Import Directory` 指向合成导入表（仅 `LoadLibraryA` / `GetProcAddress` / `VirtualProtect`）；
+- `Security/BaseReloc/TLS/LoadConfig/BoundImport/IAT/DelayImport/CLR` 目录清零；
+- **资源节（含 manifest）保持明文**并标记 `PAYLOAD_FLAG_SKIP_DECRYPT`——否则 `CreateProcess`
+  在进程创建阶段解析清单会失败并返回 `ERROR_BAD_EXE_FORMAT (193)`。
+
+### 产物自检项（`ShieldVerify`）
+
+产物大小、PE 解析（arch/节数/SizeOfImage/SizeOfHeaders）、节表几何（raw 区越界、对齐、虚拟区间）、
+入口点是否落在可执行节、合成导入表、必须清零的 8 个目录、资源目录是否保留、
+**KboxConfig 可解密性**（用 stub 的 LCG 算法解 `[0,0x100)`，校验 magic/version/`stub_rva`
+与入口节一致/`oep_rva`/`payload_rva`/`vm_count`，并回显 `def_flags`/`def_policy` 与本次选项比对）。
+
+### 退出码
+
+| 码 | 含义 |
+|---|---|
+| `0` | 加壳成功 |
+| `1` | 打包失败（PE 解析失败 / VM 自检失败 / 架构约束不满足 / 无法读写文件） |
+| `2` | 参数错误（未给出 `<in.exe> <out.exe>`） |
+
+### 注意
+
+- 运行期 stub 的 VM 自检链路仍有已知崩溃（见 README「kboXShield 独立功能线」的“当前边界”），
+  请先在测试样本上验证再加壳；自检只覆盖**静态**结构，不能替代实机运行验证；
+- 反调试启用时不要附加调试器运行产物（stub 会走 `.Ldead` 死循环）；
+- DLL 场景建议把响应策略降为「延迟 + 诱饵」（`def_policy=3`，不终止宿主进程）——UI 的智能适配已自动这样推荐。

@@ -62,7 +62,7 @@ import java.util.Map;
 public final class ProtectionPipeline {
 
     private static final String TAG = "pipeline";
-    private static final int TOTAL_STAGES = 24;
+    private static final int TOTAL_STAGES = 25;
 
     private final Path inputJar;
     private final Path outputJar;
@@ -399,14 +399,14 @@ public final class ProtectionPipeline {
         // and GUI/JNIC-excludes; never breaks a jar. The audit report (weakness
         // catalog driven: other obfuscators' adaptability weaknesses -> hardening)
         // is the deep self-inspection deliverable.
-        com.kbox.core.silentshield.SilentShield.Result ss = null;
+        com.kbox.core.silentshield.AuditOrchestrator.Result ss = null;
         java.util.List<com.kbox.core.silentshield.AuditFinding> allFindings = new ArrayList<>();
         if (cfg.isSilentShield()) {
             KBoxLog.stage(++stage, TOTAL_STAGES, "SilentShield adaptability audit (intelligent)");
             try {
                 Path ssReport = cfg.getSilentShieldReport() != null
                         ? Paths.get(cfg.getSilentShieldReport()) : workDir.resolve("silentshield-report.txt");
-                ss = new com.kbox.core.silentshield.SilentShield().run(graph, cfg, ssReport);
+                ss = new com.kbox.core.silentshield.AuditOrchestrator().run(graph, cfg, ssReport);
                 KBoxLog.info(TAG, "  SilentShield: " + ss.findings.size() + " findings, "
                         + ss.appliedActions + " actions applied, weakness catalog="
                         + com.kbox.core.silentshield.WeaknessCatalog.get().size() + " entries");
@@ -805,6 +805,20 @@ public final class ProtectionPipeline {
             KBoxLog.info(TAG, "  Resource obfuscation disabled, skipping");
         }
 
+        // ---- Stage 13b: Native library packing (protectNativeLibs) ----
+        // 自动扫描 jar 全部目录的 .dll/.so/.dylib：.dll 走 kboXShield PE 完整加壳
+        // （含函数级虚拟化/变异/平坦化），so/dylib 加密降级；产物以 KBNL blob 形式
+        // 交给打包器写入 META-INF/kbox/natlib/，明文原生库不进产物 jar。
+        com.kbox.core.packaging.NativeLibPacker.Result natLibs = null;
+        if (cfg.isProtectNativeLibs()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Native library packing (protectNativeLibs)");
+            natLibs = com.kbox.core.packaging.NativeLibPacker.pack(graph, workDir);
+            if (natLibs == null || natLibs.entries.isEmpty()) {
+                KBoxLog.info(TAG, "  No native libraries found in jar"
+                        + " (扫描 .dll/.so/.dylib 及以 .bin/.dat 等命名的共享库内容魔数)");
+            }
+        }
+
         // ---- Stage 14: Packaging ----
         KBoxLog.stage(++stage, TOTAL_STAGES, "Packaging (write jar + inject runtime + integrity hash)");
         // Phase3-L2a: EPL binning manifest — build once from the FINAL (post-rename)
@@ -829,7 +843,7 @@ public final class ProtectionPipeline {
             Packager packager = new Packager();
             packager.write(inputJar, outputJar, graph, mapping, jnicResult.libraryPath,
                     jnicResult.packedBlob, nativeCryptoBlob, cfg, resMapping, resSeed,
-                    vmpBlob, epdManifest);
+                    vmpBlob, epdManifest, natLibs);
         }
 
         // ---- Stage 14b: Deobfuscation mapping output ----

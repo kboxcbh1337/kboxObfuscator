@@ -1,0 +1,6 @@
+// 顶层构建文件。AGP 版本须与本地 Gradle 兼容：
+//   Gradle 8.13 → AGP 8.5.x
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+}

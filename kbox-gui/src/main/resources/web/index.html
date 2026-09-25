@@ -317,6 +317,7 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
       <label class="toggle"><input type="checkbox" id="autoAdaptMc"><span class="sw"></span><span class="lbl">MC mod 自动适配<span class="sub">fabric.mod.json / mixins 自动 keep</span></span></label>
       <label class="toggle"><input type="checkbox" id="reflectionGate"><span class="sw"></span><span class="lbl">反射门禁<span class="sub">Class.forName 白名单 · 拦截非白名单</span></span></label>
       <label class="toggle"><input type="checkbox" id="jnicEpl"><span class="sw"></span><span class="lbl">JNIC 吃 EPL 选例<span class="sub">native 选例对齐平坦化窗口</span></span></label>
+      <label class="toggle"><input type="checkbox" id="protectNativeLibs"><span class="sw"></span><span class="lbl">原生库加壳<span class="sub">jar 内 .dll/.so/.dylib 自动扫描 · dll 完整加壳+虚拟化</span></span></label>
       <label class="toggle"><input type="checkbox" id="hideCallGraph"><span class="sw"></span><span class="lbl">调用图隐藏<span class="sub">合成间接跳转 + 死代码诱饵</span></span></label>
       <label class="toggle"><input type="checkbox" id="fakeDebugInfo"><span class="sw"></span><span class="lbl">伪造调试信息<span class="sub">假局部变量 / 行号误导</span></span></label>
       <label class="toggle"><input type="checkbox" id="methodInlineExtract"><span class="sw"></span><span class="lbl">方法内联抽取<span class="sub">内联热点 · 拆分大方法</span></span></label>
@@ -336,7 +337,7 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
       </div>
     </div>
     <div class="row">
-      <div class="field"><label>nativeShell 增强壳</label>
+      <div class="field"><label title="对「生成的原生源码」统一生效：M1 全量字符串擦除 / M2 控制流变异与编译器厂商探测 / M3 IAT·导入隐藏（把直接 Win32 导入换成运行期动态解析）。智能适配会依据本轮是否真的产出原生码（VMP native / JNIC / BF native decoder）自动给出推荐档。">nativeShell 增强壳</label>
         <select id="nativeShell"><option value="0">0 · 关</option><option value="1">1 · M1 字符串擦除</option><option value="2">2 · +M2 控制流变异</option><option value="3" selected>3 · +M3 IAT 隐藏</option></select></div>
       <div class="field"><label>BrainfuckShield 强度</label>
         <select id="bfShieldLevel"><option value="0">0 · 关</option><option value="1">1 · 轻</option><option value="2">2 · 中</option><option value="3" selected>3 · 最强</option></select></div>
@@ -380,6 +381,70 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
         <select id="signalPoison"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
       <div class="field"><label>X2 构建签名绑定</label>
         <select id="buildSigBind"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
+    </div>
+    <div style="margin-top:10px;font-size:11.5px;opacity:.72;line-height:1.6">
+      上方数字选项可被 <b>⚡ 智能适配</b> 按输入类型自动回填推荐档（含 <b>nativeShell 增强壳</b>）：
+      独立应用推荐 <b>3 · 最强</b>；含 Mixin 的模组会把改写栈帧的 pass 收敛；
+      无入口库/Spring Boot 因关停 VMP/JNIC/BF，nativeShell 推荐 <b>0</b>（无原生码产出时为 no-op）。
+      勾选 <b>一键全开</b> 则不分类型一律拉满（BF 家族除外，需显式开启）。
+    </div>
+  </section>
+
+  <!-- kboXShield · PE 加壳（独立功能线，与 jar 混淆互不影响） -->
+  <section class="card">
+    <div class="sec-title"><span class="dot"></span>kboXShield · PE 加壳 <small>WINDOWS PE PACKER</small></div>
+    <div class="file-row" id="dropPeIn"><label>输入 PE</label>
+      <input id="peIn" placeholder="D:\path\to\app.exe（支持 .exe / .dll / .sys）" spellcheck="false">
+      <input type="file" id="pickPeIn" accept=".exe,.dll,.sys" style="display:none">
+      <button class="btn btn-ghost" id="btnPeIn">浏览…</button></div>
+    <div class="file-row" id="dropPeOut"><label>输出 PE</label>
+      <input id="peOut" placeholder="留空则自动生成 输入名-protected.exe" spellcheck="false">
+      <button class="btn btn-ghost" id="btnPeOut" title="输出路径由输入自动推导，或手动填写">自动</button></div>
+
+    <div class="row" style="margin-top:8px">
+      <div class="field"><label title="stub / engine blob 是架构专属的，无法跨架构加壳；这里只能「仅允许某一架构」。">架构</label>
+        <select id="peArch">
+          <option value="0">自动（跟随输入 PE）</option>
+          <option value="64">仅 x64（PE32+）</option>
+          <option value="32">仅 x86（PE32）</option>
+        </select></div>
+      <div class="field"><label title="弱信号响应时的空转循环次数（0 = 不延迟）">延迟循环（弱信号）</label>
+        <input type="number" id="peDelayLoops" value="20000000" min="0" spellcheck="false"></div>
+      <div class="field"><label title="反调试 / 反 VM 的 rdtsc 时间差阈值">时序阈值（rdtsc）</label>
+        <input type="number" id="peTicks" value="100000" min="0" spellcheck="false"></div>
+    </div>
+
+    <div class="row">
+      <label class="toggle" style="grid-column:span 2"><input type="checkbox" id="peVirtualize" checked><span class="sw"></span>
+        <span class="lbl">虚拟化 .textvm* 标记节<span class="sub">x64 专用 · 无标记节时为 no-op</span></span></label>
+      <label class="toggle"><input type="checkbox" id="pePolDelay" checked><span class="sw"></span>
+        <span class="lbl">弱信号：延迟后继续<span class="sub">policy bit0</span></span></label>
+      <label class="toggle"><input type="checkbox" id="pePolDecoy" checked><span class="sw"></span>
+        <span class="lbl">确认篡改：转诱饵<span class="sub">policy bit1</span></span></label>
+      <label class="toggle"><input type="checkbox" id="pePolKill" checked><span class="sw"></span>
+        <span class="lbl">敌对：终止进程<span class="sub">policy bit2 · DLL 建议关</span></span></label>
+    </div>
+
+    <div class="sec-title" style="margin-top:14px;font-size:12.5px"><span class="dot"></span>运行期检测位
+      <small id="peMaskVal">def_flags = 0x0003FFFF (262143)</small></div>
+    <div class="row" id="peBits"></div>
+    <div class="run-zone" style="margin-top:8px">
+      <button class="btn btn-ghost" id="peMaskAll">检测位全开</button>
+      <button class="btn btn-ghost" id="peMaskNone">检测位全关</button>
+      <button class="btn btn-ghost" id="peMaskL1">仅 L1（最保守）</button>
+    </div>
+
+    <div class="run-zone" style="margin-top:14px">
+      <button class="btn btn-run" id="peRunBtn">开始加壳</button>
+      <button class="btn btn-ghost" id="peAdaptBtn" title="解析输入 PE（架构 / 节表 / TLS / 资源目录 / .textvm 标记节 / 是否 DLL），自动回填推荐档">⚡ 智能适配</button>
+      <div class="loading-ring" id="peRing"><div class="ring"></div><div class="ring r2"></div></div>
+    </div>
+    <div class="summary" id="peAdaptInfo"></div>
+    <div class="summary" id="peVerify"></div>
+    <div class="console">
+      <div class="console-bar"><span class="led"></span>PACKER LOG
+        <button class="clear" onclick="document.getElementById('peLog').innerHTML=''">清空</button></div>
+      <div id="peLog"></div>
     </div>
   </section>
 
@@ -567,6 +632,7 @@ const MAX_SELECTS={'cfStrength':3,'strStrength':3,'antiDec':3,'nativeShell':3,'b
 const MAX_CHECKED=['rename','strings','scatter','cf','classEnc','vmp','jnic','resources','kotlin',
   'antiDebug','vmpSelfCheck','integrity','exJump','nativeAntiHook','bfLoader','bfShield','bfvm',
   'whiteboxStrings','obfConstants','vmpNative','autoAdaptMc','reflectionGate','jnicEpl',
+  'protectNativeLibs',
   'hideCallGraph','fakeDebugInfo','methodInlineExtract','eraseAnnotations','nullGuard',
   'vmpProtectRuntime','silentShield'];
 const DEFAULT_SELECTS={'cfStrength':2,'strStrength':3,'antiDec':0,'nativeShell':3,'bfShieldLevel':3,
@@ -585,6 +651,28 @@ function toggleAllMax(on){
 }
 
 /* ---------- 智能适配：分析输入 jar 并回填推荐选项 ---------- */
+/* 数字选项的中文名（用于把推荐集渲染成一行可读摘要；键与控件 id 一致）。 */
+const NUM_LABELS={'cfStrength':'控制流强度','strStrength':'字符串强度','antiDec':'反编译器',
+  'nativeShell':'nativeShell 增强壳','bfShieldLevel':'BrainfuckShield','typeConfusion':'类型混淆',
+  'mbaConstants':'交织表达式','opaqueStateMachine':'S2 不透明状态机','honeypot':'S4 蜜罐诱饵',
+  'methodSplit':'S1 方法切分','sentinelInterleave':'S3 sentinel 交错','blobMockFill':'S5 blob mock',
+  'stackFrameRedirect':'D1 栈帧重定向','entropyTimeAnchor':'D2 熵·时间锚','selfWipeSections':'D3 节自擦',
+  'processHeartbeat':'D4 进程心跳','honeypotPe':'D5 蜜罐 PE','oneTimeSemantic':'C1 一次性语义',
+  'lineageChain':'C2 血缘链','selfRefAuth':'C3 自反认证','multiRep':'C4 多元表示','polyGold':'C5 计算镀金',
+  'signalPoison':'X1 信号 poison','buildSigBind':'X2 构建签名绑定'};
+/* 只列“被推荐为开启”的数字项（0 表示按推荐保持关闭，不必占位）。 */
+function recommendedNumericSummary(sets){
+  if(!sets)return '';
+  const parts=[];
+  for(const k in sets){
+    if(!NUM_LABELS[k])continue;
+    const v=String(sets[k]);
+    if(v==='0'||v==='false')continue;
+    parts.push(escapeHtml(NUM_LABELS[k])+'(<b>'+escapeHtml(v)+'</b>)');
+  }
+  return parts.join(' · ');
+}
+
 let _adaptTimer=null,_adaptSeq=0,_autoApplied=false;
 async function analyze(auto){
   const inV=$('inField').value.trim();
@@ -605,8 +693,10 @@ async function analyze(auto){
     applyAdapt(j);
     _autoApplied=true;
     const chips=(j.checks||[]).map(c=>'<b>'+escapeHtml(c)+'</b>').join(' · ');
+    const numChips=recommendedNumericSummary(j.sets);
     const html='<b>'+escapeHtml(j.label)+'</b> — '+j.classes+' 类 / '+j.resources+' 资源<br>'+
       chips+'<br><span style="opacity:.9">'+escapeHtml(j.note||'')+'</span>'+
+      (numChips?'<br><span style="opacity:.85">数字项推荐：'+numChips+'</span>':'')+
       (auto?'':'<br><span style="opacity:.6;font-size:11.5px">推荐已应用到下方选项 — 可继续微调；勾选「一键全开」可整体拉满。</span>');
     info.innerHTML=html;
     info.classList.add('show');
@@ -643,6 +733,157 @@ $('inField').addEventListener('change',scheduleAutoAnalyze);
   }catch(e){}
 })();
 
+/* ---------- kboXShield · PE 加壳（独立功能线） ---------- */
+/* 运行期检测位（与 KboxFormat.KBOX_DEF_* / stub 的 KDEF_* 一一对应） */
+const PE_BITS=[
+  {b:0x00001,n:'PEB.BeingDebugged',g:'L1'},
+  {b:0x00002,n:'NtGlobalFlag',g:'L1'},
+  {b:0x00004,n:'堆 Flags/ForceFlags',g:'L1'},
+  {b:0x00100,n:'int3(0xCC) 代码扫描',g:'L1'},
+  {b:0x00008,n:'IsDebuggerPresent',g:'L2'},
+  {b:0x00010,n:'CheckRemoteDebuggerPresent',g:'L2'},
+  {b:0x00020,n:'NtQueryInformationProcess',g:'L2'},
+  {b:0x08000,n:'NtSetInformationThread',g:'L2'},
+  {b:0x00040,n:'硬件断点 Dr0-3',g:'L3'},
+  {b:0x00080,n:'rdtsc 时序',g:'L3'},
+  {b:0x00200,n:'CPUID hypervisor 位',g:'反VM'},
+  {b:0x00400,n:'hypervisor vendor 串',g:'反VM'},
+  {b:0x10000,n:'SIDT',g:'反VM'},
+  {b:0x20000,n:'VMware 特征',g:'反VM'},
+  {b:0x00800,n:'IAT 重解析比对',g:'反hook'},
+  {b:0x01000,n:'API 前缀跳转扫描',g:'反hook'},
+  {b:0x02000,n:'CRC32 完整性',g:'完整性'},
+  {b:0x04000,n:'可执行私有页（注入）',g:'反注入'}
+];
+const PE_L1=PE_BITS.filter(x=>x.g==='L1').reduce((a,x)=>a|x.b,0);
+const PE_COLOR_OK='var(--green-2)', PE_COLOR_WARN='#fbbf24', PE_COLOR_FAIL='var(--danger)';
+function peBitHex(v){return ('0000000'+v.toString(16).toUpperCase()).slice(-8);}
+function peInit(){
+  const host=$('peBits'); if(!host)return;
+  host.innerHTML=PE_BITS.map(x=>
+    '<label class="toggle" style="padding:4px 8px;grid-column:span 1">'
+    +'<input type="checkbox" data-pebit="'+x.b+'" checked><span class="sw"></span>'
+    +'<span class="lbl" style="font-size:12px">'+escapeHtml(x.n)
+    +'<span class="sub">'+escapeHtml(x.g)+' · 0x'+peBitHex(x.b)+'</span></span></label>').join('');
+  host.addEventListener('change',peSyncMask);
+  peSyncMask();
+}
+function peMask(){
+  let m=0;
+  document.querySelectorAll('[data-pebit]').forEach(c=>{ if(c.checked)m|=(+c.dataset.pebit); });
+  return m>>>0;
+}
+function peSetMask(m){
+  document.querySelectorAll('[data-pebit]').forEach(c=>{ c.checked=(m&(+c.dataset.pebit))!==0; });
+  peSyncMask();
+}
+function pePolicy(){
+  return ($('pePolDelay').checked?1:0)|($('pePolDecoy').checked?2:0)|($('pePolKill').checked?4:0);
+}
+function peSyncMask(){
+  const m=peMask();
+  $('peMaskVal').textContent='def_flags = 0x'+peBitHex(m)+' ('+m+') · policy='+pePolicy();
+}
+function peLogLine(html,color){
+  const el=$('peLog');
+  el.innerHTML+='<div'+(color?' style="color:'+color+'"':'')+'>'+html+'</div>';
+  el.scrollTop=el.scrollHeight;
+}
+function peAutoOut(){
+  const inV=$('peIn').value.trim();
+  if(!inV){flash('请先选择输入 PE，输出路径将自动推导');return;}
+  const p=inV.replace(/\\/g,'/'),slash=p.lastIndexOf('/');
+  const dir=p.slice(0,slash+1),name=p.slice(slash+1),dot=name.lastIndexOf('.');
+  $('peOut').value=dir+(dot>0?name.slice(0,dot):name)+'-protected.exe';
+  flash('已自动生成输出路径');
+}
+async function peAdapt(auto){
+  const inV=$('peIn').value.trim();
+  if(!inV){ if(!auto)flash('请先填写输入 PE'); return; }
+  const info=$('peAdaptInfo');
+  $('peRing').classList.add('show');
+  try{
+    const res=await fetch('/api/shield/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({input:inV})});
+    const j=await res.json();
+    if(!j.ok){ info.style.color=PE_COLOR_FAIL;
+      info.innerHTML='⚠ '+escapeHtml(j.error||'分析失败'); info.classList.add('show'); return; }
+    const sets=j.sets||{};
+    if(sets.arch!==undefined)$('peArch').value=String(sets.arch);
+    if(sets.defFlags!==undefined)peSetMask(+sets.defFlags);
+    if(sets.defPolicy!==undefined){
+      const p=+sets.defPolicy;
+      $('pePolDelay').checked=(p&1)!==0;
+      $('pePolDecoy').checked=(p&2)!==0;
+      $('pePolKill').checked=(p&4)!==0;
+    }
+    if(sets.defDelayLoops!==undefined)$('peDelayLoops').value=sets.defDelayLoops;
+    if(sets.defTimingTicks!==undefined)$('peTicks').value=sets.defTimingTicks;
+    if(sets.virtualize!==undefined)$('peVirtualize').checked=(String(sets.virtualize)!=='0');
+    peSyncMask();
+    const chips=(j.checks||[]).map(c=>'<b>'+escapeHtml(c)+'</b>').join(' · ');
+    info.style.color='';
+    info.innerHTML='<b>'+escapeHtml(j.label)+'</b> — '+j.classes+' 节 / 资源目录 '+j.resources+' 字节<br>'
+      +chips+'<br><span style="opacity:.9">'+escapeHtml(j.note||'')+'</span>'
+      +'<br><span style="opacity:.6;font-size:11.5px">推荐已回填（def_flags 0x'+peBitHex(peMask())
+      +' / policy '+pePolicy()+'）— 可继续微调后点「开始加壳」。</span>';
+    info.classList.add('show');
+    if(!$('peOut').value.trim())peAutoOut();
+  }catch(e){
+    info.style.color=PE_COLOR_FAIL; info.innerHTML='⚠ 无法连接后端服务'; info.classList.add('show');
+  }finally{ $('peRing').classList.remove('show'); }
+}
+async function peRun(){
+  const inV=$('peIn').value.trim();
+  if(!inV){flash('请选择输入 PE');return;}
+  let outV=$('peOut').value.trim();
+  if(!outV){peAutoOut();outV=$('peOut').value.trim();}
+  if(!outV){return;}
+  $('peLog').innerHTML=''; $('peVerify').classList.remove('show');
+  $('peRing').classList.add('show'); $('peRunBtn').disabled=true;
+  const body={input:inV,output:outV,arch:+$('peArch').value,defFlags:peMask(),defPolicy:pePolicy(),
+    defDelayLoops:+$('peDelayLoops').value,defTimingTicks:+$('peTicks').value,
+    virtualize:$('peVirtualize').checked};
+  try{
+    const res=await fetch('/api/shield',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const j=await res.json();
+    if(!j.ok&&j.error){ peLogLine('⚠ '+escapeHtml(j.error),PE_COLOR_FAIL); flash(j.error); return; }
+    (j.log||'').split('\n').forEach(l=>{
+      if(!l)return;
+      let c='';
+      if(l.indexOf('[ERROR]')>=0) c=PE_COLOR_FAIL;
+      else if(l.indexOf('[WARN]')>=0||l.indexOf('WARN')>=0) c=PE_COLOR_WARN;
+      else if(l.indexOf('[OK]')>=0) c=PE_COLOR_OK;
+      peLogLine(escapeHtml(l),c);
+    });
+    if(j.verify){
+      const v=j.verify;
+      const rows=(v.findings||[]).map(f=>{
+        const c=f.level==='fail'?PE_COLOR_FAIL:(f.level==='warn'?PE_COLOR_WARN:PE_COLOR_OK);
+        return '<div style="color:'+c+'">['+escapeHtml(String(f.level).toUpperCase())+'] '+escapeHtml(f.msg)+'</div>';
+      }).join('');
+      $('peVerify').innerHTML='<b>PE 自检：'+(v.ok?'通过':'发现致命问题')+'</b>（ok='+v.okCount
+        +' warn='+v.warnCount+' fail='+v.failCount+'）'+rows;
+      $('peVerify').classList.add('show');
+    }
+    flash(j.ok?('加壳完成 → '+outV):'加壳失败');
+  }catch(e){
+    peLogLine('⚠ 无法连接后端服务',PE_COLOR_FAIL); flash('无法连接后端服务');
+  }finally{ $('peRing').classList.remove('show'); $('peRunBtn').disabled=false; }
+}
+peInit();
+$('pickPeIn').addEventListener('change',function(){pickFile(this,$('peIn'),$('btnPeIn'),false);this.value='';});
+$('btnPeOut').addEventListener('click',peAutoOut);
+$('peMaskAll').addEventListener('click',()=>peSetMask(0x0003FFFF));
+$('peMaskNone').addEventListener('click',()=>peSetMask(0));
+$('peMaskL1').addEventListener('click',()=>peSetMask(PE_L1));
+['peVirtualize','pePolDelay','pePolDecoy','pePolKill'].forEach(id=>$(id).addEventListener('change',peSyncMask));
+$('peRunBtn').addEventListener('click',peRun);
+$('peAdaptBtn').addEventListener('click',()=>peAdapt(false));
+$('peIn').addEventListener('change',()=>{ if($('peIn').value.trim())peAdapt(true); });
+setupDrop('dropPeIn',$('pickPeIn'),$('peIn'),$('btnPeIn'),false);
+
 /* ---------- 启动混淆 ---------- */
 async function protect(){
   const inV=$('inField').value.trim(),outV=$('outField').value.trim();
@@ -669,7 +910,8 @@ async function protect(){
     opaqueStateMachine:+$('opaqueStateMachine').value,honeypot:+$('honeypot').value,methodSplit:+$('methodSplit').value,
     silentShield:$('silentShield').checked,
     vmpNative:$('vmpNative').checked,autoAdaptMc:$('autoAdaptMc').checked,reflectionGate:$('reflectionGate').checked,
-    jnicEpl:$('jnicEpl').checked,hideCallGraph:$('hideCallGraph').checked,fakeDebugInfo:$('fakeDebugInfo').checked,
+    jnicEpl:$('jnicEpl').checked,protectNativeLibs:$('protectNativeLibs').checked,
+    hideCallGraph:$('hideCallGraph').checked,fakeDebugInfo:$('fakeDebugInfo').checked,
     methodInlineExtract:$('methodInlineExtract').checked,eraseAnnotations:$('eraseAnnotations').checked,
     nullGuard:$('nullGuard').checked,vmpProtectRuntime:$('vmpProtectRuntime').checked,
     sentinelInterleave:+$('sentinelInterleave').value,blobMockFill:+$('blobMockFill').value,

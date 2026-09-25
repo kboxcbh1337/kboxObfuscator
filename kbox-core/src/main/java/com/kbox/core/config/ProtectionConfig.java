@@ -396,6 +396,25 @@ public final class ProtectionConfig {
      */
     private int nativeShell = 3;
 
+    /** Jar 内自带原生库（.dll/.so/.dylib）加壳保护（默认关）。
+     *  <p>开启后混淆阶段自动扫描输入 jar 的<b>全部目录</b>，对每个非 kbox 自产
+     *  blob 的原生库条目：</p>
+     *  <ul>
+     *    <li>{@code .dll}（PE）→ 走 {@code ShieldPacker} <b>完整加壳</b>：全节
+     *        ChaCha20 加密 + 合成导入表 + 函数级虚拟化（.pdata 逐函数，入口 E9 改写）
+     *        + 指令变异 + 控制流平坦化（双族 VM）。</li>
+     *    <li>{@code .so/.dylib}（ELF/Mach-O）→ 暂不支持 PE 壳，降级为
+     *        <b>压缩 + ChaCha20 加密存储</b>（运行时解密落盘加载）。</li>
+     *  </ul>
+     *  <p>产物 jar 中不再存在明文原生库：每个库被 KBNL 打包成
+     *  {@code META-INF/kbox/natlib/N.bin}，清单写入 {@code META-INF/kbox/natlibs.list}；
+     *  运行时 {@code NativeLoader.loadNativeLibs()} 按当前 OS 匹配扩展名解密落盘
+     *  {@code System.load} 后立即擦除临时文件。引导类（ResourceGuardLauncher）会在
+     *  应用 main 之前自动预加载，应用亦可显式调用
+     *  {@code NativeLoader.loadNativeLib(String)} 按逻辑路径加载。</p>
+     */
+    private boolean protectNativeLibs = false;
+
     /** Publisher Ed25519 public key (SPKI hex). When set, the packager embeds it
      *  (masked) into the jar and gates class/VM decryption on a valid license. */
     private String licPublicKey = null;
@@ -805,6 +824,8 @@ public final class ProtectionConfig {
     public void setCc(String cc) { this.cc = cc; }
     public int getNativeShell() { return nativeShell; }
     public void setNativeShell(int v) { nativeShell = v; }
+    public boolean isProtectNativeLibs() { return protectNativeLibs; }
+    public void setProtectNativeLibs(boolean v) { protectNativeLibs = v; }
 
     public String getLicPublicKey() { return licPublicKey; }
     public void setLicPublicKey(String v) { licPublicKey = (v == null || v.isEmpty()) ? null : v; }
@@ -916,6 +937,7 @@ public final class ProtectionConfig {
         c.bodyProtectExcludePrefixes.addAll(bodyProtectExcludePrefixes);
         c.jnicExcludePrefixes.addAll(jnicExcludePrefixes);
         c.cc = cc;
+        c.protectNativeLibs = protectNativeLibs;
         c.licPublicKey = licPublicKey;
         c.licAppSecret = licAppSecret;
         c.failOnNativeError = failOnNativeError;
@@ -988,6 +1010,7 @@ public final class ProtectionConfig {
                 + ", exJmp=" + exceptionJumpObf + ", ntvHook=" + nativeAntiHook
                 + ", nullGuard=" + nullGuard
                 + ", keepPrefix=" + keepPrefixes + ", cc=" + cc
+                + ", nativeLibs=" + protectNativeLibs
                 + ", vmpExc=" + vmpExcludePrefixes + ", jnicExc=" + jnicExcludePrefixes
                 + ", lic=" + isLicensed()
                 + ", scope=" + obfuscationScope
@@ -1075,6 +1098,8 @@ public final class ProtectionConfig {
         brainfuckShieldLevel = 3;
         // ---- native shell ----
         nativeShell = 3;
+        // ---- jar 自带原生库完整加壳（.dll 走 kboXShield PE 壳 + 虚拟化；.so/.dylib 加密） ----
+        protectNativeLibs = true;
         // ---- class encryption / resources（BF 模式下自动降档，降级时恢复） ----
         encryptClasses = true;
         obfuscateResources = true;

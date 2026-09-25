@@ -144,6 +144,7 @@ autoKeepRules = true
 | `reflectionGate` | bool | `false` | **反射门禁（L6b）**：把单参 `Class.forName` 包装为门控调用，非白名单类名（FNV-1a allowlist：图内类+keep 集+JDK 前缀）抛 `SecurityException("KBox")`。自动 allowlist，一般无需配置。 |
 | `autoAdaptMinecraft` | bool | `false` | **MC mod 自动适配**：检测 `fabric.mod.json`/`mods.toml`/`plugin.yml`/`TweakClass`/`mixins.json`，自动把入口类、mixin 类与其目标类加入 keep，保护 mod 在 Fabric/Forge/Bukkit 加载器下不破坏。 |
 | `nativeShell` | int | `3` | **原生壳增强档**（native shell）：`0`=关；`1`=M1 字符串擦除（native 段字符串即时清零）；`2`=+M2 控制流变异/厂商分散（反 IDA 签名）；`3`=+M3 IAT 隐藏/导入擦除（PE 导入表混淆，Windows）。默认 3。 |
+| `protectNativeLibs` | bool | `false` | **jar 内自带原生库加壳（自动查找）**：混淆时自动扫描输入 jar 的**全部目录**。识别规则：扩展名 `.dll/.so/.dylib` 优先，扩展名不匹配时按**内容魔数**识别共享库（PE 带 `IMAGE_FILE_DLL`、ELF 为 `ET_DYN`、Mach-O 为 `MH_DYLIB`/`MH_BUNDLE`）——因此以 `.bin`/`.dat` 等任意名字打包的原生库同样会被加壳，而 jar 内附带的 `.exe` 或普通数据不会被误判。`.dll`（PE）走 `kboXShield` **完整加壳**（全节 ChaCha20 加密 + 合成导入表 + **函数级虚拟化**（.pdata 逐函数，入口 E9 改写）+ 指令变异 + 控制流平坦化，双族 VM）；`.so/.dylib`（ELF/Mach-O）暂不支持 PE 壳，降级为**压缩 + ChaCha20 加密存储**（运行时解密落盘加载）。产物 jar 中不再存在明文原生库：每个库打包为 `META-INF/kbox/natlib/N.bin`，清单写入 `META-INF/kbox/natlibs.list`；运行时 `NativeLoader.loadNativeLibs()`（引导类在应用 main 之前自动调用）按当前 OS 匹配格式解密落盘 `System.load` 后立即擦除临时文件，亦可显式 `NativeLoader.loadNativeLib(String 逻辑路径)` 按名加载。声明 native 方法的业务类会自动加入 `parent-delegate.list`（由系统加载器定义），否则守卫加载器自定义这些类会导致 JNI 符号解析失败。`allMax=true` 时自动开启。 |
 
 > **Brainfuck 加载器注意事项（§4 续）**
 > - 仅支持独立可执行 jar（`java -jar`），需要 `Main-Class`；Spring Boot Fat Jar、Forge/Fabric mod（`TweakClass`）、无 Main-Class 的库/mod 输入会自动**优雅降级**为「非 BF 全强度保护」（rename+strings+VMP+JNIC+BFVM+BrainfuckShield+Shield 全保留，仅跳过 BF blob），不会失败（日志见 `[BF] Degrading to non-BF full protection`）。
@@ -381,6 +382,7 @@ nativeMethod = com.example.License#check#(Ljava/lang/String;)Z
 | 原生化 | `enableJnic=true` · `nativeCoverage=full` · `jnicEplDriven=true` |
 | 二次虚拟化 | `enableBfvm=true`（需 `bfvmMethod`） · `brainfuckShield=true` · `brainfuckShieldLevel=3` |
 | 原生壳 | `nativeShell=3`（M1+M2+M3） |
+| 原生库加壳 | `protectNativeLibs=true`（jar 内 `.dll` 走 kboXShield 完整加壳+函数级虚拟化，`.so/.dylib` 加密降级） |
 | 类/资源 | `encryptClasses=true` · `obfuscateResources=true` |
 | S 层 | `methodSplit=3` · `opaqueStateMachine=3` · `sentinelInterleave=3` · `honeypot=3` · `blobMockFill=3` |
 | D 层 | `stackFrameRedirect=3` · `entropyTimeAnchor=3` · `selfWipeSections=3` · `processHeartbeat=3` · `honeypotPe=3` |

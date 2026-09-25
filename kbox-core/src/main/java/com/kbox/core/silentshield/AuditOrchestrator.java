@@ -55,7 +55,7 @@ import java.util.HashSet;
  * （keep 集只增不减），对复杂 jar 自动规避易碎路径——每条加固对策都
  * 直接源于其他混淆器已暴露的适配性弱点。
  */
-public final class SilentShield {
+public final class AuditOrchestrator {
 
     private static final String TAG = "silentshield";
 

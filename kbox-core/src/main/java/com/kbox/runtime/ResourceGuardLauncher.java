@@ -46,6 +46,9 @@ public final class ResourceGuardLauncher {
         AntiDebug.check();
         // 0b. Integrity check (silent — corrupts results on tamper).
         IntegrityChecker.check();
+        // 0c. protectNativeLibs: 预加载 jar 内自带原生库（.dll/.so/.dylib 加壳产物）。
+        //     在应用 main 之前解密落盘 System.load，幂等 best-effort（无 natlib 时 no-op）。
+        preloadNativeLibs(sys);
 
         // 1. Read resource seed (may be null when resource obfuscation is off).
         byte[] seed = readResource(sys, SEED_PATH);
@@ -211,6 +214,28 @@ public final class ResourceGuardLauncher {
             // JNIC not enabled — nothing to do.
         } catch (Exception e) {
             System.err.println("[KBOX-NATIVE] Early load failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Preloads the jar's protected native libraries (protectNativeLibs 产物) via
+     * {@code NativeLoader.loadNativeLibs()} before the application main runs.
+     * Best-effort: when no {@code META-INF/kbox/natlibs.list} is present (feature
+     * off) this is a silent no-op; any per-lib failure is logged by the loader
+     * itself and never blocks launch. Uses reflection so the launcher stays
+     * loadable even when NativeLoader was not injected.
+     */
+    private static void preloadNativeLibs(ClassLoader sys) {
+        try (InputStream in = sys.getResourceAsStream("META-INF/kbox/natlibs.list")) {
+            if (in == null) return;   // protectNativeLibs not active for this jar
+        } catch (Exception e) {
+            return;
+        }
+        try {
+            Class<?> nl = Class.forName("com.kbox.runtime.NativeLoader", true, sys);
+            nl.getDeclaredMethod("loadNativeLibs").invoke(null);
+        } catch (Throwable ignored) {
+            // Best-effort only; never let a native-lib hiccup block the app.
         }
     }
 

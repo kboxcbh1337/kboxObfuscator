@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">KBox 手机监控</string>
+
+    <string name="connect_title">连接 PC 混淆器</string>
+    <string name="url_hint">http://192.168.1.10:PORT  （或 kboxmon://地址）</string>
+    <string name="btn_connect">连接</string>
+    <string name="btn_scan">扫码</string>
+    <string name="connecting">正在连接…</string>
+    <string name="url_invalid">地址无效，请输入 http://主机:端口</string>
+    <string name="scan_failed">未识别到有效二维码</string>
+
+    <string name="connected">● 已连接</string>
+    <string name="disconnected">○ 未连接（%1$s）</string>
+
+    <string name="status_title">运行状态</string>
+    <string name="stage_progress">阶段 %1$d / %2$d  ·  %3$s</string>
+    <string name="log_title">实时日志</string>
+</resources>

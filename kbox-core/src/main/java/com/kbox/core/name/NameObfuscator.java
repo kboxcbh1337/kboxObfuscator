@@ -446,6 +446,61 @@ public final class NameObfuscator {
             return mapped != null ? mapped : name;
         }
 
+        /**
+         * 同步 {@code invokedynamic} 的 SAM 方法名。
+         *
+         * <p>ASM 的 {@link Remapper#mapInvokeDynamicMethodName} 默认<b>原样返回</b>，
+         * 但 LambdaMetafactory 的 indy 名恰好就是「函数式接口的 SAM 方法名」：
+         * 接口方法被改名后若这里不同步，运行期 metacfactory 生成的 lambda 类实现的
+         * 仍是旧名，而调用点解析的是新名 —— 直接
+         * {@code AbstractMethodError: Receiver class ...$$Lambda$n does not define or
+         * inherit an implementation of the resolved method 'abstract ...'}。
+         * 只有「lambda 实现的接口来自被混淆应用自身」时才暴露（实现 JDK 接口的
+         * lambda 其方法名不会被改名），因此很容易被漏掉。</p>
+         *
+         * <p>indy 描述符的返回类型即函数式接口，据此外链查找 SAM 新名；对
+         * StringConcatFactory 之类返回非应用类型的 indy 保持原样。</p>
+         */
+        @Override
+        public String mapInvokeDynamicMethodName(String name, String descriptor) {
+            if (name == null || descriptor == null || name.isEmpty()) return name;
+            if (name.charAt(0) == '<') return name;
+            org.objectweb.asm.Type ret;
+            try {
+                ret = org.objectweb.asm.Type.getReturnType(descriptor);
+            } catch (RuntimeException bad) {
+                return name;
+            }
+            if (ret.getSort() != org.objectweb.asm.Type.OBJECT) return name;
+            String itf = ret.getInternalName();
+            if (itf == null || itf.startsWith("java/") || itf.startsWith("javax/")) return name;
+            String mapped = resolveSamName(itf, name);
+            return mapped != null ? mapped : name;
+        }
+
+        /** 沿接口/父类链查找 (owner, name) 的新名；忽略描述符，歧义返回 null。 */
+        private String resolveSamName(String owner, String name) {
+            Set<String> visited = new HashSet<>(8);
+            java.util.ArrayDeque<String> queue = new java.util.ArrayDeque<>();
+            queue.add(owner);
+            visited.add(owner);
+            while (!queue.isEmpty()) {
+                String cur = queue.poll();
+                if (cur.startsWith("java/")) continue;
+                String mapped = mapping.mapMethodByName(cur, name);
+                if (mapped != null) return mapped;
+                ClassNode cn = graph.getClasses().get(cur);
+                if (cn == null) continue;
+                if (cn.superName != null && visited.add(cn.superName)) queue.add(cn.superName);
+                if (cn.interfaces != null) {
+                    for (String it : (List<String>) cn.interfaces) {
+                        if (visited.add(it)) queue.add(it);
+                    }
+                }
+            }
+            return null;
+        }
+
         /** Walk owner via super classes AND interfaces until the declaring member is found. */
         private String resolveMethod(String owner, String name, String desc) {
             Set<String> visited = new HashSet<>(8);

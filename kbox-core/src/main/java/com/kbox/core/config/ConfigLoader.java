@@ -151,6 +151,7 @@ public final class ConfigLoader {
             case "vmpCoverage": cfg.setVmpFullCoverage(val.trim().equalsIgnoreCase("full")); break;
             case "cc": cfg.setCc(val.isEmpty() ? null : val); break;
             case "nativeShell": cfg.setNativeShell(intVal(val, 0)); break;
+            case "protectNativeLibs": cfg.setProtectNativeLibs(bool(val)); break;
             case "licPublicKey": case "licensePublicKey":
                 cfg.setLicPublicKey(val.trim()); break;
             case "licAppSecret": case "licenseAppSecret":

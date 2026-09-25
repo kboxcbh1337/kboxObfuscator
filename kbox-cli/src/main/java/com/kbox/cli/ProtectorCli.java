@@ -37,6 +37,16 @@ public final class ProtectorCli {
             launchGui(null, null, null, false);
             return;
         }
+        // kboXShield 独立功能线（PE 加壳）：--shield <in.exe> <out.exe>
+        if ("--shield".equals(args[0])) {
+            String[] rest = new String[args.length - 1];
+            System.arraycopy(args, 1, rest, 0, rest.length);
+            int rc = com.kbox.core.shield.ShieldPacker.run(rest);
+            if (rc != 0) {
+                System.exit(rc);
+            }
+            return;
+        }
         String in = null, out = null, cfgPath = null;
         String mappingPath = null;
         String mcPreset = null;
@@ -290,6 +300,7 @@ public final class ProtectorCli {
         System.out.println("                           e.g. com/example/** com/foo/Bar");
         System.out.println("  --exclude PATTERN        Class pattern to exclude (repeatable).");
         System.out.println("  --list-presets           List available Minecraft mod presets");
+        System.out.println("  --shield IN.exe OUT.exe  kboXShield 独立功能线：PE 加壳（stub+VM 镜像+加密节）");
         System.out.println("  --help, -h               Show this help message");
         System.out.println();
         System.out.println("ProGuard-style adaptive flags (for compatibility & fine-grained control):");

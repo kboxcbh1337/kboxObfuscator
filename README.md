@@ -13,6 +13,7 @@
 - [配置](#配置)
 - [新能力：交织表达式常量混淆 (mbaConstants)](#新能力交织表达式常量混淆-mbaconstants)
 - [静态深度 / 动态钻取补全（S6-S8 + D6-D9）与最大强度适配](#静态深度--动态钻取补全s6-s8--d6-d9与最大强度适配)
+- [kboXShield 独立功能线（Windows PE 加壳）](#kboxshield-独立功能线windows-pe-加壳)
 - [已有能力与诚实边界](#已有能力与诚实边界)
 
 ---
@@ -28,6 +29,7 @@
 | 常量 | 间接查表加密（`obfuscateConstants`）或**交织表达式加密**（`mbaConstants`，二选一） | 关 |
 | 混淆对抗 | 反编译器 L0..L3（goto 链、常量池炸弹、非法 StackMapTable）、类型混淆 | 分级 |
 | 原生 | JNIC Java→C 原生化（**EPL 驱动选例 `jnicEplDriven`**，S8）、Native crypto 主密钥层、native 反钩子、**native 节自擦**（D7） | 关 |
+| 原生库 | **`protectNativeLibs` jar 内原生库加壳（自动查找）**：扫描全部目录 `.dll/.so/.dylib`，`.dll` 走 kboXShield 完整加壳（函数级虚拟化/变异/平坦化），`.so/.dylib` 加密降级；运行时解密落盘加载并擦除临时文件，明文原生库不进产物 jar | 关 |
 | 虚拟机 | 双状态异或分发解释器（VMP）+ **dispatch 二次校验 slot 分发**（D8）、**BrainfuckShield 二次虚拟化**（每方法私有方言磁带）、滚动窗口 watchdog、每运行 ephemeralKey | 关 |
 | 类加载 | 类体加密（`encryptClasses`）、自定义类加载器、入口守卫、**Brainfuck 终极混沌加载**（类/资源全打包进 native 解码器，明文只驻 native 堆） | 关 |
 | 运行时 | 反调试（JDWP/JVMTI/agent/timing/TracerPid/**三源校时**）、**探头分散+模块名分片**（D6）、完整性自检、license 校验、**篡改联锁 TamperShield**、**明文曝光窗收敛**（D9） | 关 |
@@ -49,6 +51,9 @@ docs/          配置与 CLI 文档
 kboxObfPro/    干净源码交付树（com/kbox/core/bfvm + runtime/bfvm + 模块源码 + dist 产物）
 ```
 
+kboXShield 功能线的 PE 加壳代码位于 `kbox-core/src/main/java/com/kbox/core/shield/`，
+其汇编 blob 资产位于 `kbox-core/src/main/resources/shield/`。
+
 关键代码位置：
 
 - 常量混淆：`kbox-core/src/main/java/com/kbox/core/obfu/ConstantObfuscator.java`
@@ -59,6 +64,11 @@ kboxObfPro/    干净源码交付树（com/kbox/core/bfvm + runtime/bfvm + 模�
 - 配置：`kbox-core/src/main/java/com/kbox/core/config/*.java`
 - VMP 运行时：`kbox-core/src/main/java/com/kbox/runtime/VmpInterpreter.java`
 - JNIC：`kbox-core/src/main/java/com/kbox/core/jnic/*.java`
+- **kboXShield PE 加壳（本仓库新增，由 C/C++ 全量移植）：**
+  - `.../shield/ShieldPacker.java`（打包主流程）、`.../shield/PeImage.java`（PE 解析）
+  - `.../shield/VmBuilder.java` / `VmMeta.java` / `MetaInner.java`（镜像与嵌套 Meta 程序生成）
+  - `.../shield/LiftX64.java` / `IrCompile.java`（x86-64 提升与 IR→字节码编译）
+  - `.../shield/VmEngine.java`（打包期自由态解释器，用于镜像自检预演）
 
 ---
 
@@ -74,6 +84,80 @@ mvn -f kbox-cli\pom.xml clean package -DskipTests
 ```
 
 > 若改了 kbox-core 但 CLI 产物未生效，请务必 `clean` 全量重建；增量编译可能导致 shaded jar 里是旧类。
+
+**无 Maven 环境（手工构建）**：仓库根目录的 `build.ps1` 用 `javac` + `jar` 直接复刻同构 fat jar
+（`kbox-core`/`kbox-cli` 用 `--release 8`，`kbox-gui` 用 `--release 17`），依赖从本地 m2 仓库取：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1
+# 产物：dist\kboxObfuscatorb3.jar（主类 com.kbox.cli.ProtectorCli）
+```
+
+（构建脚本把中间产物放在系统临时目录，并在打包时先写临时名再覆盖：工作区内的 `.class`/`.jar`
+会被 IDE 语言服务或安全软件短暂独占，直接写目标路径偶发失败。）
+
+### 自混淆（把混淆器自身混淆后仍可用）
+
+```powershell
+java -Xmx6g -jar dist\kboxObfuscatorb3.jar `
+  --input  dist\kboxObfuscatorb3.jar `
+  --output dist\kboxObfuscatorb3-protected.jar `
+  --config self-allmax.conf
+```
+
+`self-allmax.conf` 开 `allMax = true`（除 BF 外全部最高强度），并必须声明一条
+**方法体保真边界**：
+
+```properties
+brainfuckLoader = false          # BF 会把 CLI 入口吞进 blob，自混淆场景必须关
+jnicExcludePrefix = com.kbox.
+vmpExcludePrefix  = com.kbox.
+nativeExcludePrefix = com.kbox.
+```
+
+**为什么必须排除？** 混淆器自身就是被混淆的目标：JNIC / VMP / native 会把方法体**搬进解释器**，
+而解释器按「记录下来的名字与元数据」解析成员，语义与原始字节码并不等价。一旦把引擎功能核心
+搬走，产物会在自己的热路径上直接失败。实测（已修配置前）：
+
+```
+java.lang.NullPointerException: Cannot read the array length because "bytes" is null
+    at java.lang.String.<init>
+    at com.kbox.core.analysis.DependencyAnalyzer.readManifest(DependencyAnalyzer.java:78)
+```
+
+根因是 `DependencyAnalyzer#readAll` 这个 6 行的 zip 读取辅助方法被 JNIC 变成了
+`private static native byte[] readAll(InputStream)`，而 native 实现返回 `null` —— 混淆任务还没开始
+就在「读输入 jar 的 MANIFEST」处 NPE。注意 `keepPrefix` **只豁免重命名**，不豁免 JNIC/VMP
+（`ProtectionConfig.shouldProtectClass` 才是方法体级决策，`AutoJnicVmpSelector` 与
+`JnicOrchestrator` 都按它过滤）。
+
+该前缀只按类名匹配：产物去混淆**其他工程**时，其类不在 `com.kbox.` 下，JNIC/VMP 依旧全量生效。
+
+除该边界外其余全部保持最高强度：重命名（未列入 `keepPrefix` 的引擎类照常改名）、AES 字符串加密、
+控制流平坦化、常量/MBA、类型混淆、类体加密、抗反编译、反调试、完整性校验、资源混淆等。
+
+### 本版本修复：lambda 的 SAM 方法名随接口改名同步
+
+自混淆过程中暴露出一个**通用**（不只影响自混淆）的重命名缺陷：当 `lambda`
+实现的函数式接口**来自被混淆工程自身**时，接口方法会被改名，但 `invokedynamic`
+的名字没有被同步，运行期报
+
+```
+AbstractMethodError: Receiver class com.kbox.core.shield.tg$$Lambda$28/0x... does not define
+or inherit an implementation of the resolved method 'abstract int vo(com.kbox.core.shield.zf, int)'
+of interface com.kbox.core.shield.hf.
+```
+
+原因：ASM 的 `Remapper.mapInvokeDynamicMethodName` 默认**原样返回**，而
+`LambdaMetafactory` 的 indy 名恰好就是「函数式接口的 SAM 方法名」——它不在 `bsmArgs` 里
+（`bsmArgs` 只有 samMethodType / implMethod / instantiatedMethodType），所以只能靠
+indy 名同步。修复见 `NameObfuscator.KBoxRemapper#mapInvokeDynamicMethodName`：以 indy
+描述符的返回类型定位函数式接口，沿接口/父类链查 `Mapping` 的 `(owner, name)` 新名
+（`Mapping#mapMethodByName`，同名不同描述符且新名不一致时视为歧义、不改）。
+
+实现 JDK 接口（`Runnable`/`Function` 等）的 lambda 不受影响，因此该缺陷在只跑通用目标时
+很容易漏掉，只有「自己有接口 + 自己写 lambda」的工程（例如本引擎的 `VmEngine.VmHandler`）
+才会命中。
 
 ---
 
@@ -98,6 +182,20 @@ controlFlowStrength = 2      # 超大输入（≥300 类）加速可降一档 CF
 ```
 
 GUI（`--gui`）里也有「一键全开 · 最大强度」开关，勾选即把所有选项拉满。
+
+**HTML UI 的「⚡ 智能适配」覆盖全部数字选项（含 nativeShell 增强壳）**：除勾选类开关外，
+它会按输入类型回填全部 21 个数字档位并在面板里列出「数字项推荐」摘要——
+
+| 数字项 | 独立应用 | 含 Mixin 的模组 | Spring Boot / 无入口库 |
+|---|---|---|---|
+| `nativeShell` 增强壳 | **3**（M1 字符串擦除 + M2 控制流变异 + M3 IAT/导入隐藏） | **0**（不产出原生码） | **0**（VMP/JNIC 已关，同为 no-op） |
+| `typeConfusion` / `mbaConstants` | 2 · 深 | 2 · 深 | 2 · 深 |
+| S1–S5 / D1–D5 / C1–C5 / X1–X2 | 3 · 最强 | 3（除 `stackFrameRedirect`=0、`methodSplit`=1，Mixin 会重排局部变量） | 3 · 最强 |
+| BF 家族（`bfvm`/`bfShield`/`bfShieldLevel`） | 保持 0，需显式开启 | 0 | 0 |
+
+nativeShell 是**源码级**改写，作用于本轮生成的全部原生源码（JNIC 分片、VMP native、
+native crypto、BF native decoder）；**本轮没有原生码产出时置 0**，避免无谓的原生构建。
+
 
 > **最高强度适配报告（2026-09-04 全类别实测）**：helloworld / KBox-testapp / SimpleDemo / JavaObfuscatorTest / 无 Main-Class 库 / 40MB Fabric mod / Spring Boot / Kotlin 全部 `allMax` 保护成功且运行正确。完整选项清单与适配表见 [docs/CONFIG.md §14-15](docs/CONFIG.md)。
 
@@ -244,6 +342,127 @@ bodyExcludePrefix = com.example.parse      # 方法体整体豁免（框架解�
 nativeExcludePrefix = com.example.legacy   # VMP+JNIC 共用硬排除
 ```
 GUI 中「VMP 排除类」「JNIC 排除类」文本框仅在勾选 VMP / JNIC 时显示与可选。
+
+---
+
+## kboXShield 独立功能线（Windows PE 加壳）
+
+kboXShield 是原独立的 C++ PE 加固工程（`include/` + `packer/` + `stub/`），现已**全量移植为 Java**
+并作为独立功能线并入本混淆器：`--shield <in.exe> <out.exe>`，或直接调用
+`com.kbox.core.shield.ShieldPacker.run(String[])` / `pack(String, String, StringBuilder)`。
+
+### 使用入口
+
+| 入口 | 用法 |
+|---|---|
+| CLI | `java -jar kboxObfuscatorb3.jar --shield app.exe app-protected.exe`（默认档） |
+| HTML UI | `--gui` 打开页面内的 **「kboXShield · PE 加壳」** 独立面板（含 ⚡ 智能适配 + 结构自检回显） |
+| 编程 | `ShieldPacker.pack(in, out, ShieldOptions, log)` / `ShieldVerify.verify(out, opts)` |
+
+`ShieldOptions` 可控制：架构偏好（自动 / 仅 x64 / 仅 x86）、`def_flags`（18 项运行期检测位掩码）、
+`def_policy`（bit0 延迟 / bit1 诱饵 / bit2 终止）、延迟循环、时序阈值、是否虚拟化 `.textvm*` 标记节。
+默认值与原始 C++ `packer/main.cpp` 一致。
+
+**HTML UI 面板**：输入/输出 PE、架构、虚拟化开关、响应策略三项、延迟/时序阈值、
+**18 项检测位分组开关**（L1 / L2 / L3 / 反VM / 反hook / 完整性 / 反注入，附「全开 / 全关 / 仅 L1」快捷档
+与实时掩码显示）、以及打包后的 **PE 自检结论**。面板的「智能适配」(`/api/shield/analyze`) 会解析输入 PE
+（架构 / 节表 / TLS 回调 / 资源目录 / `.textvm` 标记节 / 是否 DLL）并回填推荐档 + 给出理由——
+例如 DLL 场景自动把响应策略降为「延迟 + 诱饵」（不终止宿主进程）。
+
+**产物自检**（`ShieldVerify`，CLI 与 UI 都会跑）：PE 解析、节表几何与对齐、入口点可执行性、
+合成导入表、8 个必须清零的目录、资源目录保留、以及 **KboxConfig 可解密性**
+（用 stub 的 LCG 算法解出配置区，校验 magic/version/`stub_rva` 与入口节一致/`oep_rva`/`payload_rva`/`vm_count`，
+并回显 `def_flags`/`def_policy` 与本次选项比对）。这样「能写出但 Windows 直接拒载」这类问题
+在打包阶段就能暴露，而不是等到实机运行。
+
+### jar 内原生库加壳（`protectNativeLibs`）
+
+混淆时自动扫描输入 jar 的**全部目录**，识别原生库并做完整保护，明文原生库从不进入产物 jar。
+
+**识别规则**（与文件名无关）：扩展名 `.dll/.so/.dylib` 优先；扩展名不匹配时按**内容魔数**识别共享库——
+PE 需带 `IMAGE_FILE_DLL` 标志、ELF 需 `e_type == ET_DYN`、Mach-O 需 `MH_DYLIB`/`MH_BUNDLE`。
+因此以 **`.bin`/`.dat`** 等任意名字打包在 jar 里的原生库同样会被加壳，而 jar 内附带的 `.exe` 或普通数据不会被误判。
+
+| 支持矩阵 | `.dll` / PE（任意文件名） | `.so` / ELF | `.dylib` / Mach-O |
+|---|---|---|---|
+| 加壳方式 | **完整加壳**：全节 ChaCha20 加密 + 合成导入表 + 函数级虚拟化（.pdata 逐函数，入口 E9 改写）+ 指令变异 + 控制流平坦化（双族 VM） | 压缩 + ChaCha20 加密存储（解密落盘加载） | 压缩 + ChaCha20 加密存储（解密落盘加载） |
+| 运行时 | `System.load` 前解密落盘，加载后立即擦除临时文件（nuke + delete） | 同左 | 同左 |
+
+- **开关**：`protectNativeLibs = true`（`allMax=true` 自动开启；GUI「高级选项」勾选「原生库加壳」）。
+- **产物布局**：每个库打包为 `META-INF/kbox/natlib/N.bin`（KBNL 格式：压缩 + ChaCha20，密钥经硬件域派生），
+  清单 `META-INF/kbox/natlibs.list` 记录 `逻辑路径|blob路径|格式`（格式为 dll/so/dylib，按内容判定）。
+- **运行时加载**：引导类（`ResourceGuardLauncher`）在应用 `main` 之前自动按当前 OS 匹配格式
+  调用 `NativeLoader.loadNativeLibs()`；也可在业务代码中显式
+  `NativeLoader.loadNativeLib(String)` 按逻辑路径按需加载（如 `native/lib/mylib.bin`）。
+- **JNI 符号可见性**：声明 `native` 方法的业务类会自动加入 `parent-delegate.list`，由系统加载器定义
+  （原生库也在系统加载器命名空间下 `System.load`）；否则守卫加载器会自定义这些类，
+  导致 `UnsatisfiedLinkError`。同时 `AutoKeepDeriver` 本来就保留这类类名与方法名（JNI 符号要求）。
+- **与资源混淆协作**：开启后原生库条目自动豁免资源重命名（按内容识别，`.bin` 命名同样生效），
+  保留原始逻辑路径，应用按原名加载不受影响。
+- **注意事项**：DLL 间依赖顺序由清单顺序（jar 条目顺序）决定，存在依赖的库建议用
+  `loadNativeLib(String)` 显式控制顺序；运行时防御位（`defFlags`）在进程内加载时置 0，
+  避免 JVM 宿主内误判与杀软实时防护冲突——虚拟化/变异/平坦化不受影响。
+- **自测样例**：`_nattest/`（`mylib.dll` 导出 `Java_Main_nativeCheck` → 加壳后符号保留，输出 `NAT_OK v=42`）；
+  `_nattest2/`（同一 DLL 改名为 `native/lib/mylib.bin`，验证内容魔数识别 + 资源混淆共存 → 同样 `NAT_OK v=42`）。
+
+### 打壳模型（原地变换，与 Themida/UPX 同思路）
+
+1. 保留原 PE 全部节（代码/数据/资源节，载荷数据被加密）；
+2. 末尾追加两个随机命名节：**代码节**（`blob[0, iat_off)`，RX）与**数据节**（RWX）；
+   节内顺序为 `[KboxConfig | stub 代码][trampoline][加密 payload][合成导入表][VM 镜像组][运行期汇编引擎][VmRecs][防御报告][TLS 回调表]`；
+3. `AddressOfEntryPoint → stub 入口`；Import Directory → 合成导入表（仅 `LoadLibraryA/GetProcAddress/VirtualProtect`）；
+4. `Security/BaseReloc/TLS/LoadConfig/BoundImport/IAT/DelayImport/CLR` 目录清零（防 loader 读密文）；
+5. 运行期 stub：取基址 → 解密配置区 → 还原字符串池 → 运行期防御 → **VM 自检** →
+   解密 payload → 逐节解密 → 重建 IAT → 重定位 → 恢复节权限 → 代跑 TLS 回调 → 跳 OEP。
+
+### 关键设计
+
+- **配置区加密**：`KboxConfig`（`[0,0x100)`）以每构建随机 LCG 流密钥异或，种子写入代码节
+  `kbox_cfg_root` 槽；stub 入口先自解密。
+- **完整性 CRC32**：覆盖 `stub[0x100, iat_off)`，按「运行期视图」（字符串池已还原）计算。
+- **逐节独立 ChaCha20**：每节独立 12 字节 nonce（4B 节 ID + 8B 随机）+ 起始块计数。
+- **嵌套虚拟化**：内层 VM 解释器本身不再以明文 native 存在，而是编译为**外层 Meta VM 字节码**
+  （`MetaInner.vmBuildInnerMeta`，定长 8 字节指令、就地解密/回加密、opcode_map 随机重排 +
+  handler 偏移表）。运行期唯一明文 native 循环是 `kbox_meta_run`（blob 内，位置无关）。
+- **汇编 blob**：4 个资产由 `stub/*.S` 汇编后平铺为裸二进制，入口位于 blob 偏移 0：
+  `blob_{x64,x86}.bin`（stub，各 24576B）、`engine_{x64,x86}.bin`（运行期引擎，2848/3816B）。
+  重新生成见下节。
+
+### 重新生成汇编 blob
+
+```powershell
+# 需要 MSYS2 mingw-w64 binutils（as/ld/objcopy/objdump/nm）
+python build_blobs.py     # 见交付说明：对 stub/*.S 剥离 ELF 专有指示符后汇编，输出到 resources/shield/
+```
+
+### 移植中修复的上游跨文件契约漂移
+
+原 C++ 快照存在几处「改造只做了一半」的不一致；移植以**随包发布的运行期汇编引擎为准**统一，
+否则产物在运行期必然失败：
+
+| 漂移 | 现象 | 处理 |
+|---|---|---|
+| `vm_inner_state.h` 的 `IS_SIZE/IS_FRAME`（1248/732）与 `vm_engine_*.S`（1208/696）不一致 | 引导程序与 Meta 程序对 GPR 帧的偏移错位 40/36 字节 | 修正 `.S` 为 1248/732 并重建 engine blob |
+| 「方案B：魔数由密钥派生」只改了 `vm_builder.cpp`/`vm_engine.cpp`，汇编引擎与 `meta_inner.cpp` 仍按固定魔数校验 | 运行期 `kbox_vm_run` 以 `BAD_MAGIC` 停机 | 统一使用固定 `VM_IMAGE_MAGIC=0x4D56424B` |
+| 「方案B：ks1^ks2 双 keystream」只改了 builder/预览引擎，汇编引擎与 `meta_inner.cpp` 只有单 ks1 | 运行期反查表解密错位 → `BAD_OPCODE` | 映射区统一只叠加 ks1 |
+| 资源节（`.rsrc`）被整体加密，但 `RESOURCE` 目录未清零 | `CreateProcess` 解析清单失败 → **ERROR_BAD_EXE_FORMAT(193)**，打壳后的程序根本无法启动 | 资源节标记 `PAYLOAD_FLAG_SKIP_DECRYPT` 并保持明文（stub 已支持该标记，原先从未接线） |
+
+### 已验证的契约（离线逐字节核对）
+
+- `KboxConfig` 以 stub 的 LCG 算法解密后，`magic/version/stub_rva/oep_rva/image_base/payload/key/nonce/VM 元数据/防御配置/TLS` 全部正确；
+- `payload` 以 `key+nonce+counter=0` 解密后 `magic=KPAY`、18 条节记录、2 个 DLL、50 条导入、reloc 0x74 全部正确；
+- 18 个被加密节逐节 ChaCha20 解密后与原始 PE 的对应节数据**完全一致**；
+- 完整性 CRC32 与配置中的期望值 **MATCH**；
+- 内层镜像头 `0x4D56424B / ver2 / familyA / dispatch0 / stack_words32`、`reserved[0]=0x110 → Meta 镜像 0x4D56424D / ver1` 全部正确；
+- 合成导入表（OFT/hint/name/FirstThunk）结构合法，pefile 解析通过。
+
+### 当前边界（诚实说明）
+
+- 打壳产物**可正常加载并执行到 stub**（PE 头、导入表、重定位目录处理均正确），但
+  **运行期 VM 自检路径仍会崩溃**：禁用 VM 自检（`vm_flags=0`）后不再出现访问违例，
+  说明故障位于 native stub/引擎的运行期执行链，而非 Java 侧打包逻辑（打包契约已全部离线验证正确）。
+  该链路的进一步定位需要在目标机上以原生调试器（WinDbg/cdb）跟踪，属后续加固项。
+- 反调试开启时附加调试器会改变 stub 走向（`.Ldead` 为死循环），因此定位需先关闭 `def_flags`。
 
 ---
 

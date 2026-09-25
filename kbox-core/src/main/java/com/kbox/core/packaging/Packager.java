@@ -257,7 +257,7 @@ public final class Packager {
     public void write(Path inputJar, Path outputJar, ClassGraph graph,
                       Mapping mapping, Path nativeLib,
                       ProtectionConfig cfg) throws IOException {
-        write(inputJar, outputJar, graph, mapping, nativeLib, null, null, cfg, null, null, null, null);
+        write(inputJar, outputJar, graph, mapping, nativeLib, null, null, cfg, null, null, null, null, null);
     }
 
     /**
@@ -293,7 +293,8 @@ public final class Packager {
                       ProtectionConfig cfg,
                       ResourceMapping resMapping, byte[] resSeed,
                       byte[] vmpBlob,
-                      byte[] epdManifest) throws IOException {
+                      byte[] epdManifest,
+                      com.kbox.core.packaging.NativeLibPacker.Result natLibs) throws IOException {
         Path parent = outputJar.getParent();
         if (parent != null) Files.createDirectories(parent);
         Map<String, String> classMap = mapping != null ? mapping.getClassMap() : java.util.Collections.emptyMap();
@@ -338,6 +339,8 @@ public final class Packager {
 
             boolean springBoot = graph.isSpringBootFatJar();
             String clsRoot = springBoot ? "BOOT-INF/classes/" : "";
+            // protectNativeLibs 是否真的产出了原生库 blob（决定启动器接管与条目替换）。
+            boolean natLibsActive = natLibs != null && !natLibs.entries.isEmpty();
             ResourceReferenceUpdater ru = new ResourceReferenceUpdater(classMap);
             ManifestUpdater mu = new ManifestUpdater(classMap);
             mu.setSpringBootFatJar(springBoot);
@@ -390,6 +393,24 @@ public final class Packager {
             if (needGuard) {
                 for (String k : graph.getClasses().keySet()) {
                     if (cfg.isLibraryClass(k)) parentDelegate.add(k);
+                }
+                // protectNativeLibs: 声明 native 方法的类必须由父（系统）加载器定义。
+                // 原生库由 NativeLoader 在系统加载器命名空间下 System.load，而 JNI 符号
+                // 只在「定义该类的加载器」命名空间内解析；守卫加载器对非 JDK 类是 parent-last
+                // （自行 defineClass），若这些类被它定义，调用 native 方法必抛
+                // UnsatisfiedLinkError（实测）。JNIC 用 jnic-classes.list 解决同一问题，
+                // 业务原生库的声明类无法预知，故泛化为「所有含 native 方法的类」。
+                if (natLibsActive) {
+                    int natCls = 0;
+                    for (Map.Entry<String, ClassNode> ce : graph.getClasses().entrySet()) {
+                        if (!declaresNativeMethod(ce.getValue())) continue;
+                        String renamed = mapName(classMap, ce.getKey());
+                        if (parentDelegate.add(renamed)) natCls++;
+                    }
+                    if (natCls > 0) {
+                        KBoxLog.info(TAG, "Parent-delegating " + natCls
+                                + " class(es) declaring native methods (native lib JNI symbol resolution)");
+                    }
                 }
             }
 
@@ -519,6 +540,9 @@ public final class Packager {
                 String path = e.getKey();
                 byte[] bytes = e.getValue();
                 if (path.equals("META-INF/MANIFEST.MF")) continue;
+                // Jar 内自带原生库已由 protectNativeLibs 打包成 META-INF/kbox/natlib/*.bin，
+                // 明文条目不再写入产物 jar（避免明文 dll/so 外泄）。
+                if (natLibs != null && natLibs.contains(path)) continue;
                 if (isFrameworkText(path)) {
                     String res = ru.rewrite(path, bytes);
                     int nul = res.indexOf('\u0000');
@@ -540,7 +564,7 @@ public final class Packager {
             // 3. Manifest. When resource guard or class guard is on:
             //    - For standalone jars (Main-Class present): substitute with launcher.
             //    - For Forge mods (TweakClass present): prepend decrypt tweaker.
-            String launcherClass = (resourceGuard || classGuard)
+            String launcherClass = (resourceGuard || classGuard || natLibsActive)
                     ? "com.kbox.runtime.ResourceGuardLauncher" : null;
             // Only prepend TweakClass when class encryption is on AND the jar
             // has a TweakClass (i.e., it's a Forge/Fabric mod, not standalone jar).
@@ -601,6 +625,15 @@ public final class Packager {
                 // loaded by the PARENT loader, never re-defined locally by the guard
                 // loader, or ASM-style engines land with two copies -> ClassCastException.
                 writeParentDelegateList(out, clsRoot, parentDelegate);
+            } else if (launcherClass != null) {
+                // protectNativeLibs-only（无资源/类加密）: Main-Class 仍交给
+                // ResourceGuardLauncher（它在 seed 缺失时直接透传原 main）。启动器
+                // main() 无条件调用 AntiDebug/IntegrityChecker，且其字节码引用
+                // ResourceGuardClassLoader（类型校验期即解析），故需连同整套
+                // ResourceGuard* 类一起注入。
+                rtCount += injectResourceGuardClasses(out, clsRoot, graph);
+                rtCount += injectOne(out, clsRoot, "com/kbox/runtime/AntiDebug", rtInjected, graph);
+                rtCount += injectOne(out, clsRoot, "com/kbox/runtime/IntegrityChecker", rtInjected, graph);
             }
             // 4b. JNIC: write the packed native blob + inject NativeLoader/ChaCha20.
             if (nativeBlob != null) {
@@ -636,6 +669,27 @@ public final class Packager {
                 rtCount += injectNativeLoaderClasses(out, clsRoot, graph, rtInjected);
                 KBoxLog.info(TAG, "Wrote packed VMP native blob ("
                         + vmpBlob.length + " bytes) -> META-INF/kbox/vmp.bin");
+            }
+            // 4e. protectNativeLibs: jar 内自带原生库（.dll/.so/.dylib）加壳产物。
+            //     每个库一个 KBNL blob（META-INF/kbox/natlib/N.bin），清单
+            //     natlibs.list 记录「逻辑路径|blob路径|扩展名」，运行时
+            //     NativeLoader.loadNativeLibs() 按 OS 匹配扩展名解密落盘加载。
+            //     明文原生库从不进入产物 jar。
+            if (natLibsActive) {
+                for (com.kbox.core.packaging.NativeLibPacker.Entry en : natLibs.entries) {
+                    putEntry(out, clsRoot + en.blobPath, natLibs.blobs.get(en.blobPath));
+                }
+                StringBuilder lb = new StringBuilder();
+                for (com.kbox.core.packaging.NativeLibPacker.Entry en : natLibs.entries) {
+                    lb.append(en.logicalPath).append('|')
+                      .append(en.blobPath).append('|')
+                      .append(en.ext).append('\n');
+                }
+                putEntry(out, clsRoot + "META-INF/kbox/natlibs.list",
+                        lb.toString().getBytes(StandardCharsets.UTF_8));
+                rtCount += injectNativeLoaderClasses(out, clsRoot, graph, rtInjected);
+                KBoxLog.info(TAG, "Wrote " + natLibs.entries.size()
+                        + " packed native lib blob(s) -> META-INF/kbox/natlib/*.bin (+ natlibs.list)");
             }
             if (epdManifest != null && epdManifest.length > 0) {
                 putEntry(out, clsRoot + "META-INF/kbox/method_epd.bin", epdManifest);
@@ -1868,6 +1922,15 @@ public final class Packager {
                     injected, graph);
         }
         return count;
+    }
+
+    /** @return true when the class declares at least one {@code native} method. */
+    private static boolean declaresNativeMethod(ClassNode cn) {
+        if (cn == null || cn.methods == null) return false;
+        for (org.objectweb.asm.tree.MethodNode mn : cn.methods) {
+            if ((mn.access & org.objectweb.asm.Opcodes.ACC_NATIVE) != 0) return true;
+        }
+        return false;
     }
 
     /** @return true when the input jar is a Forge/Fabric mod (has TweakClass). */

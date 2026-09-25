@@ -1,9 +1,16 @@
-﻿# Build / scratch outputs
+# Build / scratch outputs
 target/
 build/
 out-rc/
 .gradle/
 *.class
+
+# Pipeline scratch (generated C sources + compiled natives during protection runs)
+kbox-work/
+
+# Generated build outputs
+kbox-cli/dependency-reduced-pom.xml
+selfmapping.txt
 
 # Release artifacts are published as GitHub Release assets, not tracked in git.
 dist/

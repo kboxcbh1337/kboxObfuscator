@@ -27,6 +27,7 @@ public final class NativeLoader {
     private static final String _BP1 = "META-INF/kbox/native.bin";
     private static final String _BP2 = "META-INF/kbox/jnic.bin";
     private static final String _BP3 = "META-INF/kbox/vmp.bin";
+    private static final String NATLIBS_LIST = "META-INF/kbox/natlibs.list";
 
     private NativeLoader() {}
 
@@ -34,6 +35,9 @@ public final class NativeLoader {
     private static volatile boolean _L2 = false;
     private static volatile boolean _L3 = false;
     private static volatile boolean _L4 = false;
+    private static volatile boolean _NAT = false;
+    private static final java.util.Set<String> _NAT_LOADED =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
     /**
      * Loads the JNIC native library from {@code META-INF/kbox/jnic.bin} (a path
@@ -99,6 +103,111 @@ public final class NativeLoader {
         }
         _L3 = true;
         return true;
+    }
+
+    /**
+     * 加载产物 jar 内全部与当前 OS 匹配的原生库（protectNativeLibs 产物）。
+     *
+     * <p>读取 {@code META-INF/kbox/natlibs.list}（每行 {@code 逻辑路径|blob路径|扩展名}），
+     * 仅加载扩展名与当前 OS 匹配的条目（Windows→dll，macOS→dylib，其余→so），
+     * 逐个 KBNL 解密落盘 {@link System#load} 后立即擦除临时文件。幂等、best-effort：
+     * 任何失败仅记录 stderr，绝不抛出（避免引导期因某个无关库失败而阻塞应用启动）。
+     * 引导类（ResourceGuardLauncher）会在应用 main 之前自动调用。</p>
+     */
+    public static synchronized void loadNativeLibs() {
+        if (_NAT) return;
+        _NAT = true;
+        ClassLoader cl = NativeLoader.class.getClassLoader();
+        java.util.List<String[]> refs = readNatLibList(cl);
+        if (refs.isEmpty()) return;
+        String os = osName();
+        for (String[] r : refs) {
+            String ext = r.length >= 3 ? r[2] : extOf(r[0]);
+            if (!extMatches(ext, os)) continue;
+            loadNatLibRef(cl, r[0], r[1]);
+        }
+    }
+
+    /**
+     * 按输入 jar 中的逻辑路径（如 {@code com/example/native/foo.dll}）加载单个原生库
+     * （protectNativeLibs 产物）。用于需要显式控制加载顺序/按需加载的场景。
+     *
+     * @return true 表示已找到并成功加载（或此前已加载）；false 表示未找到/加载失败
+     */
+    public static synchronized boolean loadNativeLib(String logicalPath) {
+        if (logicalPath == null || logicalPath.isEmpty()) return false;
+        if (_NAT_LOADED.contains(logicalPath)) return true;
+        ClassLoader cl = NativeLoader.class.getClassLoader();
+        for (String[] r : readNatLibList(cl)) {
+            if (logicalPath.equals(r[0])) {
+                return loadNatLibRef(cl, r[0], r[1]);
+            }
+        }
+        return false;
+    }
+
+    /** 解密一个 natlib blob → 落盘 → System.load → 擦除。失败记录 stderr 并返回 false。 */
+    private static boolean loadNatLibRef(ClassLoader cl, String logicalPath, String blobPath) {
+        if (_NAT_LOADED.contains(logicalPath)) return true;
+        byte[] blob;
+        try (InputStream in = cl.getResourceAsStream(blobPath)) {
+            if (in == null) {
+                System.err.println("[KBOX-NATIVE] natlib blob missing: " + blobPath);
+                return false;
+            }
+            blob = readAll(in);
+        } catch (IOException e) {
+            System.err.println("[KBOX-NATIVE] natlib blob read failed: " + blobPath + " - " + e);
+            return false;
+        }
+        try {
+            byte[] lib = unpack(blob);
+            Path tmp = writeToTemp(lib);
+            try {
+                System.load(tmp.toAbsolutePath().toString());
+            } finally {
+                purgeTemp(tmp);
+            }
+            _NAT_LOADED.add(logicalPath);
+            System.out.println("[KBOX-NATIVE] Loaded native lib: " + logicalPath);
+            return true;
+        } catch (Throwable t) {
+            System.err.println("[KBOX-NATIVE] natlib load failed: " + logicalPath + " - " + t);
+            return false;
+        }
+    }
+
+    /** 解析 natlibs.list；缺失时返回空列表（非 null）。 */
+    private static java.util.List<String[]> readNatLibList(ClassLoader cl) {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        try (InputStream in = cl.getResourceAsStream(NATLIBS_LIST)) {
+            if (in == null) return out;
+            String text = new String(readAll(in), java.nio.charset.StandardCharsets.UTF_8);
+            for (String line : text.split("\n")) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String[] p = line.split("\\|");
+                if (p.length >= 3) out.add(new String[]{p[0], p[1], p[2]});
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    private static boolean extMatches(String ext, String os) {
+        if (ext == null || ext.isEmpty()) return false;
+        if (os.contains("win")) return "dll".equals(ext);
+        if (os.contains("mac") || os.contains("darwin")) return "dylib".equals(ext);
+        return "so".equals(ext);
+    }
+
+    private static String extOf(String logicalPath) {
+        int i = logicalPath.lastIndexOf('.');
+        return i < 0 ? "" : logicalPath.substring(i + 1).toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static String osName() {
+        return System.getProperty("os.name", "").toLowerCase();
     }
 
     /** Loads the native library exactly once. Safe to call from multiple <clinit>. */

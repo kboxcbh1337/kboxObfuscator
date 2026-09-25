@@ -1,0 +1,76 @@
+# KBox Obfuscator — 开源许可协议
+
+> 本文件是项目的**正式开源/商用双许可证**。中英双语，以**英文原文**为准。
+> This is the formal license for this repository. The **English text is authoritative**; the Chinese summary below is for convenience only.
+
+Copyright (c) 2026 **kboxcbh1337** & **kboxStudio**
+
+---
+
+## 简体中文概览
+
+- ✅ **允许任意修改**：任何人可自由修改、复制、分发本代码（含闭源使用）。
+- ✅ **允许商用**：本代码及其衍生作品可用于商业用途。
+- ⚠️ **必须保留水印**：代码内的 `kboxcbh1337` 与 `kboxStudio` 水印必须原样保留，不得删除/篡改/规避。
+- ⚠️ **必须标明共同开发人**：在本仓库 README 及任何展示项目（官网/开源站点）中必须列明项目及其共同开发人。
+- 💰 **商业使用须付费**：任何**直接或间接**以营利为目的的使用（例如：销售包含本代码的软件、提供依赖本代码的付费服务、依托本代码开发并盈利的产品/游戏等）都必须通过**微信(WeChat)或支付宝(Alipay)**向开发者 **kboxcbh1337** 支付**不少于 500 美元**的许可费。
+- ❗ 本许可证**不是** OSI 批准的开源许可证（Open Source Initiative approved），属于**源码可用 + 付费商用**的双层自定义许可。
+
+> 完整法律条款以下方英文原文为准。If any Chinese translation conflicts with the English text, the English text prevails.
+
+---
+
+## English License (Authoritative)
+
+### KBox-OSS-1.0 — Source-Available License with Paid Commercial Use
+
+**Copyright (c) 2026 kboxcbh1337 & kboxStudio**
+
+**Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions (the "Conditions"):**
+
+### 1. Watermark Requirement (MANDATORY, non-negotiable)
+All original and derivative copies of the Software, in whole or in part, **must retain, unaltered and unobscured**, the embedded developer watermarks **`kboxcbh1337`** and **`kboxStudio`**. You must **not** remove, rename, encrypt, strip, or otherwise circumvent these watermarks, regardless of how the Software or its derivatives are compiled, obfuscated, repackaged, or transformed.
+
+### 2. Attribution & Co-development Credit (MANDATORY, non-negotiable)
+Any distribution of the Software or its derivatives, and any website, storefront, or open-source hosting page that presents or promotes the Software (including your product if it meaningfully incorporates the Software), **must prominently acknowledge** the project and its **co-developers** as listed in the `Credits` section of this repository's `README.md`. Deriving without attribution is a material breach of this license.
+
+### 3. Permitted Use
+Subject to these Conditions, the Software may be used for **any purpose**, **including commercial purposes**, and may be freely **modified** by anyone. No license is required for non-commercial, personal, educational, or research use, and no payment is due for such use.
+
+### 4. Paid Commercial Use (the "Commercial License")
+**Complementary Foundation:** The license grants a one-time, royalty-free right for *non-commercial* use. For any **commercial use**, as defined below, a **Commercial License** must be purchased from the developer before the commercial activity begins.
+
+#### 4.1 Definition of Commercial Use
+"Commercial Use" means any activity that is undertaken for money or other monetary equivalents, **whether directly or indirectly**, involving the Software or any derivative work. Examples include, but are not limited to:
+
+- Selling, licensing, or distributing the Software or any product/software that contains, embeds, or bundles the Software;
+- Providing a paid service, SaaS, or subscription that depends on or leverages the Software;
+- Deriving revenue (monetization, advertising, sales, subscriptions, in-app purchases, donations with commercial purposes, salary derived from the Software's operation) **through or because of** the Software or a product built on it — **even if the revenue comes from the product being "successful"** because it uses the Software.
+
+Making the Software indirectly profitable (for example, a game or application that becomes commercially successful due to the protection provided by the Software) constitutes Commercial Use.
+
+#### 4.2 License Fee
+The Commercial License fee is a **minimum of 500 (five hundred) United States Dollars (USD)** per commercial project / per legal entity, payable **by WeChat (微信) or Alipay (支付宝) to the developer kboxcbh1337**. Payment collection details (payment QR codes / accounts) are made available by the developer on the project's official site or by contacting **kboxcbh1337** (see the `Payment & Contact` section of the `README.md`).
+
+An entity may negotiate a different arrangement only by explicit written agreement with the developer.
+
+#### 4.3 Payment Timing
+Payment must be made **before** the first commercial release or commercial monetization of the Software or its derivatives. Retroactive commercial use without a prior Commercial License is a breach of this license and may require payment of the then-applicable fee to cure.
+
+### 5. Modification & Redistribution
+Anyone may modify the Software. Modified and unmodified copies may be redistributed under this same license, provided the Conditions (watermark, attribution, commercial licensing) are preserved in all redistributions.
+
+### 6. Disclaimer of Warranty
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 7. Termination
+This license and the rights granted hereunder will **automatically terminate** if the licensee breaches any of the Conditions (in particular the watermark, attribution, or commercial-payment obligations). Upon termination, the licensee must immediately cease all commercial use and distribution of the Software and its derivatives.
+
+### 8. General
+- This license does **not** constitute an "open source license" as defined by the Open Source Initiative (OSI).
+- This license is not affiliated with, endorsed by, or a proxy for any commercial obfuscator.
+- This license shall be governed by and construed in accordance with the laws of the laws applicable to the developer's jurisdiction, without regard to conflict-of-law principles.
+
+---
+
+*End of License. If you have questions about licensing, a Commercial License, or co-development credit, contact the developer: **kboxcbh1337**.*

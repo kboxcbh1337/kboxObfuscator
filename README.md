@@ -26,10 +26,11 @@
 | 名称 | 类/方法/字段重命名、包名打散（`renamePackages`） | 开 / 关 |
 | 字符串 | AES-256-CTR 集中加密（`stringEncryptionStrength` 1..3）、**密钥进 KBNL 硬件派生域**（S7）、白盒单解码、分散存储 | 开 |
 | 控制流 | 平坦化 + 不透明谓词（分级 1..3）、**EPL 甜点窗口选择**（`flattenerMin/MaxInsns` 16..256）、异常跳转混淆、调用图隐藏、调试信息伪造 | 开 |
-| 常量 | 间接查表加密（`obfuscateConstants`）或**交织表达式加密**（`mbaConstants`，二选一） | 关 |
+| 常量 | 间接查表加密（`obfuscateConstants`）或**交织表达式加密**（`mbaConstants`，二选一）；**运行时 MBA 重写**（`mbaRewrite`，把活值之间的 `+ - & | ^` 展开为位运算恒等树） | 关 |
 | 混淆对抗 | 反编译器 L0..L3（goto 链、常量池炸弹、非法 StackMapTable）、类型混淆 | 分级 |
 | 原生 | JNIC Java→C 原生化（**EPL 驱动选例 `jnicEplDriven`**，S8）、Native crypto 主密钥层、native 反钩子、**native 节自擦**（D7） | 关 |
-| 原生库 | **`protectNativeLibs` jar 内原生库加壳（自动查找）**：扫描全部目录 `.dll/.so/.dylib`，`.dll` 走 kboXShield 完整加壳（函数级虚拟化/变异/平坦化），`.so/.dylib` 加密降级；运行时解密落盘加载并擦除临时文件，明文原生库不进产物 jar | 关 |
+| 原生库 | **`protectNativeLibs` jar 内原生库加壳（自动查找）**：扫描全部目录 `.dll/.so/.dylib`，`.dll` 走 kboXShield 完整加壳（函数级虚拟化/变异/平坦化），`.so/.dylib` 走 **`harden+encrypt`**（ELF 去节表、Mach-O 去符号表 + KBNL 加密）；运行时解密落盘加载并擦除临时文件，明文原生库不进产物 jar；产物内含 `META-INF/kbox/native-coverage.txt` 逐文件覆盖报告 | 关 |
+| 原生产物 | **`shieldNativeOutput` 为 JNIC/VMP 混淆后的原生产物加壳**：`native.bin`/`vmp.bin`/`native-crypto.bin` 在 KBNL 之前先过 kboXShield PE 壳（函数级虚拟化/变异/平坦化），形成「KBNL 外层 + 内层壳/VM」两层 | 开 |
 | 虚拟机 | 双状态异或分发解释器（VMP）+ **dispatch 二次校验 slot 分发**（D8）、**BrainfuckShield 二次虚拟化**（每方法私有方言磁带）、滚动窗口 watchdog、每运行 ephemeralKey | 关 |
 | 类加载 | 类体加密（`encryptClasses`）、自定义类加载器、入口守卫、**Brainfuck 终极混沌加载**（类/资源全打包进 native 解码器，明文只驻 native 堆） | 关 |
 | 运行时 | 反调试（JDWP/JVMTI/agent/timing/TracerPid/**三源校时**）、**探头分散+模块名分片**（D6）、完整性自检、license 校验、**篡改联锁 TamperShield**、**明文曝光窗收敛**（D9） | 关 |
@@ -164,6 +165,8 @@ indy 名同步。修复见 `NameObfuscator.KBoxRemapper#mapInvokeDynamicMethodNa
 ## 快速使用
 
 **双击运行（HTML UI）**：直接双击 `kboxobf.jar`（或 `java -jar kboxobf.jar` 不带参数），自动启动内嵌 HTTP 服务并打开浏览器进入 **HTML UI**（一键全开 / 全部防御开关 / 实时日志）。
+
+> **两套界面，运行时二选一**：无参启动（或 `--gui`）会弹出询问框，选择 **原版 HTML UI**（内嵌 HTTP + 浏览器）或 **ZKM 式 UI**（原生 Swing：菜单栏 / 工具栏 / 左侧类浏览器 / 右侧选项标签页 / 底部日志与进度条）。也可用 `--ui html` 或 `--ui zkm` 直接指定跳过询问；headless 环境自动回落 HTML UI。ZKM 式 UI 是按 ZKM 经典布局**从零用 Swing 重写**（ZKM27 仅发布编译后 `.class`，逐类移植有版权风险）。
 
 **命令行（指令操控）**：带参数运行即为 CLI，脚本化保护：
 

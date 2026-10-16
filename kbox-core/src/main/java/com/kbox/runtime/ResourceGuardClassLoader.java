@@ -185,38 +185,56 @@ public final class ResourceGuardClassLoader extends ClassLoader {
             if (parentDelegate.contains(internal)) {
                 return super.loadClass(name, resolve);
             }
-            // JNIC / native-method classes must be loaded by the
-            // parent AppClassLoader so that JNI_OnLoad's FindClass
-            // can locate them through the standard loader chain.
-            // Check BEFORE encrypted-class check: JNIC classes are
-            // explicitly excluded from encryption by Packager, but
-            // the encryptedClasses set may still contain them.
-            // Load the native DLL BEFORE the class so JVM can link
-            // native methods during class loading.
+            // JNIC / native-method classes.
+            //
+            // SINGLE-DEFINITION POLICY: this loader defines them itself, exactly
+            // like every other class shipped in the jar. Delegating them to the
+            // parent created a SECOND copy of the same binary type ('app' vs
+            // guard); because JVM type resolution is triggered by the *referrer*,
+            // any cross-loader sharing (a parent-defined JNIC class whose
+            // signature mentions a guard-defined class, or vice versa) then died
+            // with
+            //   LinkageError: loader constraint violation: loader 'app' wants to
+            //   load interface X. A different interface with the same name was
+            //   previously loaded by com.kbox.runtime.ResourceGuardClassLoader
+            // (observed on 125/125 cases of the adaptability suite).
+            //
+            // Native binding does not need the parent: JNI_OnLoad of the JNIC
+            // library is minimal and all native methods are registered
+            // explicitly through RegisterNatives(Class) below, which takes the
+            // concrete Class object and therefore works for any defining loader.
+            //
+            // Check BEFORE the encrypted-class check: JNIC owner classes are
+            // excluded from encryption by Packager, but the encryptedClasses set
+            // may still contain them.
             if (isJnicClass(name)) {
-                // Load the native DLL BEFORE the class so JVM can link native
-                // methods during class loading.
+                // Load the native DLL BEFORE the class so JVM can bind the
+                // native methods during class loading.
                 loadNativeLibOnce();
-                Class<?> jc = null;
-                // If the class was pre-loaded by the parent (e.g. via ResourceGuardLauncher),
-                // reuse it — but still register natives. JNI_OnLoad's FindClass runs at
-                // DLL-load time, when the class is usually not loaded yet, so it cannot
-                // register the methods; we must RegisterNatives explicitly here.
+                byte[] raw = loadPlainClass(internal);
+                if (raw == null && classSeed != null && encryptedClasses.contains(internal)) {
+                    // Defensive: a JNIC owner must not be encrypted (Packager
+                    // excludes it), but if it is, decrypt it here rather than
+                    // handing ciphertext to the parent.
+                    try {
+                        raw = loadAndDecryptClass(internal);
+                    } catch (Exception ignored) { }
+                }
+                if (raw == null) {
+                    // Not shipped in this jar (or duplicated from a parent
+                    // resource): fall back to normal delegation.
+                    return super.loadClass(name, resolve);
+                }
+                Class<?> jc;
                 try {
-                    jc = super.loadClass(name, false);
-                } catch (ClassNotFoundException ignored) { }
-                if (jc == null) {
-                    byte[] raw = loadPlainClass(internal);
-                    if (raw != null) {
-                        jc = defineClass(name, raw, 0, raw.length);
-                    }
+                    jc = defineClass(name, raw, 0, raw.length);
+                } catch (LinkageError alreadyDefined) {
+                    // Somebody else won the race for this name: reuse that copy.
+                    return super.loadClass(name, resolve);
                 }
-                if (jc != null) {
-                    registerJnicNatives(jc);
-                    if (resolve) resolveClass(jc);
-                    return jc;
-                }
-                throw new ClassNotFoundException("JNIC class bytes not found: " + name);
+                registerJnicNatives(jc);
+                if (resolve) resolveClass(jc);
+                return jc;
             }
             boolean isEncrypted = classSeed != null && encryptedClasses.contains(internal);
             if (isEncrypted) {

@@ -6,12 +6,13 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.analysis.Analyzer;
-import org.objectweb.asm.tree.analysis.BasicInterpreter;
-import org.objectweb.asm.tree.analysis.BasicValue;
 import org.objectweb.asm.tree.analysis.Frame;
+import org.objectweb.asm.tree.analysis.SourceInterpreter;
+import org.objectweb.asm.tree.analysis.SourceValue;
 
 import java.util.List;
 
@@ -78,26 +79,47 @@ public final class ReflectionScanner {
                 }
             }
 
-            // Slow path: constant propagation for Class.forName(String) where the
-            // string comes from an LDC. ASM's Analyzer lets us read the Frame[] to
-            // recover the constant at the call site.
+            // Slow path: data-flow aware recovery of the STRING ARGUMENTS of the
+            // reflective lookup APIs.
+            //
+            // The fast path only sees an LDC that is the instruction IMMEDIATELY
+            // before the call, which is not the case for the realistic shapes:
+            //   Cls.class.getDeclaredMethod("compute", int.class)
+            //   -> invokestatic Integer.TYPE ; invokestatic Class.getDeclaredMethod
+            //   Cls.class.getDeclaredField("f")
+            // Here nothing kept the literal, so the declaration was renamed while
+            // the lookup string was not -> NoSuchMethodException/NoSuchFieldException
+            // at runtime (F09.4/F09.5/F10.1/F10.2).
+            //
+            // SourceInterpreter tells us exactly which instruction produced each
+            // operand-stack slot, so the name literal is recovered regardless of how
+            // many class/array operands follow it.
             try {
-                Frame<BasicValue>[] frames = new Analyzer<>(new BasicInterpreter()).analyze(cn.name, mn);
+                org.objectweb.asm.tree.analysis.Frame<SourceValue>[] frames =
+                        new Analyzer<>(new SourceInterpreter()).analyze(cn.name, mn);
                 if (frames == null) continue;
                 for (int i = 0; i < mn.instructions.size(); i++) {
                     org.objectweb.asm.tree.AbstractInsnNode ins = mn.instructions.get(i);
-                    if (ins.getOpcode() == Opcodes.INVOKESTATIC
-                            && ((MethodInsnNode) ins).name.equals(CLASS_FOR_NAME)) {
-                        Frame<BasicValue> f = frames[i];
-                        if (f != null && f.getStackSize() >= 1) {
-                            BasicValue top = f.getStack(f.getStackSize() - 1);
-                            String cls = classConstantFromValue(top);
-                            if (cls != null) graph.keep(MemberRef.ofClass(cls.replace('.', '/')));
-                        }
+                    if (!(ins instanceof MethodInsnNode)) continue;
+                    MethodInsnNode mi = (MethodInsnNode) ins;
+                    org.objectweb.asm.tree.analysis.Frame<SourceValue> f = frames[i];
+                    if (f == null) continue;
+                    String arg = reflectionNameArg(mi, f);
+                    if (arg == null) continue;
+                    if (!mi.owner.equals("java/lang/Class")) continue;
+                    if (mi.name.equals(CLASS_FOR_NAME)) {
+                        graph.keep(MemberRef.ofClass(arg.replace('.', '/')));
+                    } else {
+                        // getDeclaredMethod / getMethod / getDeclaredField /
+                        // getField / getDeclaredConstructor: the name is resolved
+                        // reflectively, so it must survive renaming in whatever
+                        // class declares it. "__anykept__" is honoured by
+                        // RetentionDecision for both methods and fields.
+                        graph.keep(new MemberRef("__anykept__", arg, ""));
                     }
                 }
             } catch (Exception ignored) {
-                // constant propagation best-effort; the fast path already covered most cases
+                // best-effort; the fast path already covered most cases
             }
         }
     }
@@ -183,9 +205,46 @@ public final class ReflectionScanner {
         return null;
     }
 
-    private String classConstantFromValue(BasicValue v) {
-        // BasicInterpreter does not track LDC string contents, so this stays null.
-        // The dedicated fast path above covers the constant-propagation case.
+    /**
+     * Recovers the {@code String} name argument of a reflective lookup call from
+     * the data-flow frame at the call site.
+     *
+     * <p>Operand-stack shape (bottom → top) at the call:</p>
+     * <ul>
+     *   <li>{@code Class.forName(String)} — static, so the name is the top slot.</li>
+     *   <li>{@code Class.getDeclaredField(String)} / {@code getField(String)} —
+     *       {@code [receiver, name]}, name on top.</li>
+     *   <li>{@code Class.getDeclaredMethod(String, Class...)} /
+     *       {@code getMethod(String, Class...)} — {@code [receiver, name, types]},
+     *       so the name sits one slot below the top.</li>
+     * </ul>
+     *
+     * <p>Returns {@code null} when the slot is not a literal or the call is not a
+     * name-taking reflective lookup. A computed name is unknowable at build time,
+     * which is exactly why G1/G4 style lookups must instead disable renaming for
+     * the referenced member.</p>
+     */
+    private static String reflectionNameArg(MethodInsnNode mi,
+                                            org.objectweb.asm.tree.analysis.Frame<SourceValue> f) {
+        if (!"java/lang/Class".equals(mi.owner)) return null;
+        boolean classArrayForm = ("getDeclaredMethod".equals(mi.name) || "getMethod".equals(mi.name))
+                && mi.desc.startsWith("(Ljava/lang/String;[Ljava/lang/Class;)");
+        boolean singleStringForm = ("getDeclaredField".equals(mi.name) || "getField".equals(mi.name))
+                && "(Ljava/lang/String;)".equals(mi.desc);
+        boolean forName = "forName".equals(mi.name)
+                && "(Ljava/lang/String;)Ljava/lang/Class;".equals(mi.desc);
+        if (!classArrayForm && !singleStringForm && !forName) return null;
+
+        int nameSlot = classArrayForm ? f.getStackSize() - 2 : f.getStackSize() - 1;
+        if (nameSlot < 0) return null;
+        SourceValue sv = f.getStack(nameSlot);
+        if (sv == null || sv.insns == null) return null;
+        for (org.objectweb.asm.tree.AbstractInsnNode src : sv.insns) {
+            if (src instanceof LdcInsnNode) {
+                Object cst = ((LdcInsnNode) src).cst;
+                if (cst instanceof String) return (String) cst;
+            }
+        }
         return null;
     }
 }

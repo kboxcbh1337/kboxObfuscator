@@ -83,20 +83,20 @@ public final class ResourceGuardLauncher {
         // JNIC is disabled (NativeLoader only injected into JNIC-protected jars).
         preloadNativeLib(sys);
 
-        // 1b. Pre-load JNIC classes via the system classloader BEFORE the
-        // guard loader intercepts. This avoids the jvm.dll crash that occurs
-        // when the guard loader tries to resolve native methods via parent.
+        // 1b. JNIC classes are NOT pre-loaded through the system loader.
+        //
+        // Doing so put every JNIC owner (and, transitively, its whole reference
+        // closure) into the 'app' loader while the rest of the application was
+        // defined by the guard loader — the same binary type then existed twice
+        // and any cross-loader type sharing threw
+        //   LinkageError: loader constraint violation
+        // (and, for encrypted dependencies, the parent read raw KBCE ciphertext:
+        //   ClassFormatError: Incompatible magic value 1647960710).
+        // The guard loader now defines JNIC classes itself and binds their native
+        // methods via RegisterNatives, so no pre-load (and no swallowing of the
+        // resulting errors) is needed. The list is still read here because the
+        // guard needs it for its own load policy.
         java.util.Set<String> jnicClassNames = readJnicClassList(sys);
-        if (jnicClassNames != null) {
-            for (String cn : jnicClassNames) {
-                String dotted = cn.replace('/', '.');
-                try {
-                    Class.forName(dotted, true, sys);
-                } catch (Throwable t) {
-                    System.err.println("[KBOX-NATIVE] Pre-load JNIC class failed: " + dotted + " - " + t);
-                }
-            }
-        }
         byte[] loaderSeed = seed != null ? seed : new byte[32];
         ResourceGuardClassLoader guard = new ResourceGuardClassLoader(sys, loaderSeed);
 

@@ -59,8 +59,11 @@ public final class NativeCryptoBuilder {
                         + "using Java HKDF path: " + oneLine(cres.log));
                 return null;
             }
-            // 先过 kboXShield（函数级虚拟化/变异/平坦化）再 KBNL；失败自动降级。
-            NativePacker.Packed packed = NativePacker.packShielded(cres.library, workDir, "ncrypto");
+            // shieldNativeOutput 开启时先过 kboXShield（函数级虚拟化/变异/平坦化）再 KBNL；
+            // 关闭时只做 KBNL。失败自动降级。
+            NativePacker.Packed packed = cfg.isShieldNativeOutput()
+                    ? NativePacker.packShielded(cres.library, workDir, "ncrypto")
+                    : NativePacker.pack(cres.library);
             KBoxLog.info(TAG, "Native crypto lib packed: " + packed.blob.length + " bytes"
                     + (packed.shielded ? " [inner PE shell + VM]" : ""));
             return packed.blob;

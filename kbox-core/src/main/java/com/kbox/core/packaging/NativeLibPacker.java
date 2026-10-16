@@ -58,13 +58,20 @@ public final class NativeLibPacker {
         public final boolean virtualized;
         /** 原始原生库字节数。 */
         public final int rawLen;
+        /** 指令集/架构：x64 / x86 / arm64 / unknown（由格式头解析）。 */
+        public final String arch;
+        /** 保护处置：shield+vm / packing-only / encrypt-only。 */
+        public final String treatment;
 
-        Entry(String logicalPath, String blobPath, String ext, boolean virtualized, int rawLen) {
+        Entry(String logicalPath, String blobPath, String ext, boolean virtualized, int rawLen,
+              String arch, String treatment) {
             this.logicalPath = logicalPath;
             this.blobPath = blobPath;
             this.ext = ext;
             this.virtualized = virtualized;
             this.rawLen = rawLen;
+            this.arch = arch;
+            this.treatment = treatment;
         }
     }
 
@@ -73,6 +80,12 @@ public final class NativeLibPacker {
         public final List<Entry> entries = new ArrayList<>();
         /** blobPath → KBNL blob（已压缩+ChaCha20 加密）。 */
         public final Map<String, byte[]> blobs = new LinkedHashMap<>();
+        /**
+         * 人类可读的「二进制覆盖报告」（每个原生库一行：路径 | 格式 | 架构 | 处置 | 原始/ blob 字节）。
+         * 由 {@code Packager} 写入 {@code META-INF/kbox/native-coverage.txt}，让“哪些文件被保护到什么程度”
+         * 可审计，而不是静默降级。
+         */
+        public String report = "";
         private final Map<String, Entry> byLogical = new LinkedHashMap<>();
 
         public boolean contains(String logicalPath) {
@@ -107,6 +120,13 @@ public final class NativeLibPacker {
         } catch (IOException e) {
             KBoxLog.warn(TAG, "Cannot create work dir " + workDir + ": " + e.getMessage());
         }
+        StringBuilder report = new StringBuilder();
+        report.append("# KBox 二进制覆盖报告（native-coverage）\n")
+              .append("# path | format | arch | treatment | sizes\n")
+              .append("# treatment: shield+vm = kboXShield PE 壳(函数级虚拟化/变异/平坦化); ")
+              .append("harden+encrypt = 结构加固(去节表/去符号表) + KBNL 加密; ")
+              .append("encrypt-only = 仅 KBNL(压缩+ChaCha20) 加密存储\n")
+              .append("# 说明: shield+vm 仅对 PE(x86/x64) 可用; ELF(.so)/Mach-O(.dylib) 走 harden+encrypt\n");
         int idx = 0;
         for (Map.Entry<String, byte[]> e : graph.getResources().entrySet()) {
             String path = e.getKey();
@@ -127,6 +147,8 @@ public final class NativeLibPacker {
             boolean isDll = "dll".equals(ext);
             byte[] lib = raw;
             boolean virtualized = false;
+            boolean hardened = false;
+            String hardenNote = "";
             if (isDll) {
                 try {
                     lib = shieldPack(raw, workDir, idx);
@@ -135,18 +157,88 @@ public final class NativeLibPacker {
                     KBoxLog.warn(TAG, "ShieldPacker failed for " + path + ": " + t.getMessage()
                             + " — falling back to encrypted storage");
                 }
+            } else {
+                // ELF / Mach-O：先做结构加固（去节表 / 去符号表），再 KBNL 加密。
+                // 这一步作用于“解密落盘后的明文镜像”，去掉逆向者最易用的符号/节名入口。
+                NativeBinaryHardener.Result hr = NativeBinaryHardener.harden(ext, raw);
+                if (hr != null) {
+                    lib = hr.bytes;
+                    hardened = true;
+                    hardenNote = hr.note;
+                }
             }
             com.kbox.core.jnic.NativePacker.Packed packed = com.kbox.core.jnic.NativePacker.pack(lib);
             String blobPath = "META-INF/kbox/natlib/" + idx + ".bin";
-            r.add(new Entry(path, blobPath, ext, virtualized, raw.length), packed.blob);
+            String arch = detectArch(ext, raw);
+            // 处置语义：
+            //   dll   -> shield+vm（kboXShield 壳 + x64 函数级虚拟化）；加壳失败则 encrypt-only
+            //   so/dylib -> harden+encrypt（结构加固 + KBNL）；结构不满足前提则 encrypt-only
+            String treatment = isDll
+                    ? (virtualized ? "shield+vm" : "encrypt-only")
+                    : (hardened ? "harden+encrypt" : "encrypt-only");
+            r.add(new Entry(path, blobPath, ext, virtualized, raw.length, arch, treatment), packed.blob);
+            report.append(path).append(" | ").append(ext).append(" | ").append(arch)
+                    .append(" | ").append(treatment)
+                    .append(" | raw=").append(raw.length).append("B")
+                    .append(" | blob=").append(packed.blob.length).append("B")
+                    .append(magicDetected ? " | 内容魔数识别" : "")
+                    .append(hardenNote.isEmpty() ? "" : " | " + hardenNote)
+                    .append('\n');
             KBoxLog.info(TAG, "Packed native lib " + path + " -> " + blobPath
-                    + " (mode=" + (virtualized ? "shield+vm" : "encrypt-only")
+                    + " (format=" + ext + ", arch=" + arch
+                    + ", mode=" + treatment
                     + (magicDetected ? ", 内容魔数识别" : "")
+                    + (hardenNote.isEmpty() ? "" : ", " + hardenNote)
                     + ", raw=" + raw.length + "B, blob=" + packed.blob.length + "B)");
             idx++;
         }
         KBoxLog.info(TAG, "Native library packing complete: " + r.entries.size() + " lib(s)");
+        r.report = report.toString();
         return r;
+    }
+
+    /**
+     * 由格式头解析指令集架构，返回 {@code x64}/{@code x86}/{@code arm64}/{@code unknown}。
+     * 只读头部字段，不做完整性校验（分类用途）。
+     */
+    public static String detectArch(String ext, byte[] b) {
+        try {
+            int n = (b == null) ? 0 : b.length;
+            if (n < 64) return "unknown";
+            if ("dll".equals(ext)) {
+                int lfanew = i32le(b, 0x3C);
+                if (lfanew <= 0 || lfanew + 6 > n) return "unknown";
+                int machine = (b[lfanew + 4] & 0xFF) | ((b[lfanew + 5] & 0xFF) << 8);
+                if (machine == 0x8664) return "x64";
+                if (machine == 0x014C) return "x86";
+                if (machine == 0xAA64) return "arm64";
+                return "unknown";
+            }
+            if ("so".equals(ext)) {
+                boolean be = (b[5] & 0xFF) == 2;
+                int m = be ? (((b[18] & 0xFF) << 8) | (b[19] & 0xFF))
+                           : ((b[18] & 0xFF) | ((b[19] & 0xFF) << 8));
+                if (m == 0x3E) return "x64";
+                if (m == 0x03) return "x86";
+                if (m == 0xB7) return "arm64";
+                return "unknown";
+            }
+            if ("dylib".equals(ext)) {
+                int m = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
+                        | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+                boolean le = (m == 0xCEFAEDFE || m == 0xCFFAEDFE);
+                int cpu = le
+                        ? ((b[4] & 0xFF) | ((b[5] & 0xFF) << 8) | ((b[6] & 0xFF) << 16) | ((b[7] & 0xFF) << 24))
+                        : (((b[4] & 0xFF) << 24) | ((b[5] & 0xFF) << 16) | ((b[6] & 0xFF) << 8) | (b[7] & 0xFF));
+                if (cpu == 0x01000007) return "x64";
+                if (cpu == 0x00000007) return "x86";
+                if (cpu == 0x0100000C) return "arm64";
+                return "unknown";
+            }
+        } catch (Throwable ignored) {
+            // header shorter than expected: fall through to unknown
+        }
+        return "unknown";
     }
 
     /**

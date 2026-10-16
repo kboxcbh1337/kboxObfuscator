@@ -310,6 +310,7 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
     <div class="grid">
       <label class="toggle"><input type="checkbox" id="bfLoader"><span class="sw"></span><span class="lbl">Brainfuck 混沌加载<span class="sub">类/资源打包进 native 解码器 · 明文只驻 native 堆</span></span></label>
       <label class="toggle"><input type="checkbox" id="bfShield"><span class="sw"></span><span class="lbl">BrainfuckShield 二次虚拟化<span class="sub">VMP 之上磁带化 · 需 VMP</span></span></label>
+      <label class="toggle"><input type="checkbox" id="bfMcHybrid"><span class="sw"></span><span class="lbl">BF×MC 混合模式<span class="sub">MC/Forge/Fabric mod：元数据+入口类+混入包明文，其余进 BF blob</span></span></label>
       <label class="toggle"><input type="checkbox" id="bfvm"><span class="sw"></span><span class="lbl">BFVM 全方法虚拟化<span class="sub">方法体→Brainfuck 磁带程序 · 需 config 指定 bfvmMethod</span></span></label>
       <label class="toggle"><input type="checkbox" id="whiteboxStrings"><span class="sw"></span><span class="lbl">白盒字符串<span class="sub">单点查找表解密 · 字节码无密钥</span></span></label>
       <label class="toggle"><input type="checkbox" id="obfConstants"><span class="sw"></span><span class="lbl">常量查表加密<span class="sub">_KboxConsts.I(k)=T[k]^K</span></span></label>
@@ -345,6 +346,8 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
         <select id="typeConfusion"><option value="0" selected>0 · 关</option><option value="1">1 · 注入</option><option value="2">2 · 深</option></select></div>
       <div class="field"><label>交织表达式常量</label>
         <select id="mbaConstants"><option value="0" selected>0 · 关</option><option value="1">1 · 基础</option><option value="2">2 · 深</option></select></div>
+      <div class="field"><label>运行时 MBA 重写</label>
+        <select id="mbaRewrite"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 强</option><option value="4">4</option><option value="5">5 · 最强</option></select></div>
       <div class="field"><label>S2 不透明状态机</label>
         <select id="opaqueStateMachine"><option value="0" selected>0 · 关</option><option value="1">1</option><option value="2">2</option><option value="3">3 · 最强</option></select></div>
       <div class="field"><label>S4 蜜罐诱饵</label>
@@ -625,18 +628,18 @@ async function poll(){
 
 /* ---------- 一键全开：把全部开关/滑杆置为最大强度 ---------- */
 const MAX_SELECTS={'cfStrength':3,'strStrength':3,'antiDec':3,'nativeShell':3,'bfShieldLevel':3,
-  'typeConfusion':2,'mbaConstants':2,'opaqueStateMachine':3,'honeypot':3,'methodSplit':3,
+  'typeConfusion':2,'mbaConstants':2,'mbaRewrite':3,'opaqueStateMachine':3,'honeypot':3,'methodSplit':3,
   'sentinelInterleave':3,'blobMockFill':3,'stackFrameRedirect':3,'entropyTimeAnchor':3,
   'selfWipeSections':3,'processHeartbeat':3,'honeypotPe':3,'oneTimeSemantic':3,'lineageChain':3,
   'selfRefAuth':3,'multiRep':3,'polyGold':3,'signalPoison':3,'buildSigBind':3};
 const MAX_CHECKED=['rename','strings','scatter','cf','classEnc','vmp','jnic','resources','kotlin',
   'antiDebug','vmpSelfCheck','integrity','exJump','nativeAntiHook','bfLoader','bfShield','bfvm',
   'whiteboxStrings','obfConstants','vmpNative','autoAdaptMc','reflectionGate','jnicEpl',
-  'protectNativeLibs',
+  'protectNativeLibs','shieldNativeOutput',
   'hideCallGraph','fakeDebugInfo','methodInlineExtract','eraseAnnotations','nullGuard',
   'vmpProtectRuntime','silentShield'];
 const DEFAULT_SELECTS={'cfStrength':2,'strStrength':3,'antiDec':0,'nativeShell':3,'bfShieldLevel':3,
-  'typeConfusion':0,'mbaConstants':0,'opaqueStateMachine':0,'honeypot':0,'methodSplit':0,
+  'typeConfusion':0,'mbaConstants':0,'mbaRewrite':0,'opaqueStateMachine':0,'honeypot':0,'methodSplit':0,
   'sentinelInterleave':0,'blobMockFill':0,'stackFrameRedirect':0,'entropyTimeAnchor':0,
   'selfWipeSections':0,'processHeartbeat':0,'honeypotPe':0,'oneTimeSemantic':0,'lineageChain':0,
   'selfRefAuth':0,'multiRep':0,'polyGold':0,'signalPoison':0,'buildSigBind':0};
@@ -654,7 +657,7 @@ function toggleAllMax(on){
 /* 数字选项的中文名（用于把推荐集渲染成一行可读摘要；键与控件 id 一致）。 */
 const NUM_LABELS={'cfStrength':'控制流强度','strStrength':'字符串强度','antiDec':'反编译器',
   'nativeShell':'nativeShell 增强壳','bfShieldLevel':'BrainfuckShield','typeConfusion':'类型混淆',
-  'mbaConstants':'交织表达式','opaqueStateMachine':'S2 不透明状态机','honeypot':'S4 蜜罐诱饵',
+  'mbaConstants':'交织表达式','mbaRewrite':'运行时 MBA 重写','opaqueStateMachine':'S2 不透明状态机','honeypot':'S4 蜜罐诱饵',
   'methodSplit':'S1 方法切分','sentinelInterleave':'S3 sentinel 交错','blobMockFill':'S5 blob mock',
   'stackFrameRedirect':'D1 栈帧重定向','entropyTimeAnchor':'D2 熵·时间锚','selfWipeSections':'D3 节自擦',
   'processHeartbeat':'D4 进程心跳','honeypotPe':'D5 蜜罐 PE','oneTimeSemantic':'C1 一次性语义',
@@ -904,13 +907,16 @@ async function protect(){
     cfStrength:+$('cfStrength').value,strStrength:+$('strStrength').value,
     antiDec:+$('antiDec').value,watermark:$('watermark').value.trim(),
     bfLoader:$('bfLoader').checked,bfShield:$('bfShield').checked,bfShieldLevel:+$('bfShieldLevel').value,
+    bfMcHybrid:$('bfMcHybrid').checked,
     bfvm:$('bfvm').checked,
     nativeShell:+$('nativeShell').value,typeConfusion:+$('typeConfusion').value,mbaConstants:+$('mbaConstants').value,
+    mbaRewrite:+$('mbaRewrite').value,
     whiteboxStrings:$('whiteboxStrings').checked,obfConstants:$('obfConstants').checked,
     opaqueStateMachine:+$('opaqueStateMachine').value,honeypot:+$('honeypot').value,methodSplit:+$('methodSplit').value,
     silentShield:$('silentShield').checked,
     vmpNative:$('vmpNative').checked,autoAdaptMc:$('autoAdaptMc').checked,reflectionGate:$('reflectionGate').checked,
     jnicEpl:$('jnicEpl').checked,protectNativeLibs:$('protectNativeLibs').checked,
+    shieldNativeOutput:$('shieldNativeOutput').checked,
     hideCallGraph:$('hideCallGraph').checked,fakeDebugInfo:$('fakeDebugInfo').checked,
     methodInlineExtract:$('methodInlineExtract').checked,eraseAnnotations:$('eraseAnnotations').checked,
     nullGuard:$('nullGuard').checked,vmpProtectRuntime:$('vmpProtectRuntime').checked,

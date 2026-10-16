@@ -687,6 +687,12 @@ public final class Packager {
                 }
                 putEntry(out, clsRoot + "META-INF/kbox/natlibs.list",
                         lb.toString().getBytes(StandardCharsets.UTF_8));
+                // 二进制覆盖报告：每个原生库「格式 | 架构 | 处置」可审计，避免“静默降级”被误读为“已全量保护”。
+                if (natLibs.report != null && !natLibs.report.isEmpty()) {
+                    putEntry(out, clsRoot + "META-INF/kbox/native-coverage.txt",
+                            natLibs.report.getBytes(StandardCharsets.UTF_8));
+                    KBoxLog.info(TAG, "Wrote native coverage report -> META-INF/kbox/native-coverage.txt");
+                }
                 rtCount += injectNativeLoaderClasses(out, clsRoot, graph, rtInjected);
                 KBoxLog.info(TAG, "Wrote " + natLibs.entries.size()
                         + " packed native lib blob(s) -> META-INF/kbox/natlib/*.bin (+ natlibs.list)");
@@ -3139,7 +3145,21 @@ public final class Packager {
                     return method ? mapping.mapMethod(cur, name, desc)
                             : mapping.mapField(cur, name, desc);
                 }
+                // Graph keys are the RENAMED internal names (the pipeline replaced
+                // every ClassNode with its remapped copy before packaging), while
+                // the hierarchy we are walking comes from the ORIGINAL bytes. A
+                // direct lookup therefore always missed and the walk stopped at the
+                // first class that did not itself declare the member.
+                //
+                // Concretely: a rolled-back subclass kept calling
+                // `invokevirtual <Sub>.protectedValue()` whose declaration lives in
+                // a renamed superclass. The walk never reached the superclass, the
+                // call site kept the OLD member name while the declaration got the
+                // NEW one, and the JVM raised
+                //   NoSuchMethodError: java.lang.String ...CrossHelper.protectedValue()
+                // Mapping the key through the rename map restores the walk.
                 ClassNode cn = graph.getClasses().get(cur);
+                if (cn == null) cn = graph.getClasses().get(mapping.mapClass(cur));
                 if (cn == null) continue;
                 if (cn.superName != null && visited.add(cn.superName)) queue.add(cn.superName);
                 if (cn.interfaces != null) {

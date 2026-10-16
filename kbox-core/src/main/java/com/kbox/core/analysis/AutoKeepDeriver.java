@@ -169,9 +169,18 @@ public final class AutoKeepDeriver {
                     // Mockito
                     "Mock", "Spy", "InjectMocks", "Captor", "MockBean",
                     // Misc
+                    // NOTE: pure JDK meta-annotations (Override / Deprecated /
+                    // SuppressWarnings / FunctionalInterface) are deliberately NOT
+                    // listed. They carry no runtime contract, so treating them as
+                    // "framework annotations" kept a class for no reason — and
+                    // because keeping is a per-CLASS decision, an @FunctionalInterface
+                    // nested interface stayed at its original name while its enclosing
+                    // class was renamed. That mixed loader/name topology is one of the
+                    // direct carriers of the "loader constraint violation" LinkageError
+                    // and it also leaked the original nested-class names into the
+                    // output jar (65% plaintext-residue finding).
                     "PostConstruct", "PreDestroy", "Resource",
-                    "Generated", "SuppressWarnings", "Override",
-                    "FunctionalInterface", "Deprecated",
+                    "Generated",
                     // gRPC
                     "GrpcService",
                     // Quartz

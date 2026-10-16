@@ -143,6 +143,19 @@ public final class ProtectionConfig {
      * table pass is skipped while it is active.
      */
     private int mbaConstants = 0;
+
+    /**
+     * Run-time Mixed Boolean-Arithmetic rewrite level, 0..3 (0=off).
+     *
+     * <p>Complementary to {@link #mbaConstants}: while that pass rewrites compile-time
+     * constants, this one rewrites the <b>live arithmetic between two run-time values</b>
+     * — every {@code IADD/ISUB/IAND/IOR/IXOR} becomes an algebraically exact tree of
+     * bitwise primitives (e.g. {@code a + b} -> {@code (a^b) + ((a&b)<<1)}), recursively
+     * re-expanded per level so each site's shape differs. This is the ZKM/OPS-class
+     * arithmetic obfuscation KBox previously relied on only for constants. Higher =
+     * deeper trees = larger methods.</p>
+     */
+    private int mbaRewrite = 0;
     /**
      * S4 honeypot bait level, 0..3 (0=off).
      * {@code kboxDedeobfShieldV1} static bait: inject synthetic classes packed
@@ -415,6 +428,34 @@ public final class ProtectionConfig {
      */
     private boolean protectNativeLibs = false;
 
+    /**
+     * kboXShield 加壳 JNIC / VMP / native-crypto 原生产物（本选项）。
+     *
+     * <p>开启后，混淆阶段生成的三个原生库在进入 KBNL 容器<b>之前</b>，先经
+     * {@code ShieldPacker} 做一层 kboXShield PE 壳：全节 ChaCha20 加密 + 合成导入表 +
+     * 函数级虚拟化（x64 按 .pdata 逐函数，入口 {@code E9 rel32} 改写）+ 指令变异 +
+     * 控制流平坦化（双族 VM）。产物因此是<b>两层</b>——<i>外层</i> KBNL（压缩 +
+     * ChaCha20 + 遮蔽魔数）+ <i>内层</i> PE 壳/VM，落盘加载前 JNIC/VMP 的内核不再以
+     * 可反汇编的明文 PE 形式存在，攻击者拿到 {@code native.bin/vmp.bin} 也无法直接
+     * 静态分析其中的 VM 解释器与 JNI stub。</p>
+     *
+     * <p>作用对象：</p>
+     * <ul>
+     *   <li>{@code META-INF/kbox/native.bin} —— JNIC 原生库（JniCTranslator 产物）</li>
+     *   <li>{@code META-INF/kbox/vmp.bin} —— VMP 原生解释器（编译 {@code kbox_vmp_core.c}）</li>
+     *   <li>{@code META-INF/kbox/native-crypto.bin} —— native crypto 库（{@code kbox_vmp_crypto.c}）</li>
+     * </ul>
+     *
+     * <p>与 {@link #protectNativeLibs} 的区别：后者针对<b>用户 jar 内自带</b>的
+     * .dll/.so/.dylib（业务原生库）；本选项针对<b>混淆器自身生成</b>的 JNIC/VMP 原生产物。
+     * 两者互不影响，可各自独立开关。</p>
+     *
+     * <p>默认 {@code true}（保持既有行为）。仅在非 Windows / 目标壳不支持的场景（如 CI 上
+     * 只想看 JNIC/VMP 的 Java 侧降级路径）才建议关闭。加壳本身失败时<b>自动降级</b>为
+     * 直接 KBNL，绝不使构建失败。</p>
+     */
+    private boolean shieldNativeOutput = true;
+
     /** Publisher Ed25519 public key (SPKI hex). When set, the packager embeds it
      *  (masked) into the jar and gates class/VM decryption on a valid license. */
     private String licPublicKey = null;
@@ -623,6 +664,9 @@ public final class ProtectionConfig {
     public void setObfuscateConstants(boolean v) { obfuscateConstants = v; }
     public int getMbaConstants() { return mbaConstants; }
     public void setMbaConstants(int v) { mbaConstants = Math.max(0, Math.min(2, v)); }
+    /** @see #mbaRewrite */
+    public int getMbaRewrite() { return mbaRewrite; }
+    public void setMbaRewrite(int v) { mbaRewrite = Math.max(0, Math.min(5, v)); }
     public int getHoneypotLevel() { return honeypotLevel; }
     public void setHoneypotLevel(int v) { honeypotLevel = Math.max(0, Math.min(3, v)); }
     public int getOpaqueStateMachine() { return opaqueStateMachine; }
@@ -826,6 +870,9 @@ public final class ProtectionConfig {
     public void setNativeShell(int v) { nativeShell = v; }
     public boolean isProtectNativeLibs() { return protectNativeLibs; }
     public void setProtectNativeLibs(boolean v) { protectNativeLibs = v; }
+    /** @see #shieldNativeOutput */
+    public boolean isShieldNativeOutput() { return shieldNativeOutput; }
+    public void setShieldNativeOutput(boolean v) { shieldNativeOutput = v; }
 
     public String getLicPublicKey() { return licPublicKey; }
     public void setLicPublicKey(String v) { licPublicKey = (v == null || v.isEmpty()) ? null : v; }
@@ -968,6 +1015,7 @@ public final class ProtectionConfig {
         c.whiteboxStrings = whiteboxStrings;
         c.obfuscateConstants = obfuscateConstants;
         c.mbaConstants = mbaConstants;
+        c.mbaRewrite = mbaRewrite;
         c.parallelThreads = parallelThreads;
         c.gpuAccel = gpuAccel;
         c.silentShield = silentShield;
@@ -1011,6 +1059,7 @@ public final class ProtectionConfig {
                 + ", nullGuard=" + nullGuard
                 + ", keepPrefix=" + keepPrefixes + ", cc=" + cc
                 + ", nativeLibs=" + protectNativeLibs
+                + ", shieldNativeOutput=" + shieldNativeOutput
                 + ", vmpExc=" + vmpExcludePrefixes + ", jnicExc=" + jnicExcludePrefixes
                 + ", lic=" + isLicensed()
                 + ", scope=" + obfuscationScope
@@ -1022,6 +1071,7 @@ public final class ProtectionConfig {
                 + ", renamePackages=" + renamePackages
                 + ", fixedXorKey=" + fixedXorKey
                 + ", mbaConst=" + mbaConstants
+                + ", mbaRewrite=" + mbaRewrite
                 + ", jnicFull=" + jnicFullCoverage
                 + ", autoKeep=" + autoKeepRules
                 + ", silentShield=" + silentShield
@@ -1072,9 +1122,15 @@ public final class ProtectionConfig {
         hideCallGraph = true;
         fakeDebugInfo = true;
         methodInlineExtract = true;
-        eraseAnnotations = true;
+        // eraseAnnotations is deliberately NOT part of the max preset: erasing
+        // RUNTIME annotations changes observable application semantics (an app
+        // that reads its own annotations suddenly sees null), and the erase list
+        // can never enumerate every annotation a framework reads reflectively.
+        // The pass stays available as an explicit opt-in.
         obfuscateConstants = true;
         mbaConstants = 2;
+        // Run-time MBA rewrite (live arithmetic -> bitwise identity trees).
+        mbaRewrite = 3;
         typeConfusionStrength = 2;
         // ---- anti analysis / debug ----
         antiDecompilerLevel = 3;
@@ -1082,7 +1138,11 @@ public final class ProtectionConfig {
         vmpSelfCheck = true;
         integrityCheck = true;
         nativeAntiHook = true;
-        nullGuard = true;
+        // nullGuard is deliberately NOT part of the max preset: it rewrites the
+        // observable semantics of Class.getResourceAsStream (a genuinely missing
+        // resource stops returning null and yields an empty stream instead), so
+        // any code that tests for null to detect absence silently flips. The pass
+        // stays available as an explicit opt-in.
         // ---- VMP + native VMP ----
         enableVmp = true;
         vmpFullCoverage = true;
@@ -1100,6 +1160,8 @@ public final class ProtectionConfig {
         nativeShell = 3;
         // ---- jar 自带原生库完整加壳（.dll 走 kboXShield PE 壳 + 虚拟化；.so/.dylib 加密） ----
         protectNativeLibs = true;
+        // ---- JNIC/VMP/native-crypto 原生产物加壳（KBNL 外层 + kboXShield 内层 PE 壳/VM） ----
+        shieldNativeOutput = true;
         // ---- class encryption / resources（BF 模式下自动降档，降级时恢复） ----
         encryptClasses = true;
         obfuscateResources = true;

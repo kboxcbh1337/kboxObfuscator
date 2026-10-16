@@ -15,9 +15,32 @@ java -jar kbox-protector.jar -i app.jar -o protected/app.jar \
     --config kbox.conf \
     --verbose
 
-# 启动 HTML UI（内置 HTTP 服务，自动打开浏览器；白绿/黑绿双主题）
+# 启动界面（默认弹窗询问用哪套：原版 HTML UI / ZKM 式 Swing UI）
 java -jar kbox-protector.jar --gui
+# 直接指定，跳过询问
+java -jar kbox-protector.jar --gui --ui html
+java -jar kbox-protector.jar --gui --ui zkm
 ```
+
+### 两套界面
+
+| 界面 | 启动方式 | 说明 |
+|---|---|---|
+| **原版 HTML UI** | `--gui --ui html`（或 `ask` 时选第一项） | 内嵌 HTTP 服务 + 浏览器；白绿/黑绿双主题、一键全开、实时日志 |
+| **ZKM 式 UI** | `--gui --ui zkm`（或 `ask` 时选第二项） | 原生 Swing：菜单栏 / 工具栏 / 左侧类浏览器 / 右侧选项标签页 / 底部日志与进度条 |
+
+> `ask`（默认）：运行时弹窗二选一；**headless 环境自动回落 HTML UI**。两套界面都能互相切换（ZKM 菜单「使用原版 HTML UI…」）。
+
+### 常用强度/适配开关（详见 [CONFIG.md](CONFIG.md)）
+
+| 配置键 | 作用 |
+|---|---|
+| `mbaRewrite` | 运行时 MBA 重写（活值之间的 `+ - & \| ^` → 位运算恒等树），`0..5`，越高越强 |
+| `mbaConstants` | 交织表达式常量，`0..2` |
+| `shieldNativeOutput` | **JNIC/VMP/native-crypto 原生产物加壳**（KBNL 外层 + PE 壳/VM 内层），默认开 |
+| `protectNativeLibs` | **jar 内自带原生库加壳**：`.dll`→`shield+vm`；`.so/.dylib`→`harden+encrypt` |
+| `brainfuckMcHybrid` | BF×MC 混合模式（MC/Forge/Fabric mod 的元数据+入口类保持明文，其余进 BF blob） |
+| `allMax` | 一键全开（含上述默认项） |
 
 ---
 
@@ -28,7 +51,8 @@ java -jar kbox-protector.jar --gui
 | `--input`  | `-i` | `PATH`  | 输入 jar（普通 jar 或 Spring Boot Fat Jar） |
 | `--output` | `-o` | `PATH`  | 输出 jar 路径 |
 | `--config` | `-c` | `PATH`  | KBox 配置文件（可选，缺省使用安全默认值） |
-| `--gui`    | —    | flag   | 启动内置 HTML UI（内嵌 HTTP 服务 + 浏览器，不再运行 headless 流程） |
+| `--gui`    | —    | flag   | 启动 UI（默认会询问使用哪套界面；见 `--ui`） |
+| `--ui`     | html\|zkm\|ask | string | 选择界面（默认 `ask`，运行时询问）：`html`=原版内嵌 HTML UI；`zkm`=ZKM 式原生 Swing UI。headless 环境下 `ask` 自动回落 `html`。 |
 | `--verbose`| `-v` | flag   | 启用 DEBUG 日志（完整进度 + 异常栈） |
 | `--debug-cf` | —  | flag   | 把每个类 / 方法的控制流处理日志直接打印到 stdout（始终可见，与 `--verbose` 独立） |
 | `--mc-preset` | —  | `NAME` | 应用 Minecraft Mod 加载器预设：`NEOFORGE` / `FORGE` / `FABRIC` / `BUKKIT` / `MIXIN` |
@@ -37,6 +61,7 @@ java -jar kbox-protector.jar --gui
 | `--exclude`| —    | `PATTERN` | 类排除模式（可重复）。`SELECTIVE` 与 `EXCLUDE` 模式下生效 |
 | `--list-presets` | — | flag | 列出所有可用的 Minecraft Mod 预设 |
 | `--shield` | — | `IN.exe OUT.exe` | **kboXShield 独立功能线**：对 Windows PE 加壳（不读 `--input/--output`，详见第 11 节） |
+| `--shield-native-output` | — | `true\|false` | 是否把 JNIC/VMP/native-crypto 原生产物经 kboXShield 加壳后再 KBNL（默认 `true`，同 `shieldNativeOutput` 配置键） |
 | `--help`   | `-h` | flag   | 显示帮助 |
 
 > 字符串模式使用 Glob 语法：`**` = 任意多级包路径，`*` = 单层包内通配。
@@ -225,10 +250,10 @@ A：NeoForge / Forge 选对应预设；Fabric 选 `FABRIC`；含 Mixin 的模组
 
 ```powershell
 # 1) CLI（默认档：def_flags=0x0003FFFF、def_policy=7、跟随输入架构）
-java -jar kboxObfuscatorb3.jar --shield app.exe app-protected.exe
+java -jar kbox-protector.jar --shield app.exe app-protected.exe
 
 # 2) HTML UI：页面内「kboXShield · PE 加壳」独立面板
-java -jar kboxObfuscatorb3.jar --gui
+java -jar kbox-protector.jar --gui --ui html
 ```
 
 **编程入口**（可传选项）：
@@ -288,3 +313,44 @@ System.out.println(rep.toText());
   请先在测试样本上验证再加壳；自检只覆盖**静态**结构，不能替代实机运行验证；
 - 反调试启用时不要附加调试器运行产物（stub 会走 `.Ldead` 死循环）；
 - DLL 场景建议把响应策略降为「延迟 + 诱饵」（`def_policy=3`，不终止宿主进程）——UI 的智能适配已自动这样推荐。
+
+---
+
+## 12. 原生库与 JNIC/VMP 产物的二进制覆盖
+
+KBox 有**两条独立**的原生保护线，可各自开关：
+
+| 开关 | 作用对象 | 处置 |
+|---|---|---|
+| `shieldNativeOutput`（默认 **开**） | 混淆器**自身生成**的 JNIC/VMP/native-crypto 库（`native.bin`/`vmp.bin`/`native-crypto.bin`） | 先过 kboXShield PE 壳（函数级虚拟化/变异/平坦化）→ 再 KBNL 加密 |
+| `protectNativeLibs`（默认 关） | **用户 jar 内自带**的原生库（全目录扫描，扩展名优先 + 内容魔数兜底） | `.dll` → `shield+vm`；`.so/.dylib` → `harden+encrypt`；其余降级 `encrypt-only` |
+
+### 处置标签含义
+
+| 标签 | 含义 |
+|---|---|
+| `shield+vm` | kboXShield 完整加壳：全节 ChaCha20 + 合成导入表 + 函数级虚拟化（x64）+ 指令变异 + 控制流平坦化 |
+| `harden+encrypt` | **结构加固 + KBNL 加密**：ELF 清除节头表（`e_shoff/e_shnum/e_shstrndx` 归零并整段清零）；Mach-O 清零 `LC_SYMTAB` 的 nlist / 字符串表区间 —— 去掉符号名与节名入口，再压缩 + ChaCha20 |
+| `encrypt-only` | 仅 KBNL（压缩 + ChaCha20）加密存储 |
+
+> `harden+encrypt` **不等于** PE 的函数级虚拟化壳：本仓库的 shell/engine 资产是 PE 专用手写汇编 blob，
+> 为 ELF/Mach-O 实现等价加载器 stub 需要按格式+架构重写并在 Linux/macOS 端到端验证。此限制**写入产物内报告**，不隐藏。
+
+### 可审计的覆盖报告
+
+开启 `protectNativeLibs` 后，产物 jar 内会写入 **`META-INF/kbox/native-coverage.txt`**：
+
+```
+# path | format | arch | treatment | sizes
+nat/libx.so    | so    | x64 | harden+encrypt | raw=1024B | blob=156B | elf: section-header-table removed (...)
+nat/hello.dll  | dll   | x64 | shield+vm      | raw=93696B| blob=128790B
+nat/liby.dylib | dylib | x64 | harden+encrypt | raw=1024B | blob=116B | macho: LC_SYMTAB tables zeroed (48B)
+```
+
+架构由格式头解析（PE `machine` / ELF `e_machine` / Mach-O `cputype`）。同一批处理的清单另见 `META-INF/kbox/natlibs.list`。
+
+### 运行期
+
+`NativeLoader.loadNativeLibs()`（引导类在应用 `main` 之前自动调用）按当前 OS 匹配格式：
+Windows 优先 **in-memory 模块映射**（明文不落盘），否则解密落盘 `System.load` 后**立即零填充擦除**
+（`deleteOnExit` + shutdown hook + 独立 helper 进程兜底）。也可显式 `NativeLoader.loadNativeLib(String 逻辑路径)` 按名加载。

@@ -774,10 +774,17 @@ public final class NativeCompiler {
      * falls back to the byte-identical Java {@code VmpInterpreter}, so a broken
      * toolchain never breaks the output.
      *
+     * @param workDir scratch directory for the generated C source and compiled lib.
+     * @param userCc  configured C compiler path (may be {@code null} for PATH lookup).
+     * @param shield  when {@code true}, the compiled shared library is passed through
+     *                the kboXShield PE packer (function-level virtualization /
+     *                mutation / CFG flattening) <b>before</b> KBNL packing — the
+     *                {@code shieldNativeOutput} option. When {@code false} the library
+     *                is only KBNL-packed. Shield failure always degrades to plain KBNL.
      * @return the packed native blob, or null when the source is absent or the
      *         compile failed.
      */
-    public static byte[] compileVmp(Path workDir, String userCc) throws IOException {
+    public static byte[] compileVmp(Path workDir, String userCc, boolean shield) throws IOException {
         Path vmpDir = workDir.resolve("kbox-vmp-native");
         Path src = writeVmpSource(vmpDir);
         if (src == null) return null;
@@ -794,10 +801,11 @@ public final class NativeCompiler {
             } catch (Exception ignored) {}
             return null;
         }
-        // 先过 kboXShield（函数级虚拟化/变异/平坦化）再 KBNL：VM 内核不再以明文形式
-        // 存在于 KBNL 载荷内。加壳失败自动降级为直接 KBNL。
-        com.kbox.core.jnic.NativePacker.Packed packed =
-                com.kbox.core.jnic.NativePacker.packShielded(cres.library, workDir, "vmp");
+        // shield 开启时先过 kboXShield（函数级虚拟化/变异/平坦化）再 KBNL：VM 内核不再以
+        // 明文形式存在于 KBNL 载荷内。关闭时只做 KBNL。加壳失败自动降级为直接 KBNL。
+        com.kbox.core.jnic.NativePacker.Packed packed = shield
+                ? com.kbox.core.jnic.NativePacker.packShielded(cres.library, workDir, "vmp")
+                : com.kbox.core.jnic.NativePacker.pack(cres.library);
         byte[] blob = packed.blob;
         KBoxLog.info(TAG, "VMP native lib packed: " + blob.length + " bytes (vmp.bin)"
                 + (packed.shielded ? " [inner PE shell + VM]" : ""));

@@ -19,6 +19,10 @@ import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.MultiANewArrayInsnNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
+import org.objectweb.asm.tree.analysis.Analyzer;
+import org.objectweb.asm.tree.analysis.BasicInterpreter;
+import org.objectweb.asm.tree.analysis.BasicValue;
+import org.objectweb.asm.tree.analysis.Frame;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -64,6 +68,12 @@ final class Flattener {
 
     private static final String TAG = "flatten";
 
+    /** Signals a deliberately declined flatten (not an error) — see
+     *  {@link #localInitPlan}. Never surfaced as a warning. */
+    private static final class SkipFlatten extends RuntimeException {
+        SkipFlatten(String why) { super(why); }
+    }
+
     private Flattener() {}
 
     /**
@@ -92,11 +102,136 @@ final class Flattener {
                     + " insn=" + insnSize + "->" + mn.instructions.size()
                     + " blocks=" + bc + " branches=" + branches);
             return true;
+        } catch (SkipFlatten sf) {
+            cfLog("      skip " + mn.name + mn.desc
+                    + " insn=" + insnSize + " branches=" + branches
+                    + " [" + sf.getMessage() + "]");
+            return false;
         } catch (Exception e) {
             KBoxLog.warn(TAG, "Flatten aborted for " + mn.name + mn.desc
                     + ": " + e.getMessage());
             return false;
         }
+    }
+
+    // ---- local-slot normalization plan codes ----
+    private static final int INIT_NONE = 0;
+    private static final int INIT_INT = 1;
+    private static final int INIT_LONG = 2;
+    private static final int INIT_FLOAT = 3;
+    private static final int INIT_DOUBLE = 4;
+    private static final int INIT_NULL = 5;
+
+    /**
+     * Computes how each local slot must be default-initialised in the dispatcher
+     * prologue so the flattened method stays verifiable, or {@code null} when the
+     * method cannot be flattened safely.
+     *
+     * <p><b>Why this is required.</b> Flattening makes every basic block a target
+     * of the entry {@code LOOKUPSWITCH}. The verifier merges the frame flowing out
+     * of the dispatcher prologue (where only the parameters are initialised) with
+     * the frame flowing in from the block's real predecessor. For a slot that the
+     * original code assigns before use on every real path — the classic
+     * {@code for (int v : arr)} loop variable — the prologue frame says
+     * {@code top} while the real predecessor says {@code int}; the merge is
+     * {@code top}, and the first {@code iload} then fails with
+     * <pre>
+     *   VerifyError: Bad local variable type
+     *     ... Type top (current frame, locals[4]) is not assignable to integer
+     * </pre>
+     * Because the offending class could not be serialised, the packager rolled the
+     * WHOLE class back to its untouched original bytes — so a class that should
+     * have been flattened shipped completely unprotected (plaintext strings,
+     * original control flow). That is the mechanism behind the observed
+     * "verify-failed, rolled back" classes and the 64% plaintext-residue finding.
+     *
+     * <p>The fix is semantically free: those slots are always written before being
+     * read on every real path (the flattening preserves the original CFG edges and
+     * only adds a fake default case that throws), so the defaults are never
+     * observed. Initialising them only removes the spurious {@code top}.
+     */
+    private static int[] localInitPlan(MethodNode mn, List<AbstractInsnNode> leaders, int firstFree) {
+        Frame<BasicValue>[] frames;
+        try {
+            frames = new Analyzer<BasicValue>(new BasicInterpreter()).analyze(mn.name, mn);
+        } catch (Throwable t) {
+            return null; // unanalysable: leave the method alone
+        }
+        if (frames == null) return null;
+        Map<AbstractInsnNode, Integer> idx = indexMap(mn);
+        int n = mn.maxLocals;
+        int[] plan = new int[Math.max(n, 0)];
+        for (AbstractInsnNode leader : leaders) {
+            Integer li = idx.get(leader);
+            if (li == null) return null;
+            Frame<BasicValue> f = frames[li];
+            if (f == null) {
+                // Unreachable in the original code. The dispatcher would make it
+                // reachable, and unreachable bytecode carries no verifier contract
+                // we could satisfy — refuse rather than risk an invalid class.
+                return null;
+            }
+            for (int s = firstFree; s < n; s++) {
+                BasicValue v = s < f.getLocals() ? f.getLocal(s) : null;
+                if (v == null || v == BasicValue.UNINITIALIZED_VALUE) continue; // merges fine with top
+                if (v == BasicValue.RETURNADDRESS_VALUE) return null; // JSR return address: no safe default
+                int want;
+                if (v == BasicValue.INT_VALUE) want = INIT_INT;
+                else if (v == BasicValue.LONG_VALUE) want = INIT_LONG;
+                else if (v == BasicValue.FLOAT_VALUE) want = INIT_FLOAT;
+                else if (v == BasicValue.DOUBLE_VALUE) want = INIT_DOUBLE;
+                else want = INIT_NULL; // any reference (or return address): null merges with it
+                if (plan[s] != INIT_NONE && plan[s] != want) {
+                    return null; // two different categories on one slot: cannot merge
+                }
+                plan[s] = want;
+            }
+        }
+        // A 2-slot local writes top into its upper half, so the upper slot must not
+        // be needed as a value of its own anywhere.
+        for (int s = 0; s + 1 < plan.length; s++) {
+            if ((plan[s] == INIT_LONG || plan[s] == INIT_DOUBLE) && plan[s + 1] != INIT_NONE) {
+                return null;
+            }
+        }
+        return plan;
+    }
+
+    /** Emits the default-value stores described by {@link #localInitPlan}. */
+    private static void emitLocalInits(InsnList out, int[] plan) {
+        if (plan == null) return;
+        for (int s = 0; s < plan.length; s++) {
+            switch (plan[s]) {
+                case INIT_INT:
+                    out.add(new InsnNode(Opcodes.ICONST_0));
+                    out.add(new VarInsnNode(Opcodes.ISTORE, s));
+                    break;
+                case INIT_LONG:
+                    out.add(new InsnNode(Opcodes.LCONST_0));
+                    out.add(new VarInsnNode(Opcodes.LSTORE, s));
+                    break;
+                case INIT_FLOAT:
+                    out.add(new InsnNode(Opcodes.FCONST_0));
+                    out.add(new VarInsnNode(Opcodes.FSTORE, s));
+                    break;
+                case INIT_DOUBLE:
+                    out.add(new InsnNode(Opcodes.DCONST_0));
+                    out.add(new VarInsnNode(Opcodes.DSTORE, s));
+                    break;
+                case INIT_NULL:
+                    out.add(new InsnNode(Opcodes.ACONST_NULL));
+                    out.add(new VarInsnNode(Opcodes.ASTORE, s));
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    /** First local slot not occupied by {@code this} / declared parameters. */
+    private static int firstFreeLocal(MethodNode mn) {
+        int argSlots = Type.getArgumentsAndReturnSizes(mn.desc) >> 2;
+        return ((mn.access & Opcodes.ACC_STATIC) != 0) ? argSlots - 1 : argSlots;
     }
 
     private static int countBranches(MethodNode mn) {
@@ -383,6 +518,15 @@ final class Flattener {
         Map<AbstractInsnNode, Integer> pos = indexMap(mn);
         leadersRaw.sort((a, b) -> Integer.compare(pos.get(a), pos.get(b)));
 
+        // 1b. Decide the prologue's local default-initialisation BEFORE anything is
+        //     rewritten (the plan is derived from the original data flow). Throws
+        //     nothing but returns null when the method cannot be flattened safely —
+        //     the caller then keeps the original body, which is always valid.
+        int[] initPlan = localInitPlan(mn, leadersRaw, firstFreeLocal(mn));
+        if (initPlan == null) {
+            throw new SkipFlatten("local-state merge unsafe");
+        }
+
         // 2. Assign ids (optionally shuffled at strength>=2 so switch cases look random).
         Map<AbstractInsnNode, Integer> idOf = new HashMap<>();
         List<Integer> ids = new ArrayList<>();
@@ -486,45 +630,85 @@ final class Flattener {
         //    and confuse static analysis.
         ThreadLocalRandom rng = ThreadLocalRandom.current();
         int fakeCount = (strength >= 3) ? rng.nextInt(8, 16) : (strength >= 2 ? rng.nextInt(3, 6) : 0);
-        // Collect existing IDs to avoid collisions.
-        java.util.Set<Integer> usedIds = new java.util.HashSet<>(ids);
-
         InsnList head = new InsnList();
-        int entryId = ids.get(0);
+        // 4a. Local-state normalization (see localInitPlan): gives every slot a
+        //     definite verifier type before the dispatcher, so the merge with each
+        //     block's real predecessor can never degrade to `top`.
+        emitLocalInits(head, initPlan);
+        // The state a block stores before jumping to the dispatcher is idOf(block)
+        // (see every exitStub() call below), so the ENTRY state must be the state of
+        // the first block. It used to be `ids.get(0)`, i.e. an element of the
+        // shuffled id list, which denotes an arbitrary other block whenever the
+        // shuffle ran (strength >= 2).
+        int entryId = idOf.get(leadersRaw.get(0));
         pushInt(head, entryId);
         head.add(new VarInsnNode(Opcodes.ISTORE, stateLocal));
         pushInt(head, idMask.get(entryId));
         head.add(new VarInsnNode(Opcodes.ISTORE, maskLocal));
         head.add(dispatch);
-        Map<Integer, LabelNode> idToLeader = new LinkedHashMap<>();
-        for (int i = 0; i < leadersRaw.size(); i++) {
-            idToLeader.put(ids.get(i), (LabelNode) leadersRaw.get(i));
-        }
-        // Generate fake labels that all point to the default (defensive throw)
+        // Dispatch table: (state ^ mask) -> the block that owns that state.
+        //
+        // Two invariants are mandatory and were both violated before:
+        //
+        //  1. Pairing. exitStub() stores `idOf(block)`, so key `id ^ mask[id]` must
+        //     map to the block whose idOf() is `id`. The old code paired
+        //     `ids.get(i)` with `leadersRaw.get(i)`, which only coincides when the
+        //     id shuffle is the identity (strength < 2). At strength >= 2 control
+        //     flow was transferred to an unrelated block.
+        //
+        //  2. Ordering. ASM's MethodWriter requires LOOKUPSWITCH keys to be
+        //     strictly increasing and throws
+        //       "The keys must be sorted in increasing order"
+        //     from visitLookupSwitchInsn otherwise. Because the ordering was
+        //     incidental (insertion order of a LinkedHashMap fed by the shuffled id
+        //     list, plus a second batch of fake keys), serialization failed, the
+        //     class had no valid protected form, and the packager rolled the WHOLE
+        //     class back to its untouched original bytes — silently dropping every
+        //     protection for it (observed on F03Ctrl/`tb`: full plaintext strings
+        //     and control flow after rollback). A TreeMap keyed by the final case
+        //     value satisfies both invariants by construction.
         LabelNode def = new LabelNode();
+        java.util.TreeMap<Integer, LabelNode> byKey = new java.util.TreeMap<>();
+        for (int i = 0; i < leadersRaw.size(); i++) {
+            int id = idOf.get(leadersRaw.get(i));
+            Integer mask = idMask.get(id);
+            byKey.put(mask != null ? (id ^ mask) : id, (LabelNode) leadersRaw.get(i));
+        }
+        // Fake entries → default (defensive throw). They must not collide with a
+        // real case value, or the real block would become unreachable.
         for (int i = 0; i < fakeCount; i++) {
-            int fakeId;
-            do { fakeId = rng.nextInt(100, 100000); } while (usedIds.contains(fakeId));
-            usedIds.add(fakeId);
-            idToLeader.put(fakeId, def);  // fake entries → default
+            int fakeKey;
+            do { fakeKey = rng.nextInt(100, 100000); } while (byKey.containsKey(fakeKey));
+            byKey.put(fakeKey, def);
         }
         head.add(new VarInsnNode(Opcodes.ILOAD, stateLocal));
         head.add(new VarInsnNode(Opcodes.ILOAD, maskLocal));
         head.add(new InsnNode(Opcodes.IXOR));
-        int total = idToLeader.size();
+        int total = byKey.size();
         int[] keys = new int[total];
         LabelNode[] lbls = new LabelNode[total];
         int idx = 0;
-        for (Map.Entry<Integer, LabelNode> e : idToLeader.entrySet()) {
-            Integer id = e.getKey();
-            Integer mask = idMask.get(id);
-            keys[idx] = (mask != null) ? (id ^ mask) : id;
+        for (Map.Entry<Integer, LabelNode> e : byKey.entrySet()) {
+            keys[idx] = e.getKey();
             lbls[idx] = e.getValue();
             idx++;
         }
         head.add(new LookupSwitchInsnNode(def, keys, lbls));
+        // Default / fake-case target. The label IS a jump target, so the verifier
+        // analyses this block: a bare ATHROW there has no Throwable to pop and the
+        // whole method fails with
+        //   "Cannot pop operand off an empty stack" (at the default block)
+        // which rolled the entire class back to its unprotected bytes. Build a
+        // real, stack-correct thrower instead.
         head.add(def);
-        head.add(new InsnNode(Opcodes.ATHROW)); // unreachable: defensive
+        head.add(new TypeInsnNode(Opcodes.NEW, "java/lang/IllegalStateException"));
+        head.add(new InsnNode(Opcodes.DUP));
+        head.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/lang/IllegalStateException", "<init>", "()V", false));
+        head.add(new InsnNode(Opcodes.ATHROW)); // unreachable in normal operation
+        // The dispatcher prologue pushes two ints before the switch; the default
+        // block pushes a reference and its dup. Both need two slots.
+        if (mn.maxStack < 2) mn.maxStack = 2;
         mn.instructions.insertBefore(mn.instructions.getFirst(), head);
         return leadersRaw.size();
     }

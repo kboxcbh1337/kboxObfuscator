@@ -145,6 +145,7 @@ public final class ConfigLoader {
             case "flattenerMinInsns": case "flattenerMin": cfg.setFlattenerMinInsns(Integer.parseInt(val)); break;
             case "flattenerMaxInsns": case "flattenerMax": cfg.setFlattenerMaxInsns(Integer.parseInt(val)); break;
             case "stringEncryptionStrength": cfg.setStringEncryptionStrength(Integer.parseInt(val)); break;
+            case "mbaRewrite": cfg.setMbaRewrite(intVal(val, 0)); break;
             case "jnicEplDriven": cfg.setJnicEplDriven(bool(val)); break;
             case "failOnNativeError": cfg.setFailOnNativeError(bool(val)); break;
             case "nativeCoverage": cfg.setJnicFullCoverage(val.trim().equalsIgnoreCase("full")); break;
@@ -152,6 +153,9 @@ public final class ConfigLoader {
             case "cc": cfg.setCc(val.isEmpty() ? null : val); break;
             case "nativeShell": cfg.setNativeShell(intVal(val, 0)); break;
             case "protectNativeLibs": cfg.setProtectNativeLibs(bool(val)); break;
+            case "shieldNativeOutput": cfg.setShieldNativeOutput(bool(val)); break;
+            // BF-MC 混合模式：此前仅有字段与管线逻辑，**没有任何配置键可开启**（不可达）。
+            case "brainfuckMcHybrid": cfg.setBrainfuckMcHybrid(bool(val)); break;
             case "licPublicKey": case "licensePublicKey":
                 cfg.setLicPublicKey(val.trim()); break;
             case "licAppSecret": case "licenseAppSecret":

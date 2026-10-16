@@ -784,7 +784,9 @@ public final class VmpInterpreter {
                 Object[] args2 = popArgs(me.getParameterTypes(), c.stack, c.sp);
                 c.sp -= args2.length;
                 Object recv = c.stack[--c.sp];
-                Object r = safeInvoke(me, recv, args2);
+                // Non-virtual: `super.f()` must call the superclass implementation,
+                // not the receiver's override (see safeInvokeSpecial).
+                Object r = safeInvokeSpecial(me, recv, args2);
                 if (me.getReturnType() != void.class) c.stack[c.sp++] = r;
             }
             return false;
@@ -1345,6 +1347,56 @@ public final class VmpInterpreter {
     }
 
     /**
+     * INVOKESPECIAL (non-{@code <init>}) dispatch: invoke the method as resolved on
+     * its declaring class, WITHOUT virtual dispatch.
+     *
+     * <p>{@link Method#invoke} always performs virtual dispatch for overridable
+     * methods, so a translated {@code invokespecial A.f()} executed through it
+     * silently became {@code invokevirtual} and called the receiver's override.
+     * A VMP-virtualised {@code super.f()} therefore returned the subclass result
+     * ({@code B.g()} produced {@code "B.g->B"} instead of {@code "B.g->A"}) — a
+     * silent semantic corruption: no exception, exit code 0, and every other case
+     * still passing. In real code the same rewrite turns {@code super.method()}
+     * into {@code this.method()}, which inverts template-method semantics and can
+     * recurse infinitely ({@code StackOverflowError}) when parent and override
+     * share the name.</p>
+     *
+     * <p>Correct semantics need a method handle created with {@code findSpecial}
+     * (the invokespecial equivalent). {@code MethodHandles.privateLookupIn} is
+     * Java 9+, while this runtime is compiled for Java 8, so it is bound
+     * reflectively and the previous behaviour is used as a fallback when it is
+     * unavailable (Java 8) or the hierarchy/module refuses the lookup.</p>
+     */
+    private static Object safeInvokeSpecial(Method me, Object recv, Object[] args) throws Exception {
+        if (recv == null) return safeInvoke(me, null, args);
+        if (me.getName().equals("clone") && recv.getClass().isArray()) {
+            return safeInvoke(me, recv, args);
+        }
+        try {
+            Class<?> declaring = me.getDeclaringClass();
+            // For `I.super.m()` the special caller is the class performing the call,
+            // not the interface that declares the default method.
+            Class<?> specialCaller = declaring.isInterface() ? recv.getClass() : declaring;
+            java.lang.reflect.Method pli = java.lang.invoke.MethodHandles.class.getMethod(
+                    "privateLookupIn", Class.class, java.lang.invoke.MethodHandles.Lookup.class);
+            java.lang.invoke.MethodHandles.Lookup lk =
+                    (java.lang.invoke.MethodHandles.Lookup) pli.invoke(
+                            null, specialCaller, java.lang.invoke.MethodHandles.lookup());
+            java.lang.invoke.MethodType mt = java.lang.invoke.MethodType.methodType(
+                    me.getReturnType(), me.getParameterTypes());
+            java.lang.invoke.MethodHandle mh =
+                    lk.findSpecial(declaring, me.getName(), mt, specialCaller);
+            Object[] coerced = coerceArgs(me.getParameterTypes(), args);
+            Object[] full = new Object[coerced.length + 1];
+            full[0] = recv;
+            System.arraycopy(coerced, 0, full, 1, coerced.length);
+            return mh.invokeWithArguments(full);
+        } catch (Throwable t) {
+            return safeInvoke(me, recv, args);
+        }
+    }
+
+    /**
      * Resolves {@code name(ptypes)} across the class hierarchy and interfaces, so
      * INVOKEVIRTUAL on inherited/overridden methods and interface dispatch work.
      */
@@ -1589,7 +1641,8 @@ public final class VmpInterpreter {
                 Object[] args2 = popArgs(me.getParameterTypes(), stack, sp);
                 sp -= args2.length;
                 Object recv = stack[--sp];
-                Object r = safeInvoke(me, recv, args2);
+                // Non-virtual dispatch (super call) — see safeInvokeSpecial.
+                Object r = safeInvokeSpecial(me, recv, args2);
                 if (me.getReturnType() != void.class) stack[sp++] = r;
             }
         } else {

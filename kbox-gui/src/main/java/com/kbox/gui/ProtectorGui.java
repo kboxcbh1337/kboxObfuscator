@@ -838,6 +838,7 @@ public final class ProtectorGui {
         // —— 除 BF 家族以外的数字选项：推荐全部拉满（最强档）——
         sets.put("typeConfusion", "2");            // 0..2
         sets.put("mbaConstants", "2");             // 0..2
+        sets.put("mbaRewrite", "2");               // 0..3
         sets.put("opaqueStateMachine", "3");
         sets.put("honeypot", "3");
         sets.put("methodSplit", "3");
@@ -1000,6 +1001,7 @@ public final class ProtectorGui {
         p.setNativeShell(jint(o, "nativeShell", 3));
         p.setTypeConfusionStrength(jint(o, "typeConfusion", 0));
         p.setMbaConstants(jint(o, "mbaConstants", 0));
+        p.setMbaRewrite(jint(o, "mbaRewrite", 0));
         p.setWhiteboxStrings(jbool(o, "whiteboxStrings", false));
         p.setObfuscateConstants(jbool(o, "obfConstants", false));
         p.setOpaqueStateMachine(jint(o, "opaqueStateMachine", 0));
@@ -1012,6 +1014,8 @@ public final class ProtectorGui {
         p.setReflectionGate(jbool(o, "reflectionGate", false));
         p.setJnicEplDriven(jbool(o, "jnicEpl", false));
         p.setProtectNativeLibs(jbool(o, "protectNativeLibs", false));
+        p.setShieldNativeOutput(jbool(o, "shieldNativeOutput", true));
+        p.setBrainfuckMcHybrid(jbool(o, "bfMcHybrid", false));
         // ---- VMP/JNIC 排除类（自定义前缀列表，逗号/分号/换行分隔）----
         String vmpExc = jstr(o, "vmpExclude");
         if (!vmpExc.isEmpty()) addExclusionPrefixes(p.getVmpExcludePrefixes(), vmpExc);

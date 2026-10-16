@@ -45,6 +45,18 @@ public final class VmpRuntimeProtector {
     private static final String[] RUNTIME_CLASSES = {
             "com/kbox/runtime/KBoxRuntime",
             "com/kbox/runtime/ResourceGuardClassLoader",
+            // ResourceGuardClassLoader is not self-contained: its own class file
+            // references the nested Entry/closures and LicVerifier. When only the
+            // outer class is added to the graph, the packager's reference-closure
+            // check aborts with "would reference N missing KBox runtime class(es)".
+            // Ship the whole set so VMP (which loads these runtime decryptors into
+            // the graph) produces a loadable jar.
+            "com/kbox/runtime/ResourceGuardClassLoader$Entry",
+            "com/kbox/runtime/ResourceGuardClassLoader$1",
+            "com/kbox/runtime/ResourceGuardClassLoader$2",
+            "com/kbox/runtime/ResourceGuardClassLoader$2$1",
+            "com/kbox/runtime/LicVerifier",
+            "com/kbox/runtime/LicVerifier$State",
     };
 
     /** Decryption method specs (owner#name#desc) eligible for VMP. */

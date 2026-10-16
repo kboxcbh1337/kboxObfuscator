@@ -1855,7 +1855,12 @@ kbox_value_t kbox_jvm_interp(JNIEnv* env, jobject receiver,
     if (max_locals > KBOX_MAX_SLOTS) max_locals = KBOX_MAX_SLOTS;
     if (max_stack  > KBOX_MAX_SLOTS) max_stack  = KBOX_MAX_SLOTS;
     KBOX_DBG("[KBOX-INTERP] v3 after init_table\n"); fflush(stderr);
-    if (!kbox_self_check()) {
+    /* kbox_self_check(): 1 = image patched (refuse), 0 = intact, -1 = undeterminable.
+     * The original guard `if (!kbox_self_check())` bailed out on the INTACT case
+     * (0) and let a patched image (1) run — inverted. Result: every JNIC method
+     * silently returned 0. Only refuse on a positive tamper signal; -1 keeps the
+     * interpreter usable on platforms where the image hash is unavailable. */
+    if (kbox_self_check() == 1) {
         kbox_value_t r; r.i = 0; return r;
     }
 
@@ -1936,7 +1941,8 @@ kbox_value_t kbox_jvm_interp_v3(JNIEnv* env, jobject receiver,
     if (max_stack  > KBOX_MAX_SLOTS) max_stack  = KBOX_MAX_SLOTS;
     KBOX_DBG("[KBOX-INTERP] v3 after init_table\n"); fflush(stderr);
 
-    if (!kbox_self_check()) {
+    /* See the legacy entry above: only refuse on a positive tamper signal. */
+    if (kbox_self_check() == 1) {
         kbox_value_t r; r.i = 0; return r;
     }
 

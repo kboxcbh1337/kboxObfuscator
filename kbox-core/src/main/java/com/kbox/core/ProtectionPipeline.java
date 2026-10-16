@@ -228,7 +228,12 @@ public final class ProtectionPipeline {
                 reason = "Spring Boot fat jar (nested BOOT-INF/lib jars cannot be hidden)";
             } else if (graph.getManifest() != null && new String(
                     graph.getManifest(), StandardCharsets.UTF_8).contains("TweakClass:")) {
-                reason = "Forge/Fabric mod loader detected (loader scans raw jar bytes)";
+                // Forge/Fabric (incl. 1.8.9 launcher-wrapper mods) load through a
+                // TweakClass and scan raw jar bytes. Mark as mcMod so the HYBRID
+                // path (metadata / entry classes / mixin package stay plaintext)
+                // is reachable instead of an unconditional degrade.
+                mcMod = true;
+                reason = "Forge/Fabric mod loader detected (TweakClass — loader scans raw jar bytes)";
             }
             if (mcMod && cfg.isBrainfuckMcHybrid()) {
                 // BF-MC hybrid (opt-in): keep the RLE blob for the bulk of the
@@ -538,6 +543,16 @@ public final class ProtectionPipeline {
             new com.kbox.core.obfu.MbaConstantObfuscator(graph, cfg).apply();
         }
 
+        // ---- Stage 6h2: Run-time MBA rewrite (mbaRewrite) ----
+        // Complementary to the constant pass above: rewrites the LIVE int arithmetic
+        // between two run-time values (IADD/ISUB/IAND/IOR/IXOR) into algebraically exact
+        // bitwise-identity trees, recursively re-expanded per level. Stack-neutral; the
+        // packager recomputes frames/sizes for classes marked CF-modified.
+        if (cfg.getMbaRewrite() > 0) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Run-time MBA rewrite");
+            new com.kbox.core.obfu.MbaRewriteObfuscator(graph, cfg).apply();
+        }
+
         // ---- Stage 6i: S4 honeypot bait (kboxDedeobfShieldV1 static decoys) ----
         // Runs AFTER const-obfuscation so the injected fake tables/round-keys stay as
         // visible, tempting literals (the bait is meant to be found), and BEFORE
@@ -707,7 +722,8 @@ public final class ProtectionPipeline {
         if (cfg.isEnableVmp() && cfg.isEnableVmpNative()) {
             KBoxLog.stage(++stage, TOTAL_STAGES, "VM原生化 (native VMP interpreter)");
             try {
-                vmpBlob = com.kbox.core.jnic.NativeCompiler.compileVmp(workDir, cfg.getCc());
+                vmpBlob = com.kbox.core.jnic.NativeCompiler.compileVmp(
+                        workDir, cfg.getCc(), cfg.isShieldNativeOutput());
                 if (vmpBlob == null) {
                     KBoxLog.info(TAG, "  VM原生化 inactive — using byte-identical Java interpreter");
                 } else {

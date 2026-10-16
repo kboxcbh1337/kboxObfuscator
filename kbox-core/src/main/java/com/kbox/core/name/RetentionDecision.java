@@ -46,6 +46,21 @@ public final class RetentionDecision {
     public boolean keepMethod(ClassNode cn, String name, String desc) {
         // 1. Constructors and static initializers cannot be renamed.
         if (name.charAt(0) == '<') return true;
+        // 1b. Annotation element names ARE the reflective contract.
+        //
+        //     A RUNTIME annotation instance is a JDK proxy whose element values
+        //     are keyed by the names written in the class file (ASM does not
+        //     remap them — they are plain strings, not descriptors), while the
+        //     proxy resolves an invoked element by the *interface method name*.
+        //     Renaming the element method therefore desynchronises the two: the
+        //     lookup misses and java.lang.reflect returns the element's DEFAULT
+        //     value. Observed as
+        //       @Marker(value = "cls", order = 1, tags = {"x","y"})
+        //       -> value() == "anonymous", order() == -1, tags().length == 0
+        //     with the annotation itself still present — exactly the
+        //     "element values silently revert to defaults" pattern.
+        if ((cn.access & 0x2000) != 0) return true;   // ACC_ANNOTATION
+
         // 2. main(String[]) is the JVM bootstrap entry; never rename.
         if (name.equals("main") && desc.equals("([Ljava/lang/String;)V")) return true;
         // 3. Object/Object-wait-family and finalize must match the superclass.

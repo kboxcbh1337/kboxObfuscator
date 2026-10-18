@@ -56,10 +56,27 @@ public final class ConstantObfuscator {
             new java.util.concurrent.atomic.AtomicInteger();
 
     // Randomized per-build symbols (set in apply()).
-    private String holder;
+    private String holderPrefix;
     private String getI;
     private String fieldK;
     private String fieldT;
+
+    /**
+     * Max constants per holder class. Each entry costs ~6-10 bytes of
+     * {@code <clinit>} bytecode (DUP + index + value + IASTORE), and a method
+     * is capped at 64 KiB — a single holder overflows on a large jar (a real
+     * 9.3k-class input produced ~197k distinct constants and the holder was
+     * dropped with MethodTooLargeException, leaving every rewritten call site
+     * pointing at a missing class). The table is therefore chunked across
+     * several holder classes.
+     */
+    private static final int CHUNK = 2000;
+
+    /** Holder class for the N-th chunk: {@code prefix} for 0, {@code prefixN} otherwise. */
+    private String holderFor(int idx) {
+        int c = idx / CHUNK;
+        return c == 0 ? holderPrefix : holderPrefix + c;
+    }
 
     public ConstantObfuscator(ClassGraph graph, ProtectionConfig cfg) {
         this.graph = graph;
@@ -85,7 +102,7 @@ public final class ConstantObfuscator {
         }
         // Build-diversity: random class/member/field names every run so the
         // decryption API is not a stable symbol a generic unpacker can target.
-        holder = "com/kbox/runtime/_" + randomName(14);
+        holderPrefix = "com/kbox/runtime/_" + randomName(14);
         getI = "m" + randomName(9);
         fieldK = "a" + randomName(5);
         fieldT = randomName(6);
@@ -96,7 +113,8 @@ public final class ConstantObfuscator {
                 cfg.getParallelThreads());
         ensureHolder();
         KBoxLog.info(TAG, "Indirect-encrypted " + rewritten.get() + " int constants (holder="
-                + holder + ")");
+                + holderPrefix + (intTable.size() > CHUNK
+                        ? " +" + ((intTable.size() - 1) / CHUNK) + " chunks" : "") + ")");
     }
 
     @SuppressWarnings("unchecked")
@@ -136,7 +154,10 @@ public final class ConstantObfuscator {
                 if (v == Integer.MIN_VALUE) continue;
                 int idx = storeAndEncrypt(v);
                 InsnList repl = new InsnList();
-                pushInt(repl, idx);
+                // Each chunk keeps its own table/API, so the call site must
+                // target the holder that owns this index and use its local id.
+                String holder = holderFor(idx);
+                pushInt(repl, idx % CHUNK);
                 repl.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, getI, GET_I_DESC, false));
                 mn.instructions.insertBefore(ins, repl);
                 mn.instructions.remove(ins);
@@ -169,19 +190,36 @@ public final class ConstantObfuscator {
     }
 
     private void ensureHolder() {
-        if (graph.getClasses().containsKey(holder)) return;
         if (key == Integer.MIN_VALUE) {
             do { key = rng.nextInt(); } while (key == Integer.MIN_VALUE || key == 0);
         }
+        int total = intTable.size();
+        if (total == 0) return;
+        int[] vals = new int[total];
+        for (Integer v : intTable.keySet()) {
+            vals[intTable.get(v)] = v;
+        }
+        int chunks = (total + CHUNK - 1) / CHUNK;
+        for (int c = 0; c < chunks; c++) {
+            String name = c == 0 ? holderPrefix : holderPrefix + c;
+            if (graph.getClasses().containsKey(name)) continue;
+            int from = c * CHUNK;
+            int to = Math.min(total, from + CHUNK);
+            graph.getClasses().put(name, buildHolder(name, vals, from, to));
+        }
+    }
+
+    /** Builds one holder class covering {@code vals[from..to)}. */
+    private ClassNode buildHolder(String name, int[] vals, int from, int to) {
         ClassNode cn = new ClassNode();
         cn.version = Opcodes.V1_8;
         cn.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
-        cn.name = holder;
+        cn.name = name;
         cn.superName = "java/lang/Object";
         // Coyote the class itself: keep it from being flattened/string-encrypted
         // (its own logic is trivial) and ensure it is not renamed since the
         // cryptographic derivation below binds to its exact internal name.
-        graph.markCfModified(holder);
+        graph.markCfModified(name);
 
         MethodNode ctor = new MethodNode(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
         ctor.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -198,25 +236,22 @@ public final class ConstantObfuscator {
         // At the use site we recompute key = T[idx] ^ (K ^ hash(holder)) so the
         // real key never exists as a bare constant (it is inferred from the
         // class's own name at runtime) — blocking naive memory-dump还原.
-        int salt = holder.hashCode();
+        int salt = name.hashCode();
         int storedK = key ^ salt;
+        int count = to - from;
         MethodNode clinit = new MethodNode(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
         InsnList cl = clinit.instructions;
         pushInt(cl, storedK);
-        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, fieldK, "I"));
-        pushInt(cl, intTable.size());
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, name, fieldK, "I"));
+        pushInt(cl, count);
         cl.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_INT));
-        int[] vals = new int[intTable.size()];
-        for (Integer v : intTable.keySet()) {
-            vals[intTable.get(v)] = v;
-        }
-        for (int i = 0; i < vals.length; i++) {
+        for (int i = 0; i < count; i++) {
             cl.add(new InsnNode(Opcodes.DUP));
             pushInt(cl, i);
-            pushInt(cl, vals[i] ^ key);
+            pushInt(cl, vals[from + i] ^ key);
             cl.add(new InsnNode(Opcodes.IASTORE));
         }
-        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, fieldT, "[I"));
+        cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, name, fieldT, "[I"));
         cl.add(new InsnNode(Opcodes.RETURN));
         clinit.maxStack = 4;
         clinit.maxLocals = 0;
@@ -227,10 +262,10 @@ public final class ConstantObfuscator {
         // as a lone constant.
         MethodNode getI = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, this.getI, GET_I_DESC, null, null);
         InsnList g = new InsnList();
-        g.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, fieldT, "[I"));
+        g.add(new FieldInsnNode(Opcodes.GETSTATIC, name, fieldT, "[I"));
         g.add(new VarInsnNode(Opcodes.ILOAD, 0));
         g.add(new InsnNode(Opcodes.IALOAD));
-        g.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, fieldK, "I"));
+        g.add(new FieldInsnNode(Opcodes.GETSTATIC, name, fieldK, "I"));
         pushInt(g, salt);
         g.add(new InsnNode(Opcodes.IXOR));
         g.add(new InsnNode(Opcodes.IXOR));
@@ -239,8 +274,7 @@ public final class ConstantObfuscator {
         getI.maxStack = 3;
         getI.maxLocals = 1;
         cn.methods.add(getI);
-
-        graph.getClasses().put(holder, cn);
+        return cn;
     }
 
     private static void pushInt(InsnList l, int v) {

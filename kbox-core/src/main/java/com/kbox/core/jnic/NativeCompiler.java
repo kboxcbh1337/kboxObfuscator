@@ -444,6 +444,34 @@ public final class NativeCompiler {
         // Forward-declare the v3 interpreter (encrypted bytecode + execution erasure).
         sb.append("typedef union { jint i; jlong l; jfloat f; jdouble d; } kbox_value_t;\n");
         sb.append("kbox_value_t kbox_jvm_interp_v3(JNIEnv*, jobject, const unsigned char*, int, void**, int, int, uint8_t*);\n\n");
+        // Class resolution that matches JVM semantics (lc/invoke use the
+        // declaring class's loader first; a mention of an absent class must not
+        // fail a method that never executes that branch). Generated array/
+        // method-id stubs call this, and the sharded build compiles every part
+        // as a SEPARATE translation unit — so the helper must live in this
+        // common header block, not only in the interpreter source.
+        sb.append("static jclass kbox_find_class(JNIEnv* env, jclass owner, const char* internal) {\n");
+        sb.append("  jclass c = (*env)->FindClass(env, internal);\n");
+        sb.append("  if (c) return c;\n");
+        sb.append("  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+        sb.append("  if (!owner) return NULL;\n");
+        sb.append("  char buf[1024];\n");
+        sb.append("  size_t n = strlen(internal);\n");
+        sb.append("  if (n >= sizeof(buf)) return NULL;\n");
+        sb.append("  for (size_t i = 0; i <= n; i++) buf[i] = (internal[i] == '/') ? '.' : internal[i];\n");
+        sb.append("  jclass cc = (*env)->FindClass(env, \"java/lang/Class\");\n");
+        sb.append("  if (!cc) { (*env)->ExceptionClear(env); return NULL; }\n");
+        sb.append("  jmethodID gcl = (*env)->GetMethodID(env, cc, \"getClassLoader\", \"()Ljava/lang/ClassLoader;\");\n");
+        sb.append("  jmethodID fn  = (*env)->GetStaticMethodID(env, cc, \"forName\",\n");
+        sb.append("                      \"(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;\");\n");
+        sb.append("  if (!gcl || !fn) { (*env)->ExceptionClear(env); return NULL; }\n");
+        sb.append("  jobject loader = (*env)->CallObjectMethod(env, owner, gcl);\n");
+        sb.append("  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return NULL; }\n");
+        sb.append("  jstring nm = (*env)->NewStringUTF(env, buf);\n");
+        sb.append("  jclass r = (jclass)(*env)->CallStaticObjectMethod(env, cc, fn, nm, JNI_FALSE, loader);\n");
+        sb.append("  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+        sb.append("  return r;\n");
+        sb.append("}\n\n");
     }
 
     /**

@@ -495,8 +495,15 @@ public final class Packager {
             // frames may have missing StackMapTable entries (javac bug).
             // injectResourceGuardClasses will re-serialize fresh copies with
             // version 49 (inference verifier, no StackMapTable required).
+            //
+            // The skip set must be populated whenever the guard classes are
+            // injected below — not only when resource/class guards are on:
+            // protectNativeLibs alone also substitutes Main-Class with the
+            // guard launcher, and in that case the graph copies (loaded by
+            // VmpRuntimeProtector) would be written here AND re-written by
+            // injectResourceGuardClasses -> ZipException duplicate entry.
             java.util.Set<String> guardSkip = new java.util.HashSet<>();
-            if (needGuard) {
+            if (needGuard || natLibsActive) {
                 guardSkip.addAll(discoverGuardClasses());
             }
 

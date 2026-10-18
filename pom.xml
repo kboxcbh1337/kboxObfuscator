@@ -6,10 +6,10 @@
 
     <groupId>com.kbox</groupId>
     <artifactId>kbox-obfuscator</artifactId>
-    <version>3.0.1</version>
+    <version>3.0.2</version>
     <packaging>pom</packaging>
     <name>KBox Obfuscator</name>
-    <description>ZKM-level + JNIC + VMP Java application protection system</description>
+    <description>Java application protection system</description>
 
     <modules>
         <module>kbox-core</module>

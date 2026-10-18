@@ -89,6 +89,7 @@ public final class ConfigLoader {
             case "encryptClasses": cfg.setEncryptClasses(bool(val)); break;
             case "enableVmp": cfg.setEnableVmp(bool(val)); break;
             case "enableBfvm": cfg.setEnableBfvm(bool(val)); break;
+            case "enableOtp": cfg.setEnableOtp(bool(val)); break;
             case "vmpInterleave": cfg.setVmpInterleave(Integer.parseInt(val)); break;
             case "brainfuckShield": cfg.setBrainfuckShield(bool(val)); break;
             case "brainfuckShieldLevel": cfg.setBrainfuckShieldLevel(Integer.parseInt(val)); break;
@@ -97,7 +98,10 @@ public final class ConfigLoader {
             case "enableJnic": cfg.setEnableJnic(bool(val)); break;
             case "obfuscateResources": cfg.setObfuscateResources(bool(val)); break;
             case "brainfuckLoader": cfg.setBrainfuckLoader(bool(val)); break;
+            case "mainClass": cfg.setMainClass(val); break;
+            case "plaintextAudit": cfg.setPlaintextAudit(bool(val)); break;
             case "autoAdaptMinecraft": cfg.setAutoAdaptMinecraft(bool(val)); break;
+            case "mcForceVmp": cfg.setMcForceVmp(bool(val)); break;
             case "fixKotlinMetadata": cfg.setFixKotlinMetadata(bool(val)); break;
             case "antiDecompilerLevel": cfg.setAntiDecompilerLevel(Integer.parseInt(val)); break;
             case "antiDebug": cfg.setAntiDebug(bool(val)); break;
@@ -110,6 +114,8 @@ public final class ConfigLoader {
             case "nullGuard": cfg.setNullGuard(bool(val)); break;
             case "methodInlineExtract": cfg.setMethodInlineExtract(bool(val)); break;
             case "eraseAnnotations": cfg.setEraseAnnotations(bool(val)); break;
+            case "eraseDebugInfo": cfg.setEraseDebugInfo(bool(val)); break;
+            case "eraseSignatures": cfg.setEraseSignatures(bool(val)); break;
             case "hideCallGraph": cfg.setHideCallGraph(bool(val)); break;
             case "fakeDebugInfo": cfg.setFakeDebugInfo(bool(val)); break;
             case "whiteboxStrings": cfg.setWhiteboxStrings(bool(val)); break;

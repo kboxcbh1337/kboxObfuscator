@@ -50,6 +50,15 @@ public final class JnicOrchestrator {
     private static final String LIB_NAME = "kbox_native";
     /** Runtime class that unpacks + loads the compressed/encrypted native lib. */
     private static final String NATIVE_LOADER = "com/kbox/runtime/NativeLoader";
+
+    /**
+     * K-OTP 原生构建种子：只在本次构建的 JNIC 原生库内以常量形式存在。
+     * 非 0 表示原生库已成功产出，K-OTP 阶段可以据此生成一次性程序 share。
+     */
+    private static volatile long OTP_NATIVE_SEED;
+
+    /** @return 本次构建可用的 K-OTP 原生种子；0 表示原生库未产出（K-OTP 应跳过）。 */
+    public static long getOtpNativeSeed() { return OTP_NATIVE_SEED; }
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
     private final NativeCompiler compiler;
@@ -73,6 +82,7 @@ public final class JnicOrchestrator {
     }
 
     public Result run(Path workDir) throws IOException {
+        OTP_NATIVE_SEED = 0L;
         if (!cfg.isEnableJnic()) {
             return new Result(null, null, false, new HashMap<>());
         }
@@ -179,8 +189,16 @@ public final class JnicOrchestrator {
         // stubs + its JNI exports. shardCount = cores (or configured threads).
         int shardCount = cfg.getParallelThreads();
         if (shardCount <= 0) shardCount = Runtime.getRuntime().availableProcessors();
+        // K-OTP: generate the per-build native seed now and bake it into the C
+        // source. It is exported through registerNatives0(KotpRuntime.class) and
+        // never appears on the Java side.
+        long otpSeed = 0L;
+        if (cfg.isEnableOtp()) {
+            long s = new java.security.SecureRandom().nextLong();
+            otpSeed = s == 0L ? 0x5DEECE66D1D3CL : s;
+        }
         java.util.List<String> shardSources =
-                NativeCompiler.assembleInterpSourceSharded(fns, classMethodCounts, shardCount);
+                NativeCompiler.assembleInterpSourceSharded(fns, classMethodCounts, shardCount, otpSeed);
         List<Path> srcFiles = new ArrayList<>();
         for (int i = 0; i < shardSources.size(); i++) {
             // Native shell hardening: encrypt function-body literals (class names,
@@ -220,6 +238,12 @@ public final class JnicOrchestrator {
         } catch (Exception ex) {
             KBoxLog.warn(TAG, "Native packing failed: " + ex.getMessage()
                     + " — falling back to raw lib copy");
+        }
+        // K-OTP can only work when the native image that carries the seed is
+        // actually shipped in the jar.
+        OTP_NATIVE_SEED = (blob != null) ? otpSeed : 0L;
+        if (otpSeed != 0L && blob == null) {
+            KBoxLog.warn(TAG, "K-OTP disabled: native blob was not produced");
         }
 
         // Mark methods native.

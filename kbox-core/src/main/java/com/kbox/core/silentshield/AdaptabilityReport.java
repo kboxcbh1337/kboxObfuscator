@@ -11,11 +11,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * AdaptabilityReport — 商业级适配性验收报告生成器（"10 年商业级混淆适配性"的交付物）。
+ * AdaptabilityReport — 适配性验收报告生成器。
  *
  * <p>把 SilentShield（弱点目录 + 深度自检 + 动作落地）与 {@link ModernStackAdapter}
  * （现代技术栈主动适配 + JDK 8..25 版本感知）的结果汇总成一份可供甲方合规审查的
- * <b>适配性验收报告</b>。报告结构对齐商业混淆器适配性四大支柱：
+ * <b>适配性验收报告</b>。报告结构按适配性四大支柱组织：
  *
  * <ul>
  *   <li><b>SPEC</b> — 规范遵循（JVMS/JNI ABI/StackMapTable/invokedynamic/bridge）。</li>
@@ -24,9 +24,9 @@ import java.util.Map;
  *   <li><b>ENV</b> — 环境（JDK 8..25 类文件版本、multi-release、JPMS、GraalVM）。</li>
  * </ul>
  *
- * <p>附加"10 年适配矩阵"：按来源混淆器（ZKM/JNIC/ProGuard/Allatori/DashO/R8-D8/
- * Stringer/Spring/Jackson/Kotlin/GraalVM…）分组，给出每个来源命中的弱点族数与对策，
- * 直观展示"其他混淆器在哪失败，我们就在哪加固"的十年覆盖。
+ * <p>附加“适配矩阵”：按来源类别（字节码混淆器 / 字节码重构器 / Android 工具链 /
+ * 原生化工具 / 字符串保护工具 / Spring / Jackson / Kotlin / GraalVM…）分组，给出每个类别的弱点族数与对策，
+ * 直观展示“同类工具在哪失败，我们就在哪加固”的覆盖。
  */
 public final class AdaptabilityReport {
 
@@ -72,7 +72,7 @@ public final class AdaptabilityReport {
         ModernStackAdapter.Result st = data.stack;
 
         sb.append("================================================================\n");
-        sb.append("KBox 适配性验收报告 — 10 年商业级混淆适配（Java 8..25）\n");
+        sb.append("KBox 适配性验收报告 — 跨版本适配（Java 8..25）\n");
         sb.append("================================================================\n");
 
         // 1. 环境支柱。
@@ -109,8 +109,8 @@ public final class AdaptabilityReport {
             sb.append("  ").append(p).append(": ").append(byPillar.getOrDefault(p, 0)).append('\n');
         }
 
-        // 4. 十年适配矩阵（按来源混淆器/生态）。
-        sb.append("\n[MATRIX] 10 年适配矩阵（来源 -> 弱点族 / 对策落地）\n");
+        // 4. 适配矩阵（按来源类别/生态）。
+        sb.append("\n[MATRIX] 适配矩阵（来源类别 -> 弱点族 / 对策落地）\n");
         Map<String, Integer> bySourceCnt = new LinkedHashMap<>();
         Map<String, Integer> bySourceMut = new LinkedHashMap<>();
         for (WeaknessCatalog.Weakness w : catalog.entries()) {
@@ -151,7 +151,7 @@ public final class AdaptabilityReport {
         if (shown == 0) sb.append("  (无)\n");
 
         sb.append("\n================================================================\n");
-        sb.append("报告完备：四支柱 + 现代技术栈 + JDK 8..25 + 10 年来源矩阵 + 高风险明细。\n");
+        sb.append("报告完备：四支柱 + 现代技术栈 + JDK 8..25 + 来源类别矩阵 + 高风险明细。\n");
         sb.append("================================================================\n");
         return sb.toString();
     }

@@ -86,7 +86,15 @@ public final class MbaConstantObfuscator {
     @SuppressWarnings("unchecked")
     private void obfClass(ClassNode cn) {
         for (MethodNode mn : (List<MethodNode>) cn.methods) {
-            if (mn.instructions == null) continue;
+            if (mn.instructions == null || mn.instructions.size() == 0) continue;
+            if ((mn.access & (Opcodes.ACC_NATIVE | Opcodes.ACC_ABSTRACT)) != 0) continue;
+            // JNIC/VMP targets are translated to the native interpreter, which
+            // re-executes this method's bytecode. Its program model does not
+            // reproduce every synthesized-expression opcode identically, so
+            // rewriting their constants both wastes work (the body is replaced)
+            // and produced WRONG results / hangs when combined with allMax.
+            // Same rule {@link MbaRewriteObfuscator} already applies.
+            if (isNativeOrVmpTarget(cn.name, mn.name, mn.desc)) continue;
             // Collect candidates first (iterate without mutating the list).
             List<AbstractInsnNode> targets = new ArrayList<>();
             for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
@@ -106,6 +114,12 @@ public final class MbaConstantObfuscator {
                 rewritten.incrementAndGet();
             }
         }
+    }
+
+    /** True when this exact method is a selected JNIC/VMP target. */
+    private boolean isNativeOrVmpTarget(String owner, String name, String desc) {
+        String key = ProtectionConfig.memberKey(owner, name, desc);
+        return cfg.getNativeMethods().contains(key) || cfg.getVmpMethods().contains(key);
     }
 
     /** Best-effort literal int constant of an instruction, or {@link Integer#MIN_VALUE}. */

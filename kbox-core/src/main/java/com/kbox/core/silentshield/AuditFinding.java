@@ -3,7 +3,7 @@ package com.kbox.core.silentshield;
 /**
  * SilentShield — 单条深度自检发现。
  *
- * <p>由 {@link AdaptationAuditor} 在输入 jar 中扫描"其他混淆器适配性弱点"
+ * <p>由 {@link AdaptationAuditor} 在输入 jar 中扫描"同类工具适配性弱点"
  * 对应的特殊代码模式后产生。每条发现记录：模式族（family）、所属类（internal
  * name）、成员（"name desc"）、风险级别、应执行的防护动作、触发条件描述与
  * 缓解说明。随后 {@link SilentShield} 会用它去 {@link WeaknessCatalog} 中

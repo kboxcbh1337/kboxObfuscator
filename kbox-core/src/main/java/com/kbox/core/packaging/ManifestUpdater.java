@@ -89,8 +89,25 @@ public final class ManifestUpdater {
                         + " (Original-Main-Class=" + newMain + ")"
                         + (springBootFatJar ? " [Spring Boot: Main-Class kept as the boot loader]" : ""));
             } else {
-                KBoxLog.warn(TAG, "Manifest has no " + entryAttr + " attribute; "
-                        + "guard launcher not installed (principal class left untouched)");
+                // No entry attribute at all (library-style input, or an entry
+                // declared through --main-class). Add both so the launcher can
+                // still be reached and the real entry is recorded.
+                //
+                // The attributes MUST go inside the main section: appending them
+                // after the trailing blank line would start a second section
+                // without a "Name:" attribute and the JVM rejects the manifest
+                // with "invalid manifest format".
+                int cut = s.length();
+                while (cut > 0) {
+                    char c = s.charAt(cut - 1);
+                    if (c == '\n' || c == '\r') cut--;
+                    else break;
+                }
+                s = s.substring(0, cut) + "\r\n"
+                        + entryAttr + ": " + launcherClass + "\r\n"
+                        + "Original-Main-Class: " + newMain + "\r\n\r\n";
+                KBoxLog.info(TAG, "Added " + entryAttr + " -> " + launcherClass
+                        + " (input had no entry attribute; Original-Main-Class=" + newMain + ")");
             }
         } else if (newMain != null && !newMain.equals(oldMainClass)) {
             String replaced = replaceAttribute(s, entryAttr, newMain);

@@ -220,6 +220,30 @@ public final class RetentionDecision {
                     "java/util/function/ToLongFunction",
                     "java/util/function/ToDoubleFunction"));
 
+    /** Memoized {@code Class.forName(...).isInterface()} for JDK types. */
+    private static final java.util.Map<String, Boolean> JDK_IFACE_MEMO = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * True when {@code internal} is a JDK interface. Boot classes are always
+     * resolvable from the obfuscator's own JVM; on any anomaly we conservatively
+     * treat an unknown {@code java/*} type as an interface (a false positive only
+     * pins a method name, a false negative ships an AbstractMethodError).
+     */
+    private static boolean isJdkInterface(String internal) {
+        if (JDK_CALLBACK_INTERFACES.contains(internal)) return true;
+        Boolean memo = JDK_IFACE_MEMO.get(internal);
+        if (memo != null) return memo;
+        boolean r;
+        try {
+            Class<?> c = Class.forName(internal.replace('/', '.'), false, null);
+            r = c.isInterface();
+        } catch (Throwable t) {
+            r = true;
+        }
+        JDK_IFACE_MEMO.put(internal, r);
+        return r;
+    }
+
     /** Walks the supertype graph (classes AND interfaces, transitively through
      *  in-jar types) and reports whether it leaves the jar. */
     private boolean hasExternalSupertype(ClassNode cn) {
@@ -243,18 +267,14 @@ public final class RetentionDecision {
             String t = queue.poll();
             if (t == null || !seen.add(t)) continue;
             if (t.startsWith("java/")) {
-                // JDK interfaces whose methods the JVM or a framework invokes BY
-                // NAME. An implementation that renames an override no longer
-                // implements the interface method, and the first callback dies with
-                // AbstractMethodError — e.g. a class implementing
-                // java.lang.reflect.InvocationHandler stops being a usable JDK
-                // dynamic-proxy handler ("Receiver class X does not define or
-                // inherit an implementation of the resolved method 'abstract
-                // java.lang.Object invoke(...)'"). Abstract CLASSES from the JDK are
-                // still skipped: every class extends java/lang/Object, so treating
-                // all java/* supertypes as external would pin every method in the
-                // jar and disable method renaming entirely.
-                if (JDK_CALLBACK_INTERFACES.contains(t)) return true;
+                // JDK INTERFACES: their method names are the callback contract.
+                // Renaming an implementation of java.util.List#iterator (or any
+                // other JDK interface method) leaves the interface method
+                // unimplemented -> AbstractMethodError at the first framework call.
+                // Only JDK CLASSES (notably java/lang/Object) are skipped, since
+                // every class extends Object and treating that as external would
+                // pin every method in the jar.
+                if (isJdkInterface(t)) return true;
                 continue;
             }
             ClassNode n = graph.getClasses().get(t);

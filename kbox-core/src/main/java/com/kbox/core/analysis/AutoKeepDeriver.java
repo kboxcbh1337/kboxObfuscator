@@ -325,12 +325,17 @@ public final class AutoKeepDeriver {
             }
         }
 
-        // ---- 6. Main / app entry points — always kept ----
+        // ---- 6. Main / app entry points ----
+        // P1-3: the METHOD name must survive, but the manifest ENTRY class may be
+        // renamed: the packer writes the mapped name into Main-Class /
+        // Original-Main-Class and emits a plaintext `-cp` stub at the original
+        // name, so both `-jar` and `java -cp` keep working.
+        final boolean manifestEntry = isManifestEntry(cn.name);
         if (cn.methods != null) {
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if ("main".equals(mn.name) && "([Ljava/lang/String;)V".equals(mn.desc)
                         && (mn.access & Opcodes.ACC_STATIC) != 0) {
-                    keepClass = true;
+                    if (!manifestEntry) keepClass = true;
                     graph.keep(new MemberRef(cn.name, "main", "([Ljava/lang/String;)V"));
                     keptMembers++;
                 }
@@ -494,6 +499,16 @@ public final class AutoKeepDeriver {
         if ("writeObject".equals(name) && "(Ljava/io/ObjectOutputStream;)V".equals(desc)) return true;
         if ("readObjectNoData".equals(name) && "()V".equals(desc)) return true;
         return false;
+    }
+
+    /** True when {@code internal} is the manifest Main-Class / Start-Class — the
+     *  one class the packer is allowed to rename (it rewrites the manifest and
+     *  emits a `-cp` stub). */
+    private boolean isManifestEntry(String internal) {
+        if (graph.getManifestMainClass() != null
+                && internal.equals(graph.getManifestMainClass().replace('.', '/'))) return true;
+        return graph.getManifestStartClass() != null
+                && internal.equals(graph.getManifestStartClass().replace('.', '/'));
     }
 
     /**

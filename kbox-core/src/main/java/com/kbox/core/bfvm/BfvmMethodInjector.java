@@ -40,6 +40,66 @@ public final class BfvmMethodInjector {
         this.nativeMethods = nativeMethods;
     }
 
+    /**
+     * 自动挑选可虚拟化的方法（P1-4）。
+     *
+     * <p>此前 {@code enableBfvm=true} 但没手写 {@code bfvmMethod} 时<b>什么都不做</b>——
+     * 开关形同虚设。现在按规则自动铺开：跳过 ctor/clinit、native/abstract、空体、
+     * 已被 VMP/JNIC 认领的方法、以及体量超过 {@code maxInsns} 的方法；其余交给
+     * {@link BfMethodCompiler#compile} 在编译期判定（不支持的会带原因跳过并留在原样）。</p>
+     *
+     * <p>只挑用户代码：库类（java/javax/kotlin/asm/第三方）不参与——BFVM 运行期开销大，
+     * 只值得用在高价值业务方法上。</p>
+     */
+    public static Set<String> autoSelect(ClassGraph graph,
+                                         com.kbox.core.config.ProtectionConfig cfg,
+                                         Set<String> vmpMethods, Set<String> nativeMethods,
+                                         int maxInsns) {
+        Set<String> out = new java.util.LinkedHashSet<>();
+        int scannedClasses = 0, scannedMethods = 0;
+        for (ClassNode cn : graph.getClasses().values()) {
+            scannedClasses++;
+            // 注意：不能用 shouldProtectClass——被 keep 的入口类（如 HelloWorld）会被判为 false，
+            // 而它们的<b>方法体</b>完全可以虚拟化（只是方法名/类名要保留）。
+            if (isFrameworkOrOwn(cn.name)) continue;
+            // Mixin classes / mixin targets are excluded from body-level
+            // obfuscation (their handlers are matched positionally by Mixin).
+            if (cfg.isBodyProtectExcluded(cn.name)) continue;
+            for (MethodNode mn : cn.methods) {
+                scannedMethods++;
+                if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) continue;
+                if (mn.name.startsWith("<")) continue;
+                if (mn.instructions == null || mn.instructions.size() == 0) continue;
+                if (mn.instructions.size() > maxInsns) {
+                    KBoxLog.info(TAG, "autoSelect skip " + cn.name + "." + mn.name
+                            + " insns=" + mn.instructions.size() + " > " + maxInsns);
+                    continue;
+                }
+                String key = com.kbox.core.config.ProtectionConfig.memberKey(cn.name, mn.name, mn.desc);
+                if (vmpMethods != null && vmpMethods.contains(key)) continue;
+                if (nativeMethods != null && nativeMethods.contains(key)) continue;
+                out.add(key);
+            }
+        }
+        KBoxLog.info(TAG, "autoSelect scanned " + scannedClasses + " classes / "
+                + scannedMethods + " methods -> " + out.size() + " candidate(s)");
+        return out;
+    }
+
+    /** 明显的框架/库/自身类：BFVM 运行期开销大，只值得用在高价值业务方法上。 */
+    private static boolean isFrameworkOrOwn(String internalName) {
+        return internalName.startsWith("java/")
+                || internalName.startsWith("javax/")
+                || internalName.startsWith("jdk/")
+                || internalName.startsWith("sun/")
+                || internalName.startsWith("com/sun/")
+                || internalName.startsWith("kotlin")
+                || internalName.startsWith("org/objectweb/asm")
+                || internalName.startsWith("org/jetbrains/")
+                || internalName.startsWith("org/intellij/")
+                || internalName.startsWith("com/kbox/");
+    }
+
     /** Result of the injection pass. */
     public static final class Result {
         public final List<String> transformed = new ArrayList<>();
@@ -91,7 +151,19 @@ public final class BfvmMethodInjector {
                         out.add(mn);
                         continue;
                     }
-                    out.add(BfVm.buildBody(cn.name, mn.access, mn.name, mn.desc, bf));
+                    MethodNode repl = BfVm.buildBody(cn.name, mn.access, mn.name, mn.desc, bf);
+                    // Keep every piece of metadata attached to the original method:
+                    // Mixin handlers (@Overwrite/@Inject/@Redirect) are recognised by
+                    // their ANNOTATIONS, and dropping them makes the mixin loader
+                    // reject the class ("contains non-private static method ...").
+                    repl.visibleAnnotations = mn.visibleAnnotations;
+                    repl.invisibleAnnotations = mn.invisibleAnnotations;
+                    repl.visibleParameterAnnotations = mn.visibleParameterAnnotations;
+                    repl.invisibleParameterAnnotations = mn.invisibleParameterAnnotations;
+                    repl.annotationDefault = mn.annotationDefault;
+                    repl.signature = mn.signature;
+                    repl.exceptions = mn.exceptions;
+                    out.add(repl);
                     r.transformed.add(key);
                     any = true;
                 } catch (UnsupportedOperationException e) {

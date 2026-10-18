@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Runtime-operand Mixed Boolean-Arithmetic rewrite (config {@code mbaRewrite}).
  *
  * <p>{@link MbaConstantObfuscator} rewrites compile-time <em>constants</em> into
- * random expression trees. This pass is the complementary half that ZKM/OPS-style
+ * random expression trees. This pass is the complementary half that
  * hardened obfuscators ship and KBox previously lacked: it rewrites the
  * <b>actual arithmetic at run time</b> — every {@code IADD/ISUB/IAND/IOR/IXOR}
  * between two live values — into an algebraically equivalent expression built
@@ -135,6 +135,18 @@ public final class MbaRewriteObfuscator {
                 repl.add(new VarInsnNode(Opcodes.ISTORE, s0));
                 Node root = expand(op, Node.leaf(Node.A), Node.leaf(Node.B), d, rnd);
                 emit(root, repl, s0, s1);
+                // HARD BUDGET: a single expansion can add hundreds of nodes, and
+                // this pass compounds with mbaConstants (which has already turned
+                // every literal into an arithmetic tree). Without a live check a
+                // 350-insn method grew to 33k nodes, blew the JVM's 64 KiB
+                // per-method code limit (MethodTooLargeException) and made the
+                // packager roll the WHOLE class back to unprotected bytes
+                // (measured on StressApp.build: lambdas in that class then threw
+                // AbstractMethodError because rollback only renames class names).
+                if (mn.instructions.size() + repl.size() > MAX_METHOD_INSNS) {
+                    mn.maxLocals -= 2;     // release the two unused temporaries
+                    continue;              // keep the original arithmetic site
+                }
                 mn.instructions.insertBefore(ins, repl);
                 mn.instructions.remove(ins);
                 done++;

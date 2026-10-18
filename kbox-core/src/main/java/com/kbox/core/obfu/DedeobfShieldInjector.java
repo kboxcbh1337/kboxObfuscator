@@ -171,15 +171,17 @@ public final class DedeobfShieldInjector {
 
         int stack = 0;
         if (needSig) {
-            // boolean KBoxDedeobfGuard.selfRefOk(int,int); pop result if left.
-            pre.add(new InsnNode(Opcodes.ICONST_0));          // sigLane pushed as int
+            // boolean KBoxDedeobfGuard.selfRefOk(int lane,int buildNo); pop result.
+            // NOTE: push lane directly — the former ICONST_0 + SWAP pair left the
+            // lane value on the operand stack (non-empty stack at RETURN ⇒
+            // VerifyError, and the ASM dataflow verifier reported it as
+            // "Execution can fall off the end of the code").
             pushConst(pre, lane);
-            pre.add(new InsnNode(Opcodes.SWAP));              // sigLane lane
             pushConst(pre, buildNo);
             pre.add(new MethodInsnNode(Opcodes.INVOKESTATIC, GUARD,
                     "selfRefOk", "(II)Z", false));
             pre.add(new InsnNode(Opcodes.POP));
-            stack = 0;
+            stack = 2;
         }
         if (needArm) {
             pushConst(pre, mask);
@@ -204,6 +206,18 @@ public final class DedeobfShieldInjector {
             for (AbstractInsnNode n : pre) insnList.add(n);
         } else {
             for (AbstractInsnNode n : pre) insnList.insertBefore(first, n);
+        }
+        // A freshly created <clinit> has no body at all: the prologue alone would
+        // fall off the end of the code. Terminate it unless the original body
+        // already ends in a return/throw/jump (labels/frames may trail it).
+        AbstractInsnNode tail = insnList.getLast();
+        while (tail != null && tail.getOpcode() < 0) tail = tail.getPrevious();
+        boolean terminated = tail != null && (tail.getOpcode() == Opcodes.RETURN
+                || tail.getOpcode() == Opcodes.ATHROW
+                || tail.getOpcode() == Opcodes.GOTO
+                || (tail.getOpcode() >= Opcodes.IRETURN && tail.getOpcode() <= Opcodes.ARETURN));
+        if (!terminated) {
+            insnList.add(new InsnNode(Opcodes.RETURN));
         }
         // bump maxStack for the prologue loads
         int needed = Math.max(2, stack);

@@ -27,7 +27,7 @@ import java.util.List;
  * Procyon, FernFlower and the java-deobfuscator/Deobfuscator tool while
  * leaving {@code java -jar} execution unaffected.
  *
- * <p>The synthetic {@code _KboxAntiDec} class is <b>never loaded by the JVM</b>
+ * <p>The synthetic {@code _x} class is <b>never loaded by the JVM</b>
  * at runtime — it exists solely inside the jar to crash tools that scan every
  * class. Because it is never loaded, the JVM verifier never inspects it; only
  * decompiler parsers (which eagerly parse every class in the jar) hit the
@@ -52,7 +52,10 @@ import java.util.List;
 public final class AntiDecompiler {
 
     private static final String TAG = "anti-dec";
-    private static final String SYNTH_CLASS = "com/kbox/runtime/_KboxAntiDec";
+    /** P2-1: the synthetic sink / chain names used to be `_x*`, which
+     *  announced "these are anti-decompiler decoys". Randomize per build. */
+    private final String synth;
+    private final String chainTag;
 
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
@@ -60,6 +63,16 @@ public final class AntiDecompiler {
     public AntiDecompiler(ClassGraph graph, ProtectionConfig cfg) {
         this.graph = graph;
         this.cfg = cfg;
+        java.util.concurrent.ThreadLocalRandom r = java.util.concurrent.ThreadLocalRandom.current();
+        this.synth = "com/kbox/runtime/_" + randTag(r, 10);
+        this.chainTag = randTag(r, 5);
+    }
+
+    private static String randTag(java.util.concurrent.ThreadLocalRandom r, int n) {
+        final String cs = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++) sb.append(cs.charAt(r.nextInt(cs.length())));
+        return sb.toString();
     }
 
     public void apply() {
@@ -147,12 +160,12 @@ public final class AntiDecompiler {
     /** Ensures the synthetic sink class exists in the graph. */
     @SuppressWarnings("unchecked")
     private ClassNode ensureSinkClass() {
-        ClassNode cn = graph.getClasses().get(SYNTH_CLASS);
+        ClassNode cn = graph.getClasses().get(synth);
         if (cn != null) return cn;
         cn = new ClassNode();
         cn.version = Opcodes.V1_8;
         cn.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
-        cn.name = SYNTH_CLASS;
+        cn.name = synth;
         cn.superName = "java/lang/Object";
         // Default constructor: must call super() before return or the JVM
         // verifier rejects with "Constructor must call super() or this()".
@@ -164,7 +177,7 @@ public final class AntiDecompiler {
         ctor.maxStack = 1;
         ctor.maxLocals = 1;
         cn.methods.add(ctor);
-        graph.getClasses().put(SYNTH_CLASS, cn);
+        graph.getClasses().put(synth, cn);
         return cn;
     }
 
@@ -242,7 +255,7 @@ public final class AntiDecompiler {
     private void injectSelfReferencingInnerClasses(ClassNode cn) {
         if (cn.innerClasses == null) cn.innerClasses = new java.util.ArrayList<>();
         cn.innerClasses.add(new org.objectweb.asm.tree.InnerClassNode(
-                SYNTH_CLASS, SYNTH_CLASS, "_KboxAntiDec",
+                synth, synth, synth.substring(synth.lastIndexOf('/') + 1),
                 Opcodes.ACC_STATIC | Opcodes.ACC_PUBLIC));
     }
 
@@ -263,7 +276,7 @@ public final class AntiDecompiler {
                                         int maxStack, int maxLocals) {
                 ByteVector bv = new ByteVector();
                 // CONSTANT_Class_info index pointing to self
-                bv.putShort(cw.newClass(SYNTH_CLASS));
+                bv.putShort(cw.newClass(synth));
                 // CONSTANT_NameAndType_info index pointing to _bloat0()V
                 bv.putShort(cw.newNameType("_bloat0", "()V"));
                 return bv;
@@ -280,7 +293,7 @@ public final class AntiDecompiler {
     private void injectDeepInheritanceChain(ClassNode sink, int depth) {
         String parent = sink.name;
         for (int i = 1; i <= depth; i++) {
-            String name = SYNTH_CLASS + "_chain" + i;
+            String name = synth + "_" + chainTag + i;
             ClassNode cn = new ClassNode();
             cn.version = Opcodes.V1_8;
             cn.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
@@ -413,7 +426,7 @@ public final class AntiDecompiler {
                         caller, "()V", null, null);
                 InsnList l = mn.instructions;
                 l.add(new org.objectweb.asm.tree.MethodInsnNode(
-                        Opcodes.INVOKESTATIC, SYNTH_CLASS, callee, "()V", false));
+                        Opcodes.INVOKESTATIC, synth, callee, "()V", false));
                 l.add(new InsnNode(Opcodes.RETURN));
                 cn.methods.add(mn);
             }
@@ -522,7 +535,7 @@ public final class AntiDecompiler {
                 for (int i = 0; i < 100; i++) {
                     bv.putShort(cw.newHandle(
                             org.objectweb.asm.Opcodes.H_INVOKESTATIC,
-                            SYNTH_CLASS, "_bloat" + (i % 5), "()V", false));
+                            synth, "_bloat" + (i % 5), "()V", false));
                     bv.putShort(0); // no arguments
                 }
                 return bv;
@@ -539,8 +552,8 @@ public final class AntiDecompiler {
                 ByteVector bv = new ByteVector();
                 bv.putShort(1000);
                 for (int i = 0; i < 1000; i++) {
-                    bv.putShort(cw.newClass(SYNTH_CLASS + "_fake" + i));
-                    bv.putShort(cw.newClass(SYNTH_CLASS + "_fake" + ((i + 1) % 1000)));
+                    bv.putShort(cw.newClass(synth + "_fake" + i));
+                    bv.putShort(cw.newClass(synth + "_fake" + ((i + 1) % 1000)));
                     bv.putShort(cw.newUTF8("_inner" + i));
                     bv.putShort(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC);
                 }
@@ -575,7 +588,7 @@ public final class AntiDecompiler {
         // At L1: recursively call _impossible (creates a cycle in the call graph)
         l.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 0));
         l.add(new org.objectweb.asm.tree.MethodInsnNode(
-                Opcodes.INVOKESTATIC, SYNTH_CLASS, "_impossible", "(I)V", false));
+                Opcodes.INVOKESTATIC, synth, "_impossible", "(I)V", false));
         l.add(new JumpInsnNode(Opcodes.GOTO, l3));
         l.add(l2);
         l.add(new InsnNode(Opcodes.NOP));

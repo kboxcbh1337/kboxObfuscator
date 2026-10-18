@@ -38,36 +38,37 @@ public final class BfMethodCompiler {
     private BfMethodCompiler() {
     }
 
-    /** {@code true} when the method body uses any opcode BFVM cannot translate. */
+    /**
+     * {@code true} when the method body uses any opcode BFVM cannot translate.
+     *
+     * <p>P1-5 起 try/catch、invokedynamic、monitor、multianewarray 均已支持；
+     * 只有 JSR/RET（Java 6 之前的子程序指令，javac 早已不再生成）仍被拒绝。</p>
+     */
     public static boolean isSupported(MethodNode mn) {
-        if (!mn.tryCatchBlocks.isEmpty()) {
-            return false;
-        }
         for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
             int op = n.getOpcode();
-            switch (op) {
-                case Opcodes.MONITORENTER:
-                case Opcodes.MONITOREXIT:
-                case Opcodes.JSR:
-                case Opcodes.RET:
-                case Opcodes.INVOKEDYNAMIC:
-                case Opcodes.MULTIANEWARRAY:
-                    return false;
-                default:
-                    break;
+            if (op == Opcodes.JSR || op == Opcodes.RET) {
+                return false;
             }
         }
         return true;
     }
 
     public static byte[] compile(MethodNode mn, String owner) {
-        if (!mn.tryCatchBlocks.isEmpty()) {
-            throw new UnsupportedOperationException(
-                    "method has exception handlers (unsupported in v1): " + mn.name + mn.desc);
-        }
         ByteWriter w = new ByteWriter();
         w.u16(Math.max(mn.maxLocals, 1));
         w.utf8(mn.desc); // parameter layout so the VM can mirror JVM local slots
+        // P1-5：异常表（start, end, handler, catchType）。pc 只有在指令发射后才知道，
+        // 所以先写占位，最后与分支目标一起回填。
+        List<TryPatch> tryPatches = new ArrayList<>();
+        w.u16(mn.tryCatchBlocks.size());
+        for (org.objectweb.asm.tree.TryCatchBlockNode t : mn.tryCatchBlocks) {
+            w.u8(t.type == null ? 0 : 1);       // 0 = catch-all (finally)
+            if (t.type != null) w.utf8(t.type);
+            tryPatches.add(new TryPatch(w.size(), t.start));   w.i32(0);
+            tryPatches.add(new TryPatch(w.size(), t.end));     w.i32(0);
+            tryPatches.add(new TryPatch(w.size(), t.handler)); w.i32(0);
+        }
         Map<LabelNode, Integer> labels = new HashMap<>();
         List<Patch> patches = new ArrayList<>();
         for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
@@ -84,6 +85,13 @@ public final class BfMethodCompiler {
             Integer target = labels.get(p.label);
             if (target == null) {
                 throw new BfVmException("unresolved branch target label");
+            }
+            w.patchI32(p.offset, target);
+        }
+        for (TryPatch p : tryPatches) {
+            Integer target = labels.get(p.label);
+            if (target == null) {
+                throw new BfVmException("unresolved exception-table label");
             }
             w.patchI32(p.offset, target);
         }
@@ -377,8 +385,63 @@ public final class BfMethodCompiler {
                 break;
             }
 
+            // ---- P1-5：monitor / multianewarray / invokedynamic ----
+            case Opcodes.MONITORENTER:
+                w.u8(Opcode.MONITORENTER);
+                break;
+            case Opcodes.MONITOREXIT:
+                w.u8(Opcode.MONITOREXIT);
+                break;
+
+            case Opcodes.MULTIANEWARRAY: {
+                org.objectweb.asm.tree.MultiANewArrayInsnNode m =
+                        (org.objectweb.asm.tree.MultiANewArrayInsnNode) n;
+                w.u8(Opcode.MULTIANEWARRAY);
+                w.utf8(m.desc);
+                w.u8(m.dims);
+                break;
+            }
+
+            case Opcodes.INVOKEDYNAMIC: {
+                org.objectweb.asm.tree.InvokeDynamicInsnNode indy =
+                        (org.objectweb.asm.tree.InvokeDynamicInsnNode) n;
+                w.u8(Opcode.INVOKEDYNAMIC);
+                w.utf8(indy.name);
+                w.utf8(indy.desc);
+                w.u8(indy.bsm.getTag());
+                w.ref(indy.bsm.getOwner(), indy.bsm.getName(), indy.bsm.getDesc());
+                w.u8(indy.bsmArgs.length);
+                for (Object a : indy.bsmArgs) {
+                    writeBsmArg(w, a);
+                }
+                break;
+            }
+
             default:
                 throw new UnsupportedOperationException("unsupported opcode " + opcodeName(op));
+        }
+    }
+
+    /** 序列化 invokedynamic 的 BSM 常量参数（ASM 允许的 7 种类型）。 */
+    private static void writeBsmArg(ByteWriter w, Object a) {
+        if (a instanceof Integer) {
+            w.u8(1); w.i32(((Integer) a).intValue());
+        } else if (a instanceof Long) {
+            w.u8(2); w.i64(((Long) a).longValue());
+        } else if (a instanceof Float) {
+            w.u8(3); w.i32(Float.floatToIntBits(((Float) a).floatValue()));
+        } else if (a instanceof Double) {
+            w.u8(4); w.i64(Double.doubleToLongBits(((Double) a).doubleValue()));
+        } else if (a instanceof String) {
+            w.u8(5); w.utf8((String) a);
+        } else if (a instanceof Type) {
+            w.u8(6); w.utf8(((Type) a).getDescriptor());
+        } else if (a instanceof org.objectweb.asm.Handle) {
+            org.objectweb.asm.Handle h = (org.objectweb.asm.Handle) a;
+            w.u8(7); w.u8(h.getTag()); w.ref(h.getOwner(), h.getName(), h.getDesc());
+        } else {
+            throw new UnsupportedOperationException(
+                    "unsupported invokedynamic bsm arg: " + a);
         }
     }
 
@@ -458,6 +521,17 @@ public final class BfMethodCompiler {
         final LabelNode label;
 
         Patch(int offset, LabelNode label) {
+            this.offset = offset;
+            this.label = label;
+        }
+    }
+
+    /** 异常表条目的待回填 pc（start / end / handler）。 */
+    private static final class TryPatch {
+        final int offset;
+        final LabelNode label;
+
+        TryPatch(int offset, LabelNode label) {
             this.offset = offset;
             this.label = label;
         }

@@ -63,6 +63,15 @@ public final class ClassGraph {
     private final Set<String> cfModifiedClasses =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** P2-11: internal names that also have a {@code META-INF/versions/N/} copy
+     *  (multi-release jar). Versioned entries stay raw so the JVM's MR lookup
+     *  keeps working, which means the base class must keep its ORIGINAL name —
+     *  the pipeline adds these to the keep-prefix list. */
+    private final Set<String> multiReleaseClasses =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public Set<String> getMultiReleaseClasses() { return multiReleaseClasses; }
+
     public Map<String, ClassNode> getClasses() { return classes; }
     public Map<String, Set<String>> getReferences() { return references; }
     public Map<String, Set<String>> getReferencedBy() { return referencedBy; }

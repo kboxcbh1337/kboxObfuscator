@@ -38,22 +38,22 @@ import java.util.HashSet;
  * <p>闭环："检测 → 分配 → 预防"。
  * <ol>
  *   <li><b>检测</b>：{@link AdaptationAuditor} 对输入 jar 做深度自检（25 类
- *       其他混淆器适配性弱点对应的特殊代码模式），产出原始发现列表。</li>
+ *       同类工具适配性弱点对应的特殊代码模式），产出原始发现列表。</li>
  *   <li><b>分配</b>：按 family|owner|member 去重（保留最高风险），然后对每条
- *       发现去 {@link WeaknessCatalog}（精编弱点目录：来源混淆器 / 支柱 /
+ *       发现去 {@link WeaknessCatalog}（精编弱点目录：来源类别 / 支柱 /
  *       弱点 / 症状 / 加固）查询该族的权威动作。</li>
  *   <li><b>预防</b>：把动作落地到 {@link ProtectionConfig} / graph keep-set——
  *       反射目标 keep、序列化保留、SPI provider 保留、回调接口成员保留、
  *       Swing GUI 类排除 JNIC/VMP（预防"无画面"）、资源路径不重命名、
  *       Signature 属性保留等，全部发生在任何混淆 pass 之前。</li>
  *   <li><b>报告</b>：输出人类可读的适配性审查报告（风险分布、已分配动作、
- *       逐条明细含"来源混淆器/支柱/弱点/加固"、预防措施），供交付与回归使用。</li>
+ *       逐条明细含"来源类别/支柱/弱点/加固"、预防措施），供交付与回归使用。</li>
  * </ol>
  *
- * <p>SilentShield 只做保守动作（宁可少混淆也不破坏语义），与商业混淆器
- * "渐进降级 / 最小侵入"哲学一致。它是安全增强层：对简单 jar 无副作用
+ * <p>SilentShield 只做保守动作（宁可少混淆也不破坏语义），与“渐进降级 / 最小侵入”
+ * 的工程哲学一致。它是安全增强层：对简单 jar 无副作用
  * （keep 集只增不减），对复杂 jar 自动规避易碎路径——每条加固对策都
- * 直接源于其他混淆器已暴露的适配性弱点。
+ * 直接源于同类工具已暴露的适配性弱点。
  */
 public final class AuditOrchestrator {
 
@@ -106,6 +106,12 @@ public final class AuditOrchestrator {
         ActionSink sink = new ActionSink(graph);
         for (AuditFinding f : findings) {
             ProtectionAction action = catalog.actionFor(f.family);
+            // P1-3: ENTRY_POINT may carry a per-finding override. The manifest
+            // entry class is renameable (Main-Class is rewritten + a `-cp` stub is
+            // emitted), so only its `main` method must be kept.
+            if ("ENTRY_POINT".equals(f.family) && f.action == ProtectionAction.KEEP_MEMBER) {
+                action = ProtectionAction.KEEP_MEMBER;
+            }
             sink.apply(f, action);
         }
         sink.commit(cfg);
@@ -285,7 +291,7 @@ public final class AuditOrchestrator {
         }
 
         sb.append("================================================================\n");
-        sb.append("SilentShield — 其他混淆器适配性弱点加固审查报告\n");
+        sb.append("SilentShield — 适配性弱点加固审查报告\n");
         sb.append("================================================================\n");
         sb.append("弱点目录: WeaknessCatalog 内置 ").append(catalog.size())
                 .append(" 条弱点条目，覆盖 ").append(catalog.sources().size())
@@ -449,20 +455,41 @@ public final class AuditOrchestrator {
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if ("main".equals(mn.name) && "([Ljava/lang/String;)V".equals(mn.desc)
                         && (mn.access & Opcodes.ACC_STATIC) != 0) {
+                    // P1-3: the manifest entry class MAY be renamed (the packer
+                    // rewrites Main-Class / Original-Main-Class and writes a
+                    // plaintext `-cp` stub at the original name). Only its `main`
+                    // method must survive. Secondary mains stay fully kept.
+                    boolean manifestEntry = (graph.getManifestMainClass() != null
+                            && cn.name.equals(graph.getManifestMainClass().replace('.', '/')))
+                            || (graph.getManifestStartClass() != null
+                            && cn.name.equals(graph.getManifestStartClass().replace('.', '/')));
+                    com.kbox.core.log.KBoxLog.debug("silentshield", "entry " + cn.name
+                            + " manifestEntry=" + manifestEntry
+                            + " mc=" + graph.getManifestMainClass());
                     out.add(new AuditFinding("ENTRY_POINT", cn.name, "main ([Ljava/lang/String;)V",
-                            RiskLevel.HIGH, ProtectionAction.KEEP_CLASS,
+                            RiskLevel.HIGH,
+                            manifestEntry ? ProtectionAction.KEEP_MEMBER : ProtectionAction.KEEP_CLASS,
                             "main / entry " + cn.name + ".main",
-                            "keep entry point " + cn.name + ".main"));
+                            manifestEntry
+                                    ? "keep entry method " + cn.name + ".main (class may be renamed)"
+                                    : "keep entry point " + cn.name + ".main"));
                 }
             }
         }
 
         // ---- enum / record / sealed ----
         if ((cn.access & Opcodes.ACC_ENUM) != 0) {
+            // Renaming an enum CLASS is safe: RetentionDecision already pins the
+            // enum-constant field names, `values`/`valueOf` and the ordinal
+            // machinery, and every symbolic reference (including the synthetic
+            // $VALUES / $SwitchMap) is remapped consistently. Keeping the class
+            // itself (the old KEEP_CLASS action) left the enum's name — and its
+            // constants' enclosing type — verbatim in the output, which in turn
+            // exposed the enclosing class name in every reference.
             out.add(new AuditFinding("ENUM_TYPE", cn.name, "", RiskLevel.LOW,
-                    ProtectionAction.KEEP_CLASS,
+                    ProtectionAction.NONE,
                     "enum " + cn.name + " with constants",
-                    "keep enum constants + valueOf/values of " + cn.name));
+                    "constants/valueOf/values stay by name; class name may be renamed"));
         }
         if ((cn.access & Opcodes.ACC_RECORD) != 0 || "java/lang/Record".equals(cn.superName)) {
             out.add(new AuditFinding("RECORD_TYPE", cn.name, "", RiskLevel.MEDIUM,
@@ -794,7 +821,7 @@ public final class AuditOrchestrator {
                     }
                 } else if (ins instanceof InvokeDynamicInsnNode) {
                     InvokeDynamicInsnNode id = (InvokeDynamicInsnNode) ins;
-                    // Java 9+ StringConcatFactory indy：R8/D8 曾在此类站点因配方被
+                    // Java 9+ StringConcatFactory indy：此类站点曾因配方被
                     // 常量折叠/参数重排破坏而错乱，检测后如实记录（弱点目录标注）。
                     if (id.bsm != null && "java/lang/invoke/StringConcatFactory".equals(id.bsm.getOwner())) {
                         out.add(new AuditFinding("STRING_CONCAT_INDY", cn.name, mn.name + " " + mn.desc,
@@ -812,8 +839,14 @@ public final class AuditOrchestrator {
                                         + cn.name + "." + mn.name + mn.desc,
                                 "preserve switch/record-object bootstrap sites; do not reorder their args"));
                     }
+                    // LambdaMetafactory / StringConcatFactory 的 Handle 是符号引用：
+                    // ASM 的 ClassRemapper 会随改名同步改写 owner/name/desc，因此无需
+                    // 进入 keep-set（旧行为会把 lambda$xxx$0 实现方法钉死在明文名上）。
+                    boolean symbolicHandle = id.bsm != null
+                            && ("java/lang/invoke/LambdaMetafactory".equals(id.bsm.getOwner())
+                                || "java/lang/invoke/StringConcatFactory".equals(id.bsm.getOwner()));
                     for (Object a : id.bsmArgs) {
-                        if (a instanceof Handle) {
+                        if (!symbolicHandle && a instanceof Handle) {
                             Handle h = (Handle) a;
                             if (!h.getOwner().startsWith("java/") && !h.getOwner().startsWith("jdk/")) {
                                 out.add(new AuditFinding("LAMBDA_CAPTURE", h.getOwner(),

@@ -3,6 +3,10 @@
 让手机（Android）远程查看电脑端混淆器的实时进度：当前阶段、进度百分比、阶段名、实时日志。
 电脑端继续跑完整混淆（含 PE 加壳 / native 编译 / VMP / JNIC 等），手机只做**远程监控端**。
 
+> ⚠️ **当前不可用**：电脑端的内嵌监控服务（`ProtectorGui` 提供的 `/api/pair`、`/api/state`、`/api/stream`）
+> 随内置 HTML UI 一起被移除；现在 `--gui` 只启动原生 Swing 桌面界面，**不再监听 HTTP 端口**，
+> 因此本模块的 APK 暂时没有可连接的后端。如需继续使用手机监控，需要重新提供一个 HTTP 服务端。
+
 ## 目录结构
 
 ```
@@ -14,7 +18,7 @@ mobile-monitor/
 │   ├── USAGE.md              # 局域网直连 / 公网穿透 实操步骤
 │   └── PROTOCOL.md           # PC↔手机 使用的 JSON / SSE 协议（供双端同步）
 ├── start-pc-monitor.bat      # 电脑端双击启动混淆器 GUI + 监控服务
-├── sync.ps1                  # 把最新 kboxObfPro dist 同步到本目录，保证两端版本一致
+├── sync.ps1                  # 把最新 dist（原始代码/dist 或 Maven 产物）同步到本目录，保证两端版本一致
 └── README.md
 ```
 
@@ -29,7 +33,7 @@ mobile-monitor/
 
 ## 电脑端（电脑版）
 
-改动位于 `kbox-gui/src/main/java/com/kbox/gui/ProtectorGui.java`：
+（原）改动位于 `kbox-gui/src/main/java/com/kbox/gui/ProtectorGui.java`（该文件已随 HTML UI 一起移除，下列实现仅作协议参考）：
 
 - 监听地址由 `127.0.0.1` 改为 `0.0.0.0`（局域网即可达，可用 `-Dkbox.gui.host=` 覆盖）。
 - 新增 `/api/pair`（配对信息 JSON）、`/api/stream`（SSE 实时推送）。
@@ -53,4 +57,4 @@ java -jar kbox-cli/target/kbox-protector.jar --gui
 ## 电脑版 ↔ 手机版 同步更新
 
 协议在 `docs/PROTOCOL.md` 中统一定义（`/api/state` JSON 字段 + SSE 事件名）。两端只要遵循同一
-schema 即自动保持同步；`sync.ps1` 会把最新 kboxObfPro dist 同步进来，确保电脑版与手机版能力一致。
+schema 即自动保持同步；`sync.ps1` 会把最新 dist 同步进来，确保电脑版与手机版能力一致。

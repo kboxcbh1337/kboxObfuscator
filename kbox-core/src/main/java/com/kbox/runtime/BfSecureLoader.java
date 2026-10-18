@@ -83,12 +83,19 @@ public final class BfSecureLoader extends ClassLoader {
      *  not to the reflect machinery).</p> */
     private static boolean callerIsKbox() {
         try {
+            // P3-15: the whole BF bootstrap surface is renamed into one per-build
+            // package, so authorise by THIS class' own package prefix instead of the
+            // literal "com.kbox.runtime." (otherwise the gate would reject the
+            // renamed loader's own main()/<init>).
+            String self = BfSecureLoader.class.getName();
+            int dot = self.lastIndexOf('.');
+            String pkg = dot > 0 ? self.substring(0, dot + 1) : "com.kbox.runtime.";
             StackTraceElement[] st = new Throwable().getStackTrace();
             // st[0] is this method's own frame; start at the caller.
             for (int i = 1; i < st.length; i++) {
                 String n = st[i].getClassName();
                 if (isFilteredFrame(n)) continue;
-                return n.startsWith("com.kbox.runtime.");
+                return n.startsWith(pkg);
             }
             return false;
         } catch (Throwable t) {
@@ -160,7 +167,26 @@ public final class BfSecureLoader extends ClassLoader {
      *  its plaintext; integrity checks must use {@link #probeClassFromBF}). The
      *  returned buffer must be released with {@link #wipeResource} once
      *  consumed. */
-    private native java.nio.ByteBuffer getResourceBytes(String name);
+    private static native java.nio.ByteBuffer getResourceBytes(String name);
+
+    /** Cheap PURE-INDEX probe (no decode, no plaintext window): true when the
+     *  blob carries this non-class resource. Backs {@link #findResource}. */
+    private static native boolean hasResource(String name);
+
+    /** Cheap PURE-INDEX probe for a class entry. Backs the child-first
+     *  {@link #loadClass} policy (blob classes are always defined by this
+     *  loader, even when a plaintext `-cp` entry stub shares the name). */
+    private static native boolean hasClass(String name);
+
+    /** Single reusable handler for synthetic {@code kboxbf:} resource URLs. */
+    private static final BfResourceHandler _RH = new BfResourceHandler();
+
+    /** Opens a blob resource for {@link BfResourceConnection} (same fail-closed
+     *  rules as {@link #getResourceAsStream}: {@code .class} is never served). */
+    static InputStream openBlobResource(String name) {
+        java.nio.ByteBuffer bb = getResourceBytes(name);
+        return bb == null ? null : new BfBlobInputStream(bb);
+    }
 
     /** Wipes + unmaps an off-heap direct buffer returned by
      *  {@link #getResourceBytes}. Called by {@link BfBlobInputStream} as soon
@@ -407,22 +433,91 @@ public final class BfSecureLoader extends ClassLoader {
         }
     }
 
-    /** Reads the renamed application entry point from the manifest. */
+    /** Reads the renamed application entry point from the manifest. P1-3: the
+     *  value may be masked (XOR + Entry-Guard-Seed) exactly like the guard path. */
     private String readOriginalMainClass() {
         byte[] mf = readBlob(_MP);
         if (mf == null) return null;
         String s = new String(mf, StandardCharsets.UTF_8);
+        String val = null;
+        String seedB64 = null;
         for (String line : s.split("\r?\n")) {
             if (line.startsWith("Original-Main-Class:")) {
-                return line.substring(line.indexOf(':') + 1).trim();
+                val = line.substring(line.indexOf(':') + 1).trim();
+            } else if (line.startsWith("Entry-Guard-Seed:")) {
+                seedB64 = line.substring(line.indexOf(':') + 1).trim();
             }
         }
-        return null;
+        if (val == null || val.isEmpty()) return null;
+        if (seedB64 != null && !seedB64.isEmpty()) {
+            try {
+                byte[] seed = java.util.Base64.getDecoder().decode(seedB64);
+                byte[] masked = java.util.Base64.getDecoder().decode(val);
+                val = new String(entryNameCodec(masked, seed), StandardCharsets.UTF_8);
+            } catch (Throwable t) {
+                return null;
+            }
+        }
+        return val;
+    }
+
+    /** Symmetric XOR codec — MUST stay byte-identical to Packager.entryNameCodec. */
+    private static byte[] entryNameCodec(byte[] in, byte[] seed) {
+        byte[] out = new byte[in.length];
+        long s = 0x6A09E667F3BCC909L;
+        for (byte b : seed) s = ((s ^ (b & 0xFF)) * 0x100000001B3L);
+        for (int i = 0; i < in.length; i++) {
+            s ^= s >>> 12; s ^= s << 25; s ^= s >>> 27;
+            s *= 0x2545F4914F6CDD1DL;
+            out[i] = (byte) (in[i] ^ (byte) (s >>> 32));
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------
     // Class loading
     // ------------------------------------------------------------------
+
+    /**
+     * Child-first for classes the payload carries, parent-first for everything
+     * else.
+     *
+     * <p>P2-9: a plaintext entry stub is written at the ORIGINAL main class name
+     * so {@code java -cp out.jar <MainClass>} can bootstrap the loader. When the
+     * real class was not renamed, both share that name — a parent-first lookup
+     * would return the stub and recurse forever. Checking the native class index
+     * first makes the blob authoritative; plaintext hybrid classes are absent
+     * from the blob and still resolve through the parent.</p>
+     */
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        synchronized (getClassLoadingLock(name)) {
+            Class<?> c = findLoadedClass(name);
+            if (c == null) {
+                // The native class index is keyed by INTERNAL names ("a/b/C"), while
+                // the JVM calls loadClass with a binary name ("a.b.C"). Passing the
+                // dotted form made hasClass() miss every packaged class, so the
+                // parent loader won — returning the plaintext -cp entry stub for the
+                // app main and recursing forever (compat.CompatApp -> stub ->
+                // BfSecureLoader.main -> ...). Default-package names contain no dot,
+                // which is why only packaged applications exposed this.
+                if (!name.startsWith("java.") && !name.startsWith("javax.")
+                        && !name.startsWith("jdk.") && !name.startsWith("sun.")
+                        && !name.startsWith("com.sun.")
+                        && hasClass(name.replace('.', '/'))) {
+                    try {
+                        c = findClass(name);
+                    } catch (ClassNotFoundException ignored) {
+                        // Transient decode failure: fall back to the parent, which
+                        // will produce the authoritative error if it lacks it too.
+                    }
+                }
+                if (c == null) c = super.loadClass(name, resolve);
+            }
+            if (resolve) resolveClass(c);
+            return c;
+        }
+    }
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
@@ -458,18 +553,45 @@ public final class BfSecureLoader extends ClassLoader {
     // ------------------------------------------------------------------
 
     /**
-     * Serves resources from the native jar blob. Falls back to the parent
-     * loader for anything not hidden in the blob.
+     * P2-8: URL-based resource lookup for blob resources.
      *
-     * <p>Note: this class intentionally defines no {@code findResource}
-     * (URL-based) override — implementing one would need a custom
-     * {@link java.net.URLStreamHandler}, which is an anonymous/nested class
-     * that would have to be injected into the jar as a second class file.
-     * Stream access via {@link #getResourceAsStream} (the canonical API used
-     * by {@code Class.getResourceAsStream}, config loaders, etc.) is fully
-     * supported; {@code Class.getResource(...)} returns {@code null} for blob
-     * resources. The loader itself is injected as a plain jar entry and must
-     * reference no class that is not also injected.</p>
+     * <p>{@code ClassLoader.getResource()} is parent-first, so plaintext jar
+     * entries (hybrid MC classes, framework text) still win. Anything the parent
+     * cannot serve falls through to this override, which returns a synthetic
+     * {@code kboxbf:} URL whose body is decoded from the native blob on demand.
+     * Implementing {@code findResource} also fixes the APIs layered on top of it:
+     * {@code Class.getResource}, {@code getResources} (default {@code findResources}
+     * delegates here) and therefore {@code ServiceLoader.load(...)}.</p>
+     *
+     * <p>Only names the blob actually carries are claimed (cheap native index
+     * probe, no decode); class bytecode stays fail-closed and is never exposed as
+     * a resource.</p>
+     */
+    @Override
+    protected java.net.URL findResource(String name) {
+        try {
+            if (name == null || !hasResource(name)) return null;
+            return new java.net.URL("kboxbf", null, -1, "/" + name, _RH);
+        } catch (java.net.MalformedURLException e) {
+            return null;
+        }
+    }
+
+    /** Java 8's default {@code findResources} returns an EMPTY enumeration (it is
+     *  {@code URLClassLoader} that overrides it), so overriding only
+     *  {@link #findResource} would leave {@code getResources(...)} blind to the
+     *  blob. Forward it explicitly. */
+    @Override
+    protected java.util.Enumeration<java.net.URL> findResources(String name) {
+        java.net.URL u = findResource(name);
+        if (u == null) return java.util.Collections.emptyEnumeration();
+        return java.util.Collections.enumeration(java.util.Collections.singletonList(u));
+    }
+
+    /**
+     * Serves resources from the native jar blob. Falls back to the parent
+     * loader for anything not hidden in the blob (child-first here: a blob body
+     * is authoritative for names it carries).
      */
     @Override
     public InputStream getResourceAsStream(String name) {

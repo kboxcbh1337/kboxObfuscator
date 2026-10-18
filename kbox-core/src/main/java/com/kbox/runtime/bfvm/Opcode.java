@@ -169,4 +169,10 @@ public final class Opcode {
 
     public static final int ARRAYLENGTH = 190;
     public static final int ATHROW = 191;
+
+    // ---- P1-5 additions（构建端 Opcode 必须同步）----
+    public static final int MULTIANEWARRAY = 250;
+    public static final int INVOKEDYNAMIC = 251;
+    public static final int MONITORENTER = 252;
+    public static final int MONITOREXIT = 253;
 }

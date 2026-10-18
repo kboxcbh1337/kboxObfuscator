@@ -58,6 +58,25 @@ public final class Packager {
 
     private static final String TAG = "package";
 
+    /** P3-15: config of the current write()/writeBrainfuck() run, so the
+     *  runtime-class injectors can read the per-build BF rename map without
+     *  threading a parameter through every call site. */
+    private ProtectionConfig activeCfg;
+
+    private static String rtName(ProtectionConfig cfg, String internal) {
+        java.util.Map<String, String> m = cfg == null ? null : cfg.getRuntimeRenameMap();
+        return RuntimeRename.name(m, internal);
+    }
+
+    /**
+     * 跳过深字节码校验的类体积上限（512 KB）。超过此体积不再对该类跑
+     * {@code CheckClassAdapter.verify()} 的全量数据流分析——该分析在超大方法
+     * （如被反编译器对抗链路膨胀的 {@code <clinit>}）上内存需求爆炸，曾在真实
+     * 874 类 jar 上把整次保护运行 OOM 掉（{@code -Xmx4g} 亦复现）。仅跳过“该类”
+     * 的深度校验，类的重序列化与逐类回滚保护网仍然生效。
+     */
+    private static final int VERIFY_MAX_BYTES = 512 * 1024;
+
     /**
      * Verifies a serialized class byte array using ASM's CheckClassAdapter.
      * This is equivalent to the JVM verifier: it checks type safety, stack
@@ -89,8 +108,28 @@ public final class Packager {
             }
         } catch (Exception ignored) {}
 
+        // P2-3: synthetic decoys / holders are never loaded by the JVM. Running
+        // the dataflow verifier on them only produces noise (and the 590 KB
+        // anti-decompiler sink was previously "skipped" anonymously at the size
+        // guard). Skip them explicitly instead.
+        if (isNeverLoadedSynthetic(className)) return null;
+
         try {
             ClassReader cr = new ClassReader(classBytes);
+            // Guard: CheckClassAdapter.verify() runs a full data-flow analysis whose
+            // memory use explodes on classes carrying very large methods (e.g. an
+            // inflated <clinit> produced by the anti-decompiler chain passes). On a
+            // real 874-class jar this OOM'd the ENTIRE protection run — reproduced
+            // even with -Xmx4g, i.e. it is not a simple heap-sizing problem.
+            // Above the threshold we skip deep verification for that class only;
+            // the class is still re-serialized and the per-class rollback net
+            // remains active, so a genuinely broken class still falls back to its
+            // original bytes instead of aborting the whole build.
+            if (classBytes.length > VERIFY_MAX_BYTES) {
+                KBoxLog.warn("package", "Skipping deep bytecode verification for oversized class "
+                        + className + " (" + classBytes.length + "B > " + VERIFY_MAX_BYTES + "B)");
+                return null;
+            }
             // Use CheckClassAdapter to verify bytecode structure and type safety.
             // The PrintWriter collects diagnostics — we only care about actual
             // bytecode corruption, not classpath limitations (Minecraft classes
@@ -145,6 +184,14 @@ public final class Packager {
      */
     @SuppressWarnings("unchecked")
     static String checkStackAtReturn(byte[] classBytes) {
+        // 与 verifyClassBytes 同一护栏：此处的 Analyzer 数据流分析在超大方法上同样会
+        // 把整次运行 OOM 掉（真实复现：procyon-0.6.0 的 com/strobel/assembler/metadata/zy
+        // 868KB -> Frame.<init> OOM）。超阈值仅跳过“该类”的深度校验并告警。
+        if (classBytes.length > VERIFY_MAX_BYTES) {
+            KBoxLog.warn("package", "Skipping stack-at-return analysis for oversized class ("
+                    + classBytes.length + "B > " + VERIFY_MAX_BYTES + "B)");
+            return null;
+        }
         try {
             ClassReader cr = new ClassReader(classBytes);
             ClassNode cn = new ClassNode();
@@ -217,6 +264,12 @@ public final class Packager {
      */
     @SuppressWarnings("unchecked")
     static String checkFrameConsistency(byte[] classBytes) {
+        // 同护栏：EXPAND_FRAMES + Analyzer 在超大方法上内存需求爆炸。
+        if (classBytes.length > VERIFY_MAX_BYTES) {
+            KBoxLog.warn("package", "Skipping frame-consistency analysis for oversized class ("
+                    + classBytes.length + "B > " + VERIFY_MAX_BYTES + "B)");
+            return null;
+        }
         try {
             ClassReader cr = new ClassReader(classBytes);
             ClassNode cn = new ClassNode();
@@ -295,6 +348,7 @@ public final class Packager {
                       byte[] vmpBlob,
                       byte[] epdManifest,
                       com.kbox.core.packaging.NativeLibPacker.Result natLibs) throws IOException {
+        activeCfg = cfg;
         Path parent = outputJar.getParent();
         if (parent != null) Files.createDirectories(parent);
         Map<String, String> classMap = mapping != null ? mapping.getClassMap() : java.util.Collections.emptyMap();
@@ -345,6 +399,20 @@ public final class Packager {
             ManifestUpdater mu = new ManifestUpdater(classMap);
             mu.setSpringBootFatJar(springBoot);
 
+            // P2-9: `java -cp out.jar <MainClass>` support.
+            //  - entry renamed  → a plaintext stub at the ORIGINAL name forwards
+            //                     to the launcher (guard) or to the mapped main.
+            //  - entry NOT renamed but a guard is active → the real class occupies
+            //    the name, so main() gets a bootstrap hook instead.
+            final String entryDotted = dotted(springBoot ? graph.getManifestStartClass()
+                                                         : graph.getManifestMainClass());
+            final boolean needGuardLaunch = resourceGuard || classGuard || natLibsActive;
+            final String entryMappedInternal = entryDotted == null ? null
+                    : mapName(classMap, entryDotted.replace('.', '/'));
+            final boolean entryRenamed = entryDotted != null
+                    && !entryMappedInternal.equals(entryDotted.replace('.', '/'));
+            final boolean cpStubNeeded = entryDotted != null && !springBoot && entryRenamed;
+
             // 1. Write classes (renamed paths). If class encryption is on,
             //    eligible classes are AES-GCM encrypted with a magic header.
             Map<String, byte[]> written = new LinkedHashMap<>();
@@ -371,6 +439,13 @@ public final class Packager {
             // against the FINAL renamed graph and rewrite any dangling one to the
             // actual declaring member's renamed name.
             repairDanglingMemberReferences(graph, mapping);
+
+            // P2-9: entry not renamed but a guard is active → hook main() itself
+            // (a stub cannot share the name). No-op for plaintext-only builds,
+            // where `java -cp` already reaches the real main.
+            if (entryDotted != null && !springBoot && !entryRenamed && needGuardLaunch) {
+                injectCpPrologue(graph, entryDotted.replace('.', '/'));
+            }
 
             // --- Native (JNIC) plain-class closure ---
             // JNIC owner classes are pre-loaded by the SYSTEM classloader BEFORE
@@ -448,7 +523,7 @@ public final class Packager {
                     if (cfg.isRollbackToOriginalBytes()) {
                         byte[] orig = lookupOriginalBytes(oldInternal, reverseClassMap, graph);
                         if (orig != null) {
-                            bytes = remapRollbackBytes(orig, mapping, graph);
+                            bytes = remapRollbackBytes(orig, mapping, graph, reverseClassMap);
                             rolledBack++;
                             KBoxLog.warn(TAG, "Rolled back " + newInternal
                                     + " to original bytes (serialization failed)");
@@ -509,7 +584,7 @@ public final class Packager {
                     if (orig != null) {
                         KBoxLog.warn(TAG, "Verify failed: " + verifyErr
                                 + " — rolling back to original bytes");
-                        bytes = remapRollbackBytes(orig, mapping, graph);
+                        bytes = remapRollbackBytes(orig, mapping, graph, reverseClassMap);
                         verifyFails++;
                     }
                 }
@@ -530,20 +605,57 @@ public final class Packager {
                     + (rolledBack > 0 ? " (" + rolledBack + " rolled back to original)" : "")
                     + (verifyFails > 0 ? " (" + verifyFails + " verify-failed, rolled back)" : ""));
 
+            // P2-4: a build that silently rolls classes back looks successful but
+            // ships unprotected bodies. Make it impossible to miss.
+            if (rolledBack > 0 || verifyFails > 0) {
+                KBoxLog.warn(TAG, "PROTECTION DEGRADED: " + rolledBack
+                        + " class(es) rolled back and " + verifyFails
+                        + " verify-failed — those classes keep their ORIGINAL bodies. "
+                        + "Treat this build as unprotected for them.");
+            }
+
+            // P2-9: plaintext `-cp` entry stub at the ORIGINAL main class name.
+            // The real entry was renamed (and may be encrypted), so the JVM could
+            // not load it by the name a user types after `java -cp`.
+            if (cpStubNeeded) {
+                String target = needGuardLaunch
+                        ? "com.kbox.runtime.ResourceGuardLauncher" : entryMappedInternal;
+                putEntry(out, entryDotted.replace('.', '/') + ".class",
+                        cpEntryStub(entryDotted, target, needGuardLaunch));
+                KBoxLog.info(TAG, "Wrote -cp entry stub " + entryDotted + " -> " + target
+                        + (needGuardLaunch ? ".bootstrapCp" : ".main")
+                        + " (java -cp <jar> " + entryDotted + ")");
+            }
+
             // 2. Copy resources. Framework text files (META-INF/services/*,
             //    spring.factories, AutoConfiguration.imports) go through
             //    ResourceReferenceUpdater for class-name rewriting. Everything
             //    else (binary resources, already-renamed/encrypted files) is
             //    written as raw bytes so we never corrupt a PNG/JKS blob.
             int resCount = 0;
+            int skippedBuildOnly = 0;
+            int skippedSignatures = 0;
             for (Map.Entry<String, byte[]> e : graph.getResources().entrySet()) {
                 String path = e.getKey();
                 byte[] bytes = e.getValue();
                 if (path.equals("META-INF/MANIFEST.MF")) continue;
+                // 构建期专用资源（原生解释器 C 源码 / objdump dump / Maven 元数据）绝不能
+                // 随产物分发：它们不是运行所需，却把整套防护引擎的设计图交给逆向者。
+                if (isBuildOnlyResource(path)) {
+                    skippedBuildOnly++;
+                    continue;
+                }
                 // Jar 内自带原生库已由 protectNativeLibs 打包成 META-INF/kbox/natlib/*.bin，
                 // 明文条目不再写入产物 jar（避免明文 dll/so 外泄）。
                 if (natLibs != null && natLibs.contains(path)) continue;
-                if (isFrameworkText(path)) {
+                // P2-11: a signed input cannot stay signed after rewriting class
+                // bytes — drop the signature block instead of shipping a jar that
+                // dies with "SHA-256 digest error".
+                if (isSignatureFile(path)) { skippedSignatures++; continue; }
+                if (isPlaintextStructural(path)) {
+                    // 签名块 / multi-release / module-info：原字节透传，绝不改写。
+                    putEntry(out, clsRoot + path, bytes);
+                } else if (isFrameworkText(path)) {
                     String res = ru.rewrite(path, bytes);
                     int nul = res.indexOf('\u0000');
                     String newPath = nul >= 0 ? res.substring(0, nul) : path;
@@ -559,7 +671,15 @@ public final class Packager {
                 }
                 resCount++;
             }
-            KBoxLog.info(TAG, "Wrote " + resCount + " resources");
+            KBoxLog.info(TAG, "Wrote " + resCount + " resources"
+                    + (skippedSignatures > 0
+                       ? " (dropped " + skippedSignatures + " JAR signature file(s): "
+                         + "class bytes were rewritten, re-sign the output if needed)"
+                       : "")
+                    + (skippedBuildOnly > 0
+                       ? " (" + skippedBuildOnly + " build-only resource(s) dropped:"
+                         + " native C sources / objdump dumps / maven metadata)"
+                       : ""));
 
             // 3. Manifest. When resource guard or class guard is on:
             //    - For standalone jars (Main-Class present): substitute with launcher.
@@ -614,7 +734,7 @@ public final class Packager {
                 rtCount += injectRuntimeClassesLicensing(out, clsRoot, cfg, graph, rtInjected);
             }
             if (needGuard) {
-                rtCount += injectResourceGuardClasses(out, clsRoot, graph);
+                rtCount += injectResourceGuardClasses(out, clsRoot, graph, rtInjected);
                 if (resourceGuard) {
                     writeResourceGuardMetadata(out, clsRoot, resMapping, resSeed);
                 }
@@ -631,7 +751,7 @@ public final class Packager {
                 // main() 无条件调用 AntiDebug/IntegrityChecker，且其字节码引用
                 // ResourceGuardClassLoader（类型校验期即解析），故需连同整套
                 // ResourceGuard* 类一起注入。
-                rtCount += injectResourceGuardClasses(out, clsRoot, graph);
+                rtCount += injectResourceGuardClasses(out, clsRoot, graph, rtInjected);
                 rtCount += injectOne(out, clsRoot, "com/kbox/runtime/AntiDebug", rtInjected, graph);
                 rtCount += injectOne(out, clsRoot, "com/kbox/runtime/IntegrityChecker", rtInjected, graph);
             }
@@ -698,7 +818,7 @@ public final class Packager {
                         + " packed native lib blob(s) -> META-INF/kbox/natlib/*.bin (+ natlibs.list)");
             }
             if (epdManifest != null && epdManifest.length > 0) {
-                putEntry(out, clsRoot + "META-INF/kbox/method_epd.bin", epdManifest);
+                putEntry(out, clsRoot + "META-INF/kbox/method_epd.bin", maskList(epdManifest));
                 KBoxLog.info(TAG, "Wrote EPL binning manifest ("
                         + epdManifest.length + " bytes) -> META-INF/kbox/method_epd.bin");
             }
@@ -719,7 +839,7 @@ public final class Packager {
             // (dir/file masquerade, bad-CRC bait, decoy native lib) without affecting
             // the running app. Only when resource obfuscation is active (max mode).
             if (cfg.isObfuscateResources()) {
-                writeAntiUnpackDecoys(out);
+                writeAntiUnpackDecoys(out, isMinecraftModJar(graph));
             }
             // S5 (kboxDedeobfShieldV1): second-tier mock fill decoys (gated).
             if (cfg.getBlobMockFill() > 0) {
@@ -791,6 +911,14 @@ public final class Packager {
             KBoxLog.info(TAG, "Copied native lib to " + target);
         }
         KBoxLog.info(TAG, "Wrote protected jar: " + outputJar);
+        if (cfg.isPlaintextAudit()) {
+            java.util.Set<String> appEntries = new java.util.HashSet<>();
+            for (String k : graph.getClasses().keySet()) {
+                appEntries.add(mapName(classMap, k) + ".class");
+            }
+            PlaintextAudit.audit(inputJar, outputJar, dotted(graph.isSpringBootFatJar()
+                    ? graph.getManifestStartClass() : graph.getManifestMainClass()), appEntries);
+        }
     }
 
     /**
@@ -832,6 +960,7 @@ public final class Packager {
                                BfSymbolSet sym, byte[] vmpBlob,
                                byte[] nativeCryptoBlob,
                                byte[] epdManifest) throws IOException {
+        activeCfg = cfg;
         Path parent = outputJar.getParent();
         if (parent != null) Files.createDirectories(parent);
         if (nativeBlob == null) {
@@ -872,6 +1001,18 @@ public final class Packager {
                     KBoxLog.info(TAG, "BF hybrid keeps plaintext: "
                             + plainClasses.size() + " classes, " + plainResources.size()
                             + " resource paths (" + r.loader + ")");
+                    if (plainClasses.isEmpty() && graph.getManifestMainClass() != null) {
+                        // No annotated entry class was found (synthetic / launcher-wrapper
+                        // mods): without at least one plaintext anchor nothing would ever
+                        // call attach() and the blob would stay undecoded. Keep the
+                        // manifest main class (with its <clinit> hook) as that anchor.
+                        String anchor = graph.getManifestMainClass().replace('.', '/');
+                        if (graph.getClasses().containsKey(anchor)) {
+                            plainClasses.add(anchor);
+                            KBoxLog.info(TAG, "BF hybrid anchor: no annotated entry class — "
+                                    + "keeping manifest main class " + anchor + " plaintext");
+                        }
+                    }
                 } else {
                     KBoxLog.warn(TAG, "BF hybrid: no MC loader detected — all classes go into the blob");
                 }
@@ -880,6 +1021,16 @@ public final class Packager {
                         + " — all classes go into the blob");
             }
         }
+
+        // Spring Boot fat jar support (P1-6): the boot loader (JarLauncher) must
+        // stay loadable from the jar ROOT and BOOT-INF/lib/*.jar must stay raw, so
+        // only BOOT-INF/classes + application resources go into the blob. The
+        // bootstrap classes and the native blobs are written under
+        // BOOT-INF/classes/ (LaunchedClassLoader's root), and Start-Class — not
+        // Main-Class — is redirected to BfSecureLoader.
+        boolean springBoot = graph.isSpringBootFatJar();
+        String clsRoot = springBoot ? "BOOT-INF/classes/" : "";
+        java.util.Set<String> plainStored = new java.util.HashSet<>();
 
         // 1. Same correctness repairs as the normal path.
         fixCrossPackageClassAccess(graph, classMap);
@@ -896,6 +1047,15 @@ public final class Packager {
         for (Map.Entry<String, ClassNode> e : graph.getClasses().entrySet()) {
             String oldInternal = e.getKey();
             String newInternal = mapName(classMap, oldInternal);
+            if (springBoot && oldInternal.startsWith("org/springframework/boot/loader/")) {
+                // The boot launcher itself: the JVM loads Main-Class from the jar
+                // ROOT, so these classes can never live in the blob.
+                byte[] pbytes = serialize(e.getValue(), graph, cfg);
+                if (pbytes != null) {
+                    plainClassBytes.put(newInternal, pbytes);
+                    continue;
+                }
+            }
             if (hybrid && plainClasses.contains(oldInternal)) {
                 // Keep this class readable by the mod loader.
                 injectBfAttach(e.getValue());
@@ -912,7 +1072,7 @@ public final class Packager {
                 if (cfg.isRollbackToOriginalBytes()) {
                     byte[] orig = lookupOriginalBytes(oldInternal, reverseClassMap, graph);
                     if (orig != null) {
-                        bytes = remapRollbackBytes(orig, mapping, graph);
+                        bytes = remapRollbackBytes(orig, mapping, graph, reverseClassMap);
                         rolledBack++;
                     } else {
                         KBoxLog.warn(TAG, "BF skip " + newInternal
@@ -932,7 +1092,7 @@ public final class Packager {
                 try { java.nio.file.Files.write(java.nio.file.Paths.get("_bf-vfdump-" + newInternal.replace('/', '_') + ".class"), bytes); } catch (Throwable t) {}
                 byte[] orig = lookupOriginalBytes(oldInternal, reverseClassMap, graph);
                 if (orig != null) {
-                    bytes = remapRollbackBytes(orig, mapping, graph);
+                    bytes = remapRollbackBytes(orig, mapping, graph, reverseClassMap);
                     verifyFails++;
                 }
             }
@@ -941,6 +1101,11 @@ public final class Packager {
         KBoxLog.info(TAG, "BF packed " + classes.size() + " classes"
                 + (rolledBack > 0 ? " (" + rolledBack + " rolled back)" : "")
                 + (verifyFails > 0 ? " (" + verifyFails + " verify-failed)" : ""));
+        if (rolledBack > 0 || verifyFails > 0) {
+            KBoxLog.warn(TAG, "PROTECTION DEGRADED (BF): " + rolledBack
+                    + " class(es) rolled back and " + verifyFails
+                    + " verify-failed — those classes keep their ORIGINAL bodies.");
+        }
 
         // 3. Resources (BF disables resource obfuscation, so names are original).
         //    Framework text files (services/spring.factories) still get their
@@ -965,7 +1130,16 @@ public final class Packager {
                 plainFramework.put(path, bytes);
                 continue;
             }
-            if (isFrameworkText(path)) {
+            if (isSignatureFile(path)) {
+                // P2-11: a rewritten jar cannot keep its signature block — the JVM
+                // would abort at class load with "SHA-256 digest error".
+                continue;
+            }
+            if (isPlaintextStructural(path)) {
+                // P2-10：META-INF/versions/* / module-info / package-info
+                // 必须原字节透传（BF 加载器无法为它们提供 URL，也不能改写）。
+                plainFramework.put(path, bytes);
+            } else if (isFrameworkText(path)) {
                 String res = ru.rewrite(path, bytes);
                 int nul = res.indexOf('\u0000');
                 String newPath = nul >= 0 ? res.substring(0, nul) : path;
@@ -994,13 +1168,19 @@ public final class Packager {
 
         // 5. Assemble the tiny jar.
         try (ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(outputJar))) {
-            String clsRoot = ""; // Brainfuck mode is standalone-jar only.
             ManifestUpdater mu = new ManifestUpdater(classMap);
-            byte[] manifest = mu.update(graph.getManifest(),
-                    dotted(graph.getManifestMainClass()),
-                    "com.kbox.runtime.BfSecureLoader");
-            // NOTE: entry-point obfuscation (obfuscateEntryPoint) is intentionally
-            // NOT applied — BfSecureLoader reads Original-Main-Class verbatim.
+            mu.setSpringBootFatJar(springBoot);
+            String entryDotted = dotted(springBoot ? graph.getManifestStartClass()
+                                                   : graph.getManifestMainClass());
+            // P3-15: the launcher class itself is renamed per build.
+            final String bfLoaderDotted =
+                    rtName(cfg, "com/kbox/runtime/BfSecureLoader").replace('/', '.');
+            byte[] manifest = mu.update(graph.getManifest(), entryDotted, bfLoaderDotted);
+            // P1-3 (BF path): mask Original-Main-Class exactly like the guard
+            // path. BfSecureLoader decodes it with Entry-Guard-Seed.
+            if (manifest != null && cfg.isObfuscateEntryPoint()) {
+                manifest = obfuscateEntryPoint(manifest);
+            }
             if (manifest != null) putEntry(out, "META-INF/MANIFEST.MF", manifest);
             // Per-build key seed (BF mode): embedded as a plain jar entry so the
             // run JVM's HardwareKeyRing reads the same seed and re-derives the
@@ -1008,12 +1188,37 @@ public final class Packager {
             {
                 byte[] bseed = com.kbox.runtime.HardwareKeyRing.currentBuildSeed();
                 if (bseed != null && bseed.length == 32) {
-                    putEntry(out, "META-INF/kbox/seed.bin", bseed);
+                    putEntry(out, clsRoot + "META-INF/kbox/seed.bin", bseed);
+                }
+            }
+
+            // Spring Boot: nested dependency jars are mapped as a contiguous byte
+            // window by the boot loader and are not part of the graph's resource
+            // map, so copy them raw (STORED) straight from the input archive.
+            if (springBoot) {
+                int nested = 0;
+                try (java.util.zip.ZipFile in = new java.util.zip.ZipFile(inputJar.toFile())) {
+                    java.util.Enumeration<? extends java.util.zip.ZipEntry> en = in.entries();
+                    while (en.hasMoreElements()) {
+                        java.util.zip.ZipEntry ze = en.nextElement();
+                        if (ze.isDirectory() || !ze.getName().startsWith("BOOT-INF/lib/")) continue;
+                        putStoredEntry(out, ze.getName(),
+                                readAll(in.getInputStream(ze)));
+                        nested++;
+                    }
+                }
+                if (nested > 0) {
+                    KBoxLog.info(TAG, "BF kept " + nested
+                            + " Spring Boot nested jar(s) as raw BOOT-INF/lib entries");
                 }
             }
 
             for (Map.Entry<String, byte[]> pf : plainFramework.entrySet()) {
-                putEntry(out, pf.getKey(), pf.getValue());
+                if (plainStored.contains(pf.getKey())) {
+                    putStoredEntry(out, pf.getKey(), pf.getValue());
+                } else {
+                    putEntry(out, pf.getKey(), pf.getValue());
+                }
             }
             if (!plainFramework.isEmpty()) {
                 KBoxLog.info(TAG, "BF kept framework text as plain jar entries: "
@@ -1029,17 +1234,34 @@ public final class Packager {
                         + " loader-critical classes as plain jar entries");
             }
 
-            putEntry(out, "META-INF/kbox/classes.bf.rle", packed.rleBytes);
+            // P2-9: `java -cp <jar> <OriginalMainClass>` bootstrap stub. The real
+            // entry lives in the blob (and may be renamed), so the JVM could not
+            // load it by its original name; this plaintext class forwards to
+            // BfSecureLoader.main, which decodes the blob and invokes the real
+            // entry. Skipped in hybrid mode (the plaintext entry class already
+            // attaches the blob from its <clinit>) and for Spring Boot.
+            if (!springBoot && entryDotted != null) {
+                String origInternal = entryDotted.replace('.', '/');
+                if (!plainClassBytes.containsKey(origInternal)) {
+                    putEntry(out, origInternal + ".class",
+                            cpEntryStub(entryDotted, bfLoaderDotted, false));
+                    KBoxLog.info(TAG, "BF wrote -cp entry stub " + entryDotted
+                            + " -> " + bfLoaderDotted + ".main (java -cp <jar> "
+                            + entryDotted + ")");
+                }
+            }
+
+            putEntry(out, clsRoot + "META-INF/kbox/classes.bf.rle", packed.rleBytes);
             // NOTE: no separate index.dat is shipped. The name->(offset,len) index
             // is embedded as a signed header at the head of the classes.bf.rle raw
             // blob and parsed only inside the native decode heap; Java never sees
             // offsets, so nothing on disk/heap enumerates the payload for a dumper.
-            putEntry(out, "META-INF/kbox/native.bin", nativeBlob);
+            putEntry(out, clsRoot + "META-INF/kbox/native.bin", nativeBlob);
             // JNIC co-existence: the JNIC native lib ships under its OWN path so the
             // BF decoder (native.bin) and the JNIC lib don't collide. BfSecureLoader
             // loads it via NativeLoader.loadJnic() and registers natives per class.
             if (jnicBlob != null) {
-                putEntry(out, "META-INF/kbox/jnic.bin", jnicBlob);
+                putEntry(out, clsRoot + "META-INF/kbox/jnic.bin", jnicBlob);
                 KBoxLog.info(TAG, "BF packed JNIC native lib -> META-INF/kbox/jnic.bin ("
                         + jnicBlob.length + " bytes)");
             }
@@ -1049,7 +1271,7 @@ public final class Packager {
             // via NativeLoader.loadVmp() and falls back to the Java interpreter if
             // the blob was not compiled for this build.
             if (vmpBlob != null) {
-                putEntry(out, "META-INF/kbox/vmp.bin", vmpBlob);
+                putEntry(out, clsRoot + "META-INF/kbox/vmp.bin", vmpBlob);
                 KBoxLog.info(TAG, "BF packed VMP native lib -> META-INF/kbox/vmp.bin ("
                         + vmpBlob.length + " bytes)");
             }
@@ -1059,12 +1281,12 @@ public final class Packager {
             // otherwise every protected string resolves to a NoClassDefFoundError
             // and the decryptor's catch-all falls back to garbage (noise).
             if (nativeCryptoBlob != null) {
-                putEntry(out, "META-INF/kbox/native-crypto.bin", nativeCryptoBlob);
+                putEntry(out, clsRoot + "META-INF/kbox/native-crypto.bin", nativeCryptoBlob);
                 KBoxLog.info(TAG, "BF packed native crypto lib -> META-INF/kbox/native-crypto.bin ("
                         + nativeCryptoBlob.length + " bytes)");
             }
             if (epdManifest != null && epdManifest.length > 0) {
-                putEntry(out, "META-INF/kbox/method_epd.bin", epdManifest);
+                putEntry(out, clsRoot + "META-INF/kbox/method_epd.bin", maskList(epdManifest));
                 KBoxLog.info(TAG, "BF packed EPL manifest -> META-INF/kbox/method_epd.bin ("
                         + epdManifest.length + " bytes)");
             }
@@ -1088,7 +1310,7 @@ public final class Packager {
             java.util.Set<String> rtInjected = new java.util.HashSet<>();
             int rtCount = 0;
             // When white-box string encryption is on, the plaintext boot classes
-            // are themselves ZKM-style hardened: their String literals are
+            // are themselves hardened: their String literals are
             // encrypted (replaced with a per-string-salt decryptor call into a
             // synthetic holder) and each non-init method gains an opaque predicate,
             // so the constant pool no longer carries readable bootstrap strings.
@@ -1101,6 +1323,11 @@ public final class Packager {
             }
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/BfSecureLoader", rtInjected, graph, bootObs);
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/BfBlobInputStream", rtInjected, graph, bootObs);
+            // P2-8: URL-based resource lookup (findResource / getResources /
+            // ServiceLoader) needs a handler + connection pair. They are plain
+            // bootstrap classes for the same reason as the loader itself.
+            rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/BfResourceHandler", rtInjected, graph, bootObs);
+            rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/BfResourceConnection", rtInjected, graph, bootObs);
             rtCount += injectBoot(out, clsRoot, "com/kbox/runtime/NativeLoader", rtInjected, graph, bootObs);
             // NativeLoader.unpack() needs KbnlKey.derive() before the blob is
             // decodable, so KbnlKey must also ship as a plain boot class.
@@ -1131,6 +1358,16 @@ public final class Packager {
         }
         KBoxLog.info(TAG, "Wrote Brainfuck-protected jar: " + outputJar
                 + " (rle=" + packed.rleBytes.length + ")");
+        if (cfg.isPlaintextAudit()) {
+            // In BF mode application classes live in the blob, so appEntries is
+            // effectively just the plaintext surface (hybrid / spring-boot root).
+            java.util.Set<String> appEntries = new java.util.HashSet<>(plainClassBytes.keySet());
+            for (String k : graph.getClasses().keySet()) {
+                appEntries.add(mapName(classMap, k) + ".class");
+            }
+            PlaintextAudit.audit(inputJar, outputJar, dotted(graph.isSpringBootFatJar()
+                    ? graph.getManifestStartClass() : graph.getManifestMainClass()), appEntries);
+        }
     }
 
     /**
@@ -1221,6 +1458,80 @@ public final class Packager {
     }
 
     /**
+     * 必须按<b>原字节</b>保留的结构性条目（P2-10）：签名块、multi-release 版本化目录。
+     *
+     * <p>签名文件（{@code .SF/.RSA/.DSA/.EC}）一旦被当作文本改写就会整包签名失效；
+     * {@code META-INF/versions/N/*} 是 JVM 按路径直接读取的版本化条目，改名/重写会让
+     * 多版本 jar 静默退化。二者都只是"原样透传"，不做任何名称重写。</p>
+     */
+    private static boolean isPlaintextStructural(String path) {
+        String p = path.toLowerCase(java.util.Locale.ROOT);
+        if (p.startsWith("meta-inf/versions/")) return true;
+        if (p.startsWith("meta-inf/") && (p.endsWith(".sf") || p.endsWith(".rsa")
+                || p.endsWith(".dsa") || p.endsWith(".ec"))) return true;
+        return p.endsWith("module-info.class") || p.endsWith("package-info.class");
+    }
+
+    /**
+     * P2-11: JAR signature block ({@code META-INF/*.SF|*.RSA|*.DSA|*.EC}).
+     *
+     * <p>Obfuscation REWRITES class bytes, so the recorded digests can never
+     * match again. Keeping the signature block makes the JVM verify at class
+     * load and abort with {@code SecurityException: SHA-256 digest error} — the
+     * jar becomes unusable. Standard practice (ProGuard / Shadow / Spring Boot
+     * repackage) is to DROP the signature block: the output ships unsigned and
+     * can be re-signed by the customer. Digest attributes left in MANIFEST.MF
+     * are inert without a {@code .SF}.</p>
+     */
+    private static boolean isSignatureFile(String path) {
+        String p = path.toLowerCase(java.util.Locale.ROOT);
+        return p.startsWith("meta-inf/") && (p.endsWith(".sf") || p.endsWith(".rsa")
+                || p.endsWith(".dsa") || p.endsWith(".ec"));
+    }
+
+    /**
+     * 构建期专用资源 —— 只在<b>构建机</b>上被 Protector 自己读取（编译原生解释器、打包 PE 壳），
+     * 产物运行<b>完全不需要</b>。把它们按原文复制进产物，等于把整套防护引擎的图纸交给逆向者：
+     * v3.0.1 强度测试报告里 P0-1（~432 KB 原生 C 源码）、P0-2（objdump 全量反汇编 dump）、
+     * P2-3（{@code META-INF/maven/**} 泄漏模块划分与入口）都出自这里。
+     *
+     * <p>只匹配<b>明确的构建期产物</b>，不按扩展名一刀切（用户 jar 里合法的 {@code .c}/{@code .h}
+     * 资源、以及 {@code shield/*.bin} 这类运行/打包所需二进制载荷都会保留）。</p>
+     */
+    private static boolean isBuildOnlyResource(String path) {
+        if (path == null) return false;
+        // 1) 产物根目录下的原生解释器 / 加载器源码与头文件
+        if (BUILD_ONLY_SOURCES.contains(path)) return true;
+        // 2) 其余根级 .c/.h（无目录分隔符）= 构建期生成物，而非用户资源
+        if (path.indexOf('/') < 0 && (path.endsWith(".c") || path.endsWith(".h"))) return true;
+        // 3) 调试用反汇编 dump（保留 engine_*.bin / blob_*.bin）
+        if (path.endsWith("_dump.txt") || path.endsWith("dump.txt")) return true;
+        if (path.startsWith("shield/") && path.endsWith(".txt")) return true;
+        // 4) Maven 元数据：模块划分 + 入口
+        if (path.startsWith("META-INF/maven/")) return true;
+        // 5) 构建临时产物
+        if (path.equals("compiled.class")) return true;
+        return false;
+    }
+
+    /** 遮蔽清单类载荷（{@code jnic-classes.list} / {@code method_epd.bin}）：明文清单即"受保护索引表"。 */
+    private static byte[] maskList(byte[] data) {
+        return com.kbox.runtime.KboxListMask.mask(data,
+                com.kbox.runtime.HardwareKeyRing.currentBuildSeed());
+    }
+
+    /** 已知的原生解释器源码 / 头文件（构建期编译进 native blob）。 */
+    private static final java.util.Set<String> BUILD_ONLY_SOURCES = new java.util.HashSet<>(
+            java.util.Arrays.asList(
+                    "kbox_bf_loader.c",
+                    "kbox_vmp_core.c",
+                    "kbox_vmp_crypto.c",
+                    "kbox_jnic_interp.c",
+                    "kbox_jnic_interp_v3.c",
+                    "kbox_jnic_core.h",
+                    "kbox_reflect_loader.c"));
+
+    /**
      * Injects every {@code ResourceGuard*} runtime class (launcher, loader, and
      * any inner/anonymous classes) by auto-discovering them from the classpath.
      * This avoids brittle hand-listing of {@code $Entry}, {@code $1}, etc.
@@ -1230,10 +1541,15 @@ public final class Packager {
      * they were already written in the main class loop.
      */
     private int injectResourceGuardClasses(ZipOutputStream out, String clsRoot,
-                                           ClassGraph graph) throws IOException {
+                                           ClassGraph graph,
+                                           java.util.Set<String> rtInjected) throws IOException {
         java.util.Collection<String> internals = discoverGuardClasses();
         int count = 0;
         for (String internal : internals) {
+            // The shared injected-set prevents duplicate zip entries when a guard
+            // class was already written by injectRuntimeClasses (e.g. the VMP
+            // runtime protector injects ResourceGuardClassLoader first).
+            if (rtInjected != null && !rtInjected.add(internal)) continue;
             // Do NOT skip classes already in the graph. They were written
             // in Step 1 with raw compiler frames which may have missing
             // StackMapTable entries. reSerializeRuntimeClass strips frames
@@ -1755,8 +2071,13 @@ public final class Packager {
         for (String n : encryptedNames) {
             sb.append(n).append('\n');
         }
+        // P1-1 (report 2026-10-17): the list names every class whose body is
+        // AES-encrypted — shipping it in plaintext hands the analyst the exact
+        // set to attack and even re-exposes the masked entry-point name. Mask it
+        // with the same build-seed keystream as method_epd.bin (the runtime
+        // already unmask-parses this format).
         putEntry(out, clsRoot + "META-INF/kbox/encrypted-classes.list",
-                sb.toString().getBytes(StandardCharsets.UTF_8));
+                maskList(sb.toString().getBytes(StandardCharsets.UTF_8)));
         KBoxLog.info(TAG, "Wrote class guard metadata (" + encryptedNames.size() + " encrypted classes)");
     }
 
@@ -1779,9 +2100,11 @@ public final class Packager {
         for (String n : classNames) {
             sb.append(n).append('\n');
         }
+        // 遮蔽后落盘：明文清单会直接告诉逆向者"哪些类被 JNIC 保护"（强度报告 P0-3）。
         putEntry(out, clsRoot + "META-INF/kbox/jnic-classes.list",
-                sb.toString().getBytes(StandardCharsets.UTF_8));
-        KBoxLog.info(TAG, "Wrote JNIC class list (" + classNames.size() + " classes) -> META-INF/kbox/jnic-classes.list");
+                maskList(sb.toString().getBytes(StandardCharsets.UTF_8)));
+        KBoxLog.info(TAG, "Wrote masked JNIC class list (" + classNames.size()
+                + " classes) -> META-INF/kbox/jnic-classes.list");
     }
 
     /**
@@ -1873,7 +2196,9 @@ public final class Packager {
         // (decode the BF program), VmCore (+ nested State/Cursor/Uninitialized) and
         // the self-contained Opcode/BfVmException. All must ship whenever BFVM is on,
         // or the first call to a virtualized method throws NoClassDefFoundError.
-        if (cfg.isEnableBfvm() && !cfg.getBfvmMethods().isEmpty()) {
+        // P1-4：BFVM 支持自动选方法，因此不能再以 bfvmMethods 非空作为注入条件——
+        // 否则 enableBfvm=true + 自动选中方法时，运行期会 NoClassDefFoundError。
+        if (cfg.isEnableBfvm() || cfg.isEnableOtp()) {
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/BfRuntime", injected, graph);
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/BfInterpreter", injected, graph);
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/VmCore", injected, graph);
@@ -1882,6 +2207,11 @@ public final class Packager {
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/VmCore$Uninitialized", injected, graph);
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/Opcode", injected, graph);
             count += injectOne(out, clsRoot, "com/kbox/runtime/bfvm/BfVmException", injected, graph);
+        }
+        if (cfg.isEnableOtp()) {
+            // K-OTP runtime: reconstructs each one-time program from its share,
+            // executes it and re-randomises the share in place.
+            count += injectOne(out, clsRoot, "com/kbox/runtime/KotpRuntime", injected, graph);
         }
         // Anti-debug and integrity classes are needed by the ResourceGuardLauncher,
         // which calls AntiDebug.check() and IntegrityChecker.check()
@@ -1894,6 +2224,13 @@ public final class Packager {
         if (cfg.isIntegrityCheck() || needGuard) {
             count += injectOne(out, clsRoot, "com/kbox/runtime/IntegrityChecker", injected, graph);
         }
+        // P1-1: both encrypted-classes.list and jnic-classes.list are masked with
+        // KboxListMask at build time; the launcher needs the class to unmask them.
+        // (Previously it was never injected, so a JNIC/class-guard build that read
+        // a masked list died with NoClassDefFoundError: KboxListMask.)
+        if (needGuard || cfg.isEnableJnic()) {
+            count += injectOne(out, clsRoot, "com/kbox/runtime/KboxListMask", injected, graph);
+        }
         // True hardware key ring: the class-key derivation now binds to
         // HardwareKeyRing.fingerprint() (real CPU/BIOS/board serials via HKDF),
         // so it must be present whenever class encryption is active. It is ALSO
@@ -1904,7 +2241,8 @@ public final class Packager {
         // derived via KbnlKey.derive -> HardwareKeyRing.fingerprint(), so ANY
         // string-encrypted build (even plaintext packaging, no BF/VMP/JNIC)
         // must ship HardwareKeyRing or the string holder <clinit> throws CNFE.
-        if (cfg.isEncryptStrings() || cfg.isEncryptClasses() || cfg.isEnableVmp() || cfg.isEnableJnic()) {
+        if (cfg.isEncryptStrings() || cfg.isWhiteboxStrings() || cfg.isScatterStrings()
+                || cfg.isEncryptClasses() || cfg.isEnableVmp() || cfg.isEnableJnic()) {
             count += injectOne(out, clsRoot, "com/kbox/runtime/HardwareKeyRing", injected, graph);
         }
         // kboxDedeobfShieldV1 dynamic guard: inject whenever any static/dynamic
@@ -1926,6 +2264,15 @@ public final class Packager {
         if (cfg.isEncryptClasses() && !isForgeMod(graph)) {
             count += injectPatched(out, clsRoot, "com/kbox/runtime/KBoxClassDecryptTweaker",
                     injected, graph);
+        }
+        // AntiDebug is a HARD dependency of the generated string decryptors: the AES
+        // decryptor emits `if (AntiDebug.isTampered()) goto noise` unconditionally.
+        // Inject it for EVERY string mode (AES/whitebox/scatter) — not just AES — so
+        // the reference-closure check can never reject the build and the protected
+        // jar can never die with NoClassDefFoundError on the decryptor hot path.
+        if (cfg.isEncryptStrings() || cfg.isWhiteboxStrings() || cfg.isScatterStrings()
+                || cfg.isAntiDebug() || cfg.isIntegrityCheck() || needGuard) {
+            count += injectOne(out, clsRoot, "com/kbox/runtime/AntiDebug", injected, graph);
         }
         return count;
     }
@@ -1994,7 +2341,7 @@ public final class Packager {
         // BFVM runtime: BfRuntime.call is referenced by every virtualized method stub;
         // in the BF blob variant the runtime rides inside the payload so it resolves via
         // the blob loader just like the protected classes.
-        if (cfg.isEnableBfvm() && !cfg.getBfvmMethods().isEmpty()) {
+        if (cfg.isEnableBfvm() || cfg.isEnableOtp()) {
             count += collectOne(classes, graph, "com/kbox/runtime/bfvm/BfRuntime");
             count += collectOne(classes, graph, "com/kbox/runtime/bfvm/BfInterpreter");
             count += collectOne(classes, graph, "com/kbox/runtime/bfvm/VmCore");
@@ -2004,8 +2351,13 @@ public final class Packager {
             count += collectOne(classes, graph, "com/kbox/runtime/bfvm/Opcode");
             count += collectOne(classes, graph, "com/kbox/runtime/bfvm/BfVmException");
         }
+        if (cfg.isEnableOtp()) {
+            count += collectOne(classes, graph, "com/kbox/runtime/KotpRuntime");
+        }
         boolean needGuard = cfg.isObfuscateResources() || cfg.isEncryptClasses();
-        if (cfg.isAntiDebug() || cfg.isIntegrityCheck() || needGuard) {
+        // AntiDebug rides for every string mode (see the plaintext path for why).
+        if (cfg.isEncryptStrings() || cfg.isWhiteboxStrings() || cfg.isScatterStrings()
+                || cfg.isAntiDebug() || cfg.isIntegrityCheck() || needGuard) {
             count += collectOne(classes, graph, "com/kbox/runtime/AntiDebug");
         }
         if (cfg.isIntegrityCheck() || needGuard) {
@@ -2065,11 +2417,13 @@ public final class Packager {
 
     private int collectOne(Map<String, byte[]> classes, ClassGraph graph,
                            String internal, boolean force) throws IOException {
+        String outName = rtName(activeCfg, internal);
         if (!force) {
-            if (classes.containsKey(internal)) return 0;
+            if (classes.containsKey(internal) || classes.containsKey(outName)) return 0;
             if (graph.getClasses().containsKey(internal)) return 0; // already in blob map
         }
         boolean wasPresent = classes.containsKey(internal)
+                || classes.containsKey(outName)
                 || graph.getClasses().containsKey(internal);
         byte[] raw = loadClasspathResource(internal + ".class");
         if (raw == null) {
@@ -2077,9 +2431,13 @@ public final class Packager {
             KBoxLog.warn(TAG, internal + ".class not found on classpath");
             return 0;
         }
-        byte[] bytes = reSerializeRuntimeClass(raw, internal);
-        if (bytes == null) bytes = raw;
-        classes.put(internal, bytes);
+        byte[] bytes = reSerializeRuntimeClass(raw, internal,
+                activeCfg == null ? null : activeCfg.getRuntimeRenameMap());
+        if (bytes == null) {
+            bytes = raw;
+            outName = internal;   // raw bytes keep their original internal name
+        }
+        classes.put(outName, bytes);
         return 1;
     }
 
@@ -2102,14 +2460,19 @@ public final class Packager {
         // computation to avoid VerifyError ("Expecting a stackmap frame").
         // Raw compiler output may have incomplete frames for some code
         // patterns; COMPUTE_FRAMES recalculates them from scratch.
-        byte[] bytes = reSerializeRuntimeClass(raw, internal);
+        // P3-15: apply the per-build BF rename map (no-op for other classes).
+        byte[] bytes = reSerializeRuntimeClass(raw, internal,
+                activeCfg == null ? null : activeCfg.getRuntimeRenameMap());
+        // Rename only when the rewrite actually happened: raw fallback bytes
+        // still carry the ORIGINAL internal name and must keep the original path.
+        String outName = bytes != null ? rtName(activeCfg, internal) : internal;
         if (bytes != null) {
-            putEntry(out, clsRoot + internal + ".class", bytes);
+            putEntry(out, clsRoot + outName + ".class", bytes);
             injected.add(internal);
             return 1;
         }
         // Fallback: write raw bytes as-is.
-        putEntry(out, clsRoot + internal + ".class", raw);
+        putEntry(out, clsRoot + outName + ".class", raw);
         injected.add(internal);
         return 1;
     }
@@ -2146,9 +2509,12 @@ public final class Packager {
         if (obs != null && !internal.equals("com/kbox/runtime/BfSecureLoader")) {
             bytes = obs.obfuscate(raw);
         }
-        byte[] fin = reSerializeRuntimeClass(bytes, internal);
-        if (fin != null) bytes = fin;
-        putEntry(out, clsRoot + internal + ".class", bytes);
+        // P3-15: per-build BF runtime rename (see injectOne).
+        byte[] fin = reSerializeRuntimeClass(bytes, internal,
+                activeCfg == null ? null : activeCfg.getRuntimeRenameMap());
+        String outName = internal;
+        if (fin != null) { bytes = fin; outName = rtName(activeCfg, internal); }
+        putEntry(out, clsRoot + outName + ".class", bytes);
         injected.add(internal);
         return 1;
     }
@@ -2237,10 +2603,37 @@ public final class Packager {
      * @return re-serialized bytes, or null if class cannot be parsed
      */
     public static byte[] reSerializeRuntimeClass(byte[] raw, String internal) {
+        return reSerializeRuntimeClass(raw, internal, null);
+    }
+
+    /** P3-15 variant: re-serialize, then apply the per-build BF runtime rename
+     *  map. {@code BfNativeBuilder} uses the same call so the loader-method
+     *  hashes are computed over exactly the bytes that ship. */
+    public static byte[] reSerializeRuntimeClass(byte[] raw, String internal,
+                                                 java.util.Map<String, String> rename) {
+        byte[] base = reSerializeRuntimeClassRaw(raw, internal);
+        if (base == null || rename == null || rename.isEmpty()) return base;
+        try {
+            return RuntimeRename.remap(base, rename);
+        } catch (Throwable t) {
+            KBoxLog.warn(TAG, "runtime rename failed for " + internal + ": " + t.getMessage());
+            return base;
+        }
+    }
+
+    private static byte[] reSerializeRuntimeClassRaw(byte[] raw, String internal) {
         try {
             org.objectweb.asm.ClassReader cr = new org.objectweb.asm.ClassReader(raw);
             org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
             cr.accept(cn, org.objectweb.asm.ClassReader.EXPAND_FRAMES);
+
+            // P1-2: injected runtime classes are not part of the input graph, so
+            // the DebugMetadataEraser never saw them — 34 of them shipped their
+            // SourceFile (NativeLoader.java / VmCore.java / ...). Strip here so
+            // every injected/boot/blob runtime class is metadata-clean too.
+            cn.sourceFile = null;
+            cn.sourceDebug = null;
+            stripDebugInfo(cn);
 
             // Target V1_7 to support CONSTANT_MethodType (tag 16).
             cn.version = org.objectweb.asm.Opcodes.V1_7;
@@ -2364,6 +2757,22 @@ public final class Packager {
      * exists solely to crash decompiler UIs that scan every class).
      */
     private byte[] serialize(ClassNode cn, ClassGraph graph, ProtectionConfig cfg) {
+        byte[] out = serializeRaw(cn, graph, cfg);
+        if (out == null) return null;
+        java.util.Map<String, String> rt = cfg == null ? null : cfg.getRuntimeRenameMap();
+        if (rt == null || rt.isEmpty()) return out;
+        // P3-15: rewrite references to the renamed BF runtime surface (VMP/BFVM
+        // stubs, attach() hooks and Class.forName string constants all point at
+        // the original names at this stage).
+        try {
+            return RuntimeRename.remap(out, rt);
+        } catch (Throwable t) {
+            KBoxLog.warn(TAG, "runtime rename failed for " + cn.name + ": " + t.getMessage());
+            return out;
+        }
+    }
+
+    private byte[] serializeRaw(ClassNode cn, ClassGraph graph, ProtectionConfig cfg) {
         // Clean up invalid try-catch blocks: after CF, exception-jump, and
         // anti-decompiler transforms, some try-catch blocks may reference
         // LabelNodes that are no longer in the instruction list.  Orphaned
@@ -2444,7 +2853,12 @@ public final class Packager {
     /** True for kbox synthetic classes that exist only to crash decompiler UIs
      *  and are never loaded by the JVM at runtime. */
     private static boolean isNeverLoadedSynthetic(String internal) {
-        return internal.startsWith("com/kbox/runtime/");
+        // P2-3: only the synthetic decoy / holder classes (name starts with '_'
+        // in the runtime package). Real runtime classes (NativeLoader, ...) MUST
+        // still be verified — narrowing this from the old "all com/kbox/runtime/"
+        // also stops the oversized anti-decompiler sink from being silently
+        // skipped in a way that hid genuine errors on real runtime classes.
+        return internal != null && internal.startsWith("com/kbox/runtime/_");
     }
 
     /**
@@ -3076,12 +3490,51 @@ public final class Packager {
      * class has already renamed (e.g. an interface static field accessed via
      * an implementing class) -> NoSuchFieldError / NoSuchMethodError.
      */
-    private static byte[] remapRollbackBytes(byte[] current, Mapping mapping, ClassGraph graph) {
-        if (mapping == null || mapping.getClassMap().isEmpty()) return current;
+    private static byte[] remapRollbackBytes(byte[] current, Mapping mapping, ClassGraph graph, java.util.Map<String, String> reverseClassMap) {
+        // 不再因"无改名映射"直接返回：即使没有重命名，回滚类也必须擦掉调试元数据。
         try {
             ClassReader cr = new ClassReader(current);
-            ClassWriter cw = new ClassWriter(cr, 0);
-            ClassRemapper remap = new ClassRemapper(cw, new FullRollbackRemapper(mapping, graph));
+            // 必须用 new ClassWriter(0)（而不是 new ClassWriter(cr, 0)）：后者会**整表复制**
+            // 原常量池，即使属性被丢弃，`HelloWorld.java` 这类字符串仍留在池里可被 grep 出来。
+            // 新建 writer 会按实际引用重建常量池；frames 仍按 visitFrame 原样写出，不受影响。
+            ClassWriter cw = new ClassWriter(0);
+            // 回滚类同样要擦掉调试/结构元数据：被回滚的类是把<b>原始字节</b>重新写回产物，
+            // 若不擦，它的 SourceFile（原类名）会原样带回，改名照样可被反查。
+            // （实测：HelloWorld 主类因校验失败回滚，产物里仍能读到 "HelloWorld.java"。）
+            org.objectweb.asm.ClassVisitor strip =
+                    new org.objectweb.asm.ClassVisitor(org.objectweb.asm.Opcodes.ASM9, cw) {
+                        @Override
+                        public void visitSource(String source, String debug) {
+                            // 丢弃 SourceFile / SourceDebugExtension
+                        }
+
+                        @Override
+                        public org.objectweb.asm.MethodVisitor visitMethod(int access, String name,
+                                String descriptor, String signature, String[] exceptions) {
+                            org.objectweb.asm.MethodVisitor mv =
+                                    super.visitMethod(access, name, descriptor, null, exceptions);
+                            if (mv == null) return null;
+                            return new org.objectweb.asm.MethodVisitor(org.objectweb.asm.Opcodes.ASM9, mv) {
+                                @Override
+                                public void visitLineNumber(int line, org.objectweb.asm.Label start) {
+                                    // 丢弃 LineNumberTable
+                                }
+
+                                @Override
+                                public void visitLocalVariable(String n, String d, String sig,
+                                        org.objectweb.asm.Label s, org.objectweb.asm.Label e, int idx) {
+                                    // 丢弃 LocalVariableTable
+                                }
+
+                                @Override
+                                public void visitParameter(String n, int a) {
+                                    // 丢弃 MethodParameters
+                                }
+                            };
+                        }
+                    };
+            ClassRemapper remap = new ClassRemapper(strip,
+                    new FullRollbackRemapper(mapping, graph, reverseClassMap));
             cr.accept(remap, 0);
             // Deliberately NO frame recomputation here. `current` is the pristine
             // input class, so its StackMapTable was produced by javac against the
@@ -3107,10 +3560,19 @@ public final class Packager {
     private static final class FullRollbackRemapper extends Remapper {
         private final Mapping mapping;
         private final ClassGraph graph;
+        private final java.util.Map<String, String> reverse;
 
-        FullRollbackRemapper(Mapping mapping, ClassGraph graph) {
+        FullRollbackRemapper(Mapping mapping, ClassGraph graph,
+                              java.util.Map<String, String> reverse) {
             this.mapping = mapping;
             this.graph = graph;
+            this.reverse = reverse;
+        }
+
+        /** Renamed internal name -> original internal name (identity if unknown). */
+        private String orig(String n) {
+            String o = reverse.get(n);
+            return o != null ? o : n;
         }
 
         @Override
@@ -3123,6 +3585,54 @@ public final class Packager {
             if (name.charAt(0) == '<') return name;
             String mapped = resolve(owner, name, desc, true);
             return mapped != null ? mapped : name;
+        }
+
+        /**
+         * LambdaMetafactory 的 invokedynamic 名字就是函数式接口的 SAM 方法名。
+         *
+         * <p>回滚类（序列化失败 → 原始字节 + 仅名字重映射）此前只映射了
+         * {@code invokeinterface} 等符号引用，没有映射 indy 名字：接口方法被改成
+         * {@code db}，而 lambda 生成类仍实现旧的 {@code apply}，运行期直接
+         * {@code AbstractMethodError: ... does not define or inherit an
+         * implementation of 'abstract int db(int,int)'}。这里与
+         * {@code NameObfuscator.KBoxRemapper} 保持同样的解析逻辑（indy 描述符的
+         * 返回类型即函数式接口，沿接口/父类链查 (owner,name) 的新名）。</p>
+         */
+        @Override
+        public String mapInvokeDynamicMethodName(String name, String descriptor) {
+            if (name == null || descriptor == null || name.isEmpty()) return name;
+            if (name.charAt(0) == '<') return name;
+            org.objectweb.asm.Type ret;
+            try {
+                ret = org.objectweb.asm.Type.getReturnType(descriptor);
+            } catch (RuntimeException bad) {
+                return name;
+            }
+            if (ret.getSort() != org.objectweb.asm.Type.OBJECT) return name;
+            String itf = ret.getInternalName();
+            if (itf == null || itf.startsWith("java/") || itf.startsWith("javax/")) return name;
+            java.util.Set<String> visited = new java.util.HashSet<>(8);
+            java.util.ArrayDeque<String> queue = new java.util.ArrayDeque<>();
+            queue.add(itf);
+            visited.add(itf);
+            while (!queue.isEmpty()) {
+                String cur = queue.poll();
+                String curOrig = orig(cur);
+                if (curOrig.startsWith("java/")) continue;
+                String mapped = mapping.mapMethodByName(curOrig, name);
+                if (mapped != null) return mapped;
+                ClassNode cn = graph.getClasses().get(mapping.mapClass(curOrig));
+                if (cn == null) cn = graph.getClasses().get(cur);
+                if (cn == null) continue;
+                if (cn.superName != null && visited.add(cn.superName)) queue.add(cn.superName);
+                if (cn.interfaces != null) {
+                    for (Object it : cn.interfaces) {
+                        String s = String.valueOf(it);
+                        if (visited.add(s)) queue.add(s);
+                    }
+                }
+            }
+            return name;
         }
 
         @Override
@@ -3138,28 +3648,20 @@ public final class Packager {
             visited.add(owner);
             while (!queue.isEmpty()) {
                 String cur = queue.poll();
-                if (cur.startsWith("java/")) continue;
-                boolean hit = method ? mapping.hasMethod(cur, name, desc)
-                        : mapping.hasField(cur, name, desc);
+                // Mapping keys are ORIGINAL names. The hierarchy reached through a
+                // renamed ClassNode carries RENAMED super/interface names, so
+                // normalize before every lookup (otherwise a rollback class keeps
+                // calling get() while the declaration was renamed to jzd()).
+                String curOrig = orig(cur);
+                if (curOrig.startsWith("java/")) continue;
+                boolean hit = method ? mapping.hasMethod(curOrig, name, desc)
+                        : mapping.hasField(curOrig, name, desc);
                 if (hit) {
-                    return method ? mapping.mapMethod(cur, name, desc)
-                            : mapping.mapField(cur, name, desc);
+                    return method ? mapping.mapMethod(curOrig, name, desc)
+                            : mapping.mapField(curOrig, name, desc);
                 }
-                // Graph keys are the RENAMED internal names (the pipeline replaced
-                // every ClassNode with its remapped copy before packaging), while
-                // the hierarchy we are walking comes from the ORIGINAL bytes. A
-                // direct lookup therefore always missed and the walk stopped at the
-                // first class that did not itself declare the member.
-                //
-                // Concretely: a rolled-back subclass kept calling
-                // `invokevirtual <Sub>.protectedValue()` whose declaration lives in
-                // a renamed superclass. The walk never reached the superclass, the
-                // call site kept the OLD member name while the declaration got the
-                // NEW one, and the JVM raised
-                //   NoSuchMethodError: java.lang.String ...CrossHelper.protectedValue()
-                // Mapping the key through the rename map restores the walk.
-                ClassNode cn = graph.getClasses().get(cur);
-                if (cn == null) cn = graph.getClasses().get(mapping.mapClass(cur));
+                ClassNode cn = graph.getClasses().get(mapping.mapClass(curOrig));
+                if (cn == null) cn = graph.getClasses().get(cur);
                 if (cn == null) continue;
                 if (cn.superName != null && visited.add(cn.superName)) queue.add(cn.superName);
                 if (cn.interfaces != null) {
@@ -3205,6 +3707,84 @@ public final class Packager {
             clinit.instructions.insert(insns);
             if (clinit.maxStack < 1) clinit.maxStack = 1;
         }
+    }
+
+    /**
+     * P2-9: plaintext {@code -cp} entry stub.
+     *
+     * <p>Writes a class at the ORIGINAL entry-point name whose only method is
+     * {@code main(String[])}. It lets {@code java -cp out.jar <OriginalMain>}
+     * start a build whose real entry was renamed, encrypted or hidden in the BF
+     * blob. The stub references nothing but the bootstrap target, so loading and
+     * verifying it never touches protected bytecode.</p>
+     *
+     * @param guardHook true → call {@code ResourceGuardLauncher.bootstrapCp}
+     *                  (installs the guard loader and re-dispatches);
+     *                  false → forward straight to {@code target.main}.
+     */
+    private static byte[] cpEntryStub(String originalDotted, String targetDotted,
+                                      boolean guardHook) {
+        String internal = originalDotted.replace('.', '/');
+        String targetInternal = targetDotted.replace('.', '/');
+        org.objectweb.asm.ClassWriter cw = new org.objectweb.asm.ClassWriter(0);
+        cw.visit(org.objectweb.asm.Opcodes.V1_8,
+                org.objectweb.asm.Opcodes.ACC_PUBLIC | org.objectweb.asm.Opcodes.ACC_SUPER,
+                internal, null, "java/lang/Object", null);
+        org.objectweb.asm.MethodVisitor mv = cw.visitMethod(
+                org.objectweb.asm.Opcodes.ACC_PUBLIC | org.objectweb.asm.Opcodes.ACC_STATIC,
+                "main", "([Ljava/lang/String;)V", null,
+                new String[]{"java/lang/Throwable"});
+        mv.visitCode();
+        mv.visitVarInsn(org.objectweb.asm.Opcodes.ALOAD, 0);
+        if (guardHook) {
+            // ResourceGuardLauncher.bootstrapCp(args) installs the guard loader and
+            // re-dispatches the real main; the boolean result is irrelevant here.
+            mv.visitMethodInsn(org.objectweb.asm.Opcodes.INVOKESTATIC, targetInternal,
+                    "bootstrapCp", "([Ljava/lang/String;)Z", false);
+            mv.visitInsn(org.objectweb.asm.Opcodes.POP);
+        } else {
+            mv.visitMethodInsn(org.objectweb.asm.Opcodes.INVOKESTATIC, targetInternal, "main",
+                    "([Ljava/lang/String;)V", false);
+        }
+        mv.visitInsn(org.objectweb.asm.Opcodes.RETURN);
+        mv.visitMaxs(1, 1);
+        mv.visitEnd();
+        cw.visitEnd();
+        return cw.toByteArray();
+    }
+
+    /**
+     * P2-9: {@code -cp} hook for the case where the entry class was NOT renamed
+     * (so a stub cannot occupy the same name). Prepends
+     * {@code if (ResourceGuardLauncher.bootstrapCp(args)) return;} to
+     * {@code main}, which redirects a plain {@code java -cp} launch through the
+     * guard launcher while the {@code -jar} path (already bootstrapped) falls
+     * through to the real body.
+     */
+    private static void injectCpPrologue(ClassGraph graph, String internalName) {
+        org.objectweb.asm.tree.ClassNode cn = graph.getClasses().get(internalName);
+        if (cn == null) return;
+        for (Object mo : cn.methods) {
+            org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) mo;
+            if (!"main".equals(mn.name) || !"([Ljava/lang/String;)V".equals(mn.desc)) continue;
+            int need = org.objectweb.asm.Opcodes.ACC_STATIC | org.objectweb.asm.Opcodes.ACC_PUBLIC;
+            if ((mn.access & need) != need) continue;
+            org.objectweb.asm.tree.LabelNode cont = new org.objectweb.asm.tree.LabelNode();
+            org.objectweb.asm.tree.InsnList il = new org.objectweb.asm.tree.InsnList();
+            il.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0));
+            il.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "com/kbox/runtime/ResourceGuardLauncher", "bootstrapCp",
+                    "([Ljava/lang/String;)Z", false));
+            il.add(new org.objectweb.asm.tree.JumpInsnNode(org.objectweb.asm.Opcodes.IFEQ, cont));
+            il.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.RETURN));
+            il.add(cont);
+            mn.instructions.insert(il);
+            KBoxLog.info(TAG, "Injected -cp bootstrap hook into " + internalName + ".main");
+            return;
+        }
+        KBoxLog.warn(TAG, "Entry class " + internalName + " has no main(String[]) — "
+                + "`java -cp` launch cannot be routed through the guard launcher");
     }
 
     private static void putEntry(ZipOutputStream out, String name, byte[] data) throws IOException {
@@ -3260,7 +3840,19 @@ public final class Packager {
     // (A bit-reliable bad-CRC header or a same-name duplicate entry is intentionally
     // NOT used: ZipOutputStream.closeEntry() re-validates STORED CRC / rejects
     // duplicate names and aborts the build — not acceptable.)
-    private static void writeAntiUnpackDecoys(ZipOutputStream out) throws IOException {
+    /** True when the input declares any known Minecraft mod/plugin metadata. */
+    private static boolean isMinecraftModJar(ClassGraph graph) {
+        if (graph == null) return false;
+        java.util.Map<String, byte[]> r = graph.getResources();
+        return r.containsKey("fabric.mod.json")
+                || r.containsKey("META-INF/mods.toml")
+                || r.containsKey("META-INF/neoforge.mods.toml")
+                || r.containsKey("mcmod.info")
+                || r.containsKey("plugin.yml")
+                || r.containsKey("paper-plugin.yml");
+    }
+
+    private static void writeAntiUnpackDecoys(ZipOutputStream out, boolean modJar) throws IOException {
         String stamp = "Kbox-" + Integer.toHexString(java.util.concurrent.ThreadLocalRandom.current().nextInt());
         String fakePkg = "META-INF/kbox/" + stamp + "/";
         // 1. Dir/file masquerade under a decoy package path (never a real class).
@@ -3268,13 +3860,18 @@ public final class Packager {
         putEntry(out, fakePkg + "com/kbox/protect/Foo.class/.git", "x".getBytes(StandardCharsets.UTF_8));
         putEntry(out, fakePkg + "com/kbox/protect/Bar.java/", new byte[0]);
         putEntry(out, fakePkg + "com/kbox/protect/Bar.java/.keep", new byte[0]);
-        // 2. Junk pseudo-class for naive **/*.class dump reprocessors.
-        byte[] junkCls = new byte[]{ (byte)0xCA, (byte)0xFE, (byte)0xBA, (byte)0xBE,
-                                     0x00, 0x00, 0x00, 0x3B, /* bogus minor/major */
-                                     0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                     0x00, 0x00 }; // junk header, invalid body
-        putEntry(out, fakePkg + "META-INF/services/Factory.class", junkCls);
-        putEntry(out, fakePkg + "META-INF/services/Factory$Loader.class", junkCls);
+        // 2. Junk pseudo-class for naive **/*.class dump reprocessors. Skipped for
+        //    Minecraft mod jars: FML/NeoForge ASM-parse every *.class entry while
+        //    discovering @Mod classes, and one intentionally-invalid file makes the
+        //    loader reject the whole jar ("probably a corrupt zip").
+        if (!modJar) {
+            byte[] junkCls = new byte[]{ (byte)0xCA, (byte)0xFE, (byte)0xBA, (byte)0xBE,
+                                         0x00, 0x00, 0x00, 0x3B, /* bogus minor/major */
+                                         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x00, 0x00 }; // junk header, invalid body
+            putEntry(out, fakePkg + "META-INF/services/Factory.class", junkCls);
+            putEntry(out, fakePkg + "META-INF/services/Factory$Loader.class", junkCls);
+        }
         // 3. Decoy native lib for disk-dumping extractors.
         byte[] dll = {0x4D, 0x5A, 0x00, 0x00}; // "MZ\x00\x00" inert fake PE header
         putEntry(out, fakePkg + "native/native-trap.dll", dll);

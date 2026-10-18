@@ -88,6 +88,11 @@ public final class MinecraftModDetector {
             return detectForgeLike(res.get("META-INF/mods.toml"),
                     MinecraftModPresets.ModLoader.FORGE);
         }
+        if (res.containsKey("mcmod.info")) {
+            // Forge 1.8.9 / 1.12.2 metadata (before the mods.toml era). FML scans
+            // every class for @Mod, so this era needs the same adaptation.
+            return detectLegacyForge();
+        }
         if (res.containsKey("paper-plugin.yml")) {
             return detectBukkit(res.get("paper-plugin.yml"));
         }
@@ -164,6 +169,24 @@ public final class MinecraftModDetector {
         return r;
     }
 
+    /**
+     * Legacy Forge (1.8.9 / 1.12.2) metadata: {@code mcmod.info} is a JSON array
+     * of objects with a {@code modid}, and FML finds the entry point by scanning
+     * every class for {@code @Mod}. Keep every annotated class (the modId match
+     * is only a hint — several mods ship one info file per mod).
+     */
+    private Result detectLegacyForge() {
+        Result r = new Result(MinecraftModPresets.ModLoader.FORGE);
+        r.protectedResources.add("mcmod.info");
+        r.protectedResources.add("pack.mcmeta");
+        // FML loads whatever class carries @Mod, so keep every annotated class.
+        for (ClassNode cn : graph.getClasses().values()) {
+            if (findModId(cn) != null) r.entryClasses.add(cn.name);
+        }
+        log(r, "Forge (legacy mcmod.info)");
+        return r;
+    }
+
     /** Return the modId declared in an {@code @Mod(...)} annotation, or null. */
     private static String findModId(ClassNode cn) {
         List<AnnotationNode> annos = new ArrayList<>();
@@ -171,11 +194,16 @@ public final class MinecraftModDetector {
         if (cn.invisibleAnnotations != null) annos.addAll(cn.invisibleAnnotations);
         for (AnnotationNode an : annos) {
             String desc = an.desc;
-            if (desc.equals("Lnet/minecraftforge/fml/common/Mod;")
+            if (desc.equals("Lcpw/mods/fml/common/Mod;")
+                    || desc.equals("Lnet/minecraftforge/fml/common/Mod;")
                     || desc.equals("Lnet/neoforged/fml/common/Mod;")) {
                 if (an.values == null) continue;
                 for (int i = 0; i < an.values.size(); i += 2) {
-                    if ("value".equals(an.values.get(i)) && an.values.get(i + 1) instanceof String) {
+                    Object k = an.values.get(i);
+                    // Forge 1.8.9..1.20 declared @Mod(modid = "..."); NeoForge and
+                    // the newer Forge use the shorthand @Mod("...") = value.
+                    if (("modid".equals(k) || "value".equals(k))
+                            && an.values.get(i + 1) instanceof String) {
                         return (String) an.values.get(i + 1);
                     }
                 }
@@ -311,6 +339,62 @@ public final class MinecraftModDetector {
         cfg.getExcludeResourcePatterns().add("*.accesstransformer.cfg");
         cfg.getExcludeResourcePatterns().add("META-INF/jars/");
         cfg.getExcludeResourcePatterns().add("META-INF/jars/*");
+        // Class encryption must be OFF for mod jars: Forge/NeoForge discover mods by
+        // ASM-parsing EVERY class in the jar (ModFileScanData / @Mod scan) before the
+        // JVM loads any of them. An encrypted entry is unreadable and the whole jar
+        // is rejected as corrupt. Fabric does not scan, but keeping one policy for
+        // all loaders avoids a build that silently only works on Fabric.
+        if (cfg.isEncryptClasses()) {
+            cfg.setEncryptClasses(false);
+            KBoxLog.info(TAG, "Class encryption disabled: the mod loader ASM-scans raw "
+                    + "class bytes for @Mod/@Mixin metadata before loading");
+        }
+        // The BF blob loader cannot coexist with a host mod loader: FML/Fabric
+        // define mod classes themselves, while the blob lives only inside
+        // BfSecureLoader. Instrumented plaintext mod classes reference engine
+        // classes (VmpInterpreter, JnicIndy, ...) that would then be unreachable
+        // -> NoClassDefFoundError during mod construction. Keep the mod jar as a
+        // normal (obfuscated) jar; BF remains available for runnable apps.
+        if (cfg.isBrainfuckLoader() || cfg.isBrainfuckMcHybrid()) {
+            cfg.setBrainfuckLoader(false);
+            cfg.setBrainfuckMcHybrid(false);
+            KBoxLog.info(TAG, "BF blob loader disabled for a mod jar: the host loader "
+                    + "owns class loading, blob-only engine classes are unreachable");
+        }
+        // Resource renaming/encryption is incompatible with mod jars: the host
+        // loader and the mod itself open resources by their original paths
+        // (ResourceBundle("luckperms"), assets/**, data/**, mixin configs, ...),
+        // and no guard loader sits between them and the jar. Keep resources
+        // byte-identical (string encryption still hides their names in code).
+        if (cfg.isObfuscateResources()) {
+            cfg.setObfuscateResources(false);
+            KBoxLog.info(TAG, "Resource obfuscation disabled for a mod jar: the host "
+                    + "loader reads assets/data/config files by their original paths");
+        }
+        // VMP replaces method bodies with an interpreter-driven program. In mod
+        // jars the interpreter resolves referenced classes through the mod
+        // layer; framework code that compares Class objects by identity (Gson's
+        // ExclusionStrategy, Dist guards, ...) can observe a different Class
+        // instance and silently take the wrong branch. Keep VMP for executable
+        // apps and every other protector active for mods.
+        if (cfg.isEnableVmp() && !cfg.isMcForceVmp()) {
+            cfg.setEnableVmp(false);
+            KBoxLog.info(TAG, "VMP disabled for a mod jar: the mod layer's class "
+                    + "identity/resolution semantics break interpreter-side lookups "
+                    + "(set mcForceVmp=true to override)");
+        } else if (cfg.isEnableVmp()) {
+            KBoxLog.warn(TAG, "VMP kept ON for this mod jar (mcForceVmp=true): "
+                    + "maximum strength, framework class-identity guards may misbehave");
+        }
+        // Anti-decompiler level 2/3 inject deliberately malformed attributes, fake
+        // StackMapTables and bad method handles into a synthetic class. FML/NeoForge
+        // parse EVERY class entry during mod discovery, so one unparseable entry
+        // makes the loader reject the whole jar ("probably a corrupt zip").
+        if (cfg.getAntiDecompilerLevel() > 0) {
+            cfg.setAntiDecompilerLevel(0);
+            KBoxLog.info(TAG, "Anti-decompiler disabled: malformed-attribute decoys are "
+                    + "fatal to the loader's all-class ASM scan");
+        }
     }
 
     private void log(Result r, String loaderName) {
@@ -324,10 +408,9 @@ public final class MinecraftModDetector {
     // Minimal parsers (no external JSON/YAML dependency)
     // ------------------------------------------------------------------
 
-    /** "key": "value" at top level. */
+    /** "key": "value" — only matches a KEY occurrence (not a value equal to the key). */
     static String extractJsonString(String json, String key) {
-        String search = "\"" + key + "\"";
-        int idx = json.indexOf(search);
+        int idx = indexOfJsonKey(json, key, 0);
         if (idx < 0) return null;
         idx = json.indexOf(':', idx);
         if (idx < 0) return null;
@@ -339,11 +422,26 @@ public final class MinecraftModDetector {
         return json.substring(idx + 1, end);
     }
 
+    /** Index of {@code "key"} followed (after optional whitespace) by ':', or -1.
+     *  Searching for the bare quoted token is not enough: values such as
+     *  {@code "environment": "server"} contain the same text as the key
+     *  {@code "server"} and used to make the entrypoint parser return nothing. */
+    static int indexOfJsonKey(String json, String key, int from) {
+        String needle = "\"" + key + "\"";
+        while (true) {
+            int idx = json.indexOf(needle, from);
+            if (idx < 0) return -1;
+            int p = idx + needle.length();
+            while (p < json.length() && Character.isWhitespace(json.charAt(p))) p++;
+            if (p < json.length() && json.charAt(p) == ':') return idx;
+            from = idx + needle.length();
+        }
+    }
+
     /** Extract all strings from a JSON array value for the given key. */
     static List<String> extractJsonStringArray(String json, String key) {
         List<String> out = new ArrayList<>();
-        String search = "\"" + key + "\"";
-        int idx = json.indexOf(search);
+        int idx = indexOfJsonKey(json, key, 0);
         if (idx < 0) return out;
         idx = json.indexOf(':', idx);
         if (idx < 0) return out;

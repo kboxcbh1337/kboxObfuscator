@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Random;
 
 /**
- * ZKM-style light obfuscation for the plaintext bootstrap classes.
+ * Light obfuscation for the plaintext bootstrap classes.
  *
  * <p>The 6 boot classes ({@code BfSecureLoader}, {@code BfBlobInputStream},
  * {@code NativeLoader}, {@code KbnlKey}, {@code ChaCha20} + its nested

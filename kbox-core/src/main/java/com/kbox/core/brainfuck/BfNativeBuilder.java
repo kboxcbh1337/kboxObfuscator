@@ -40,7 +40,7 @@ public final class BfNativeBuilder {
 
     /** Loads + re-serializes the loader class (shares Packager's routine so the
      *  hashed bytes equal the injected bytes). Returns null when unavailable. */
-    private static byte[] loaderReSerialized() {
+    private static byte[] loaderReSerialized(java.util.Map<String, String> rename) {
         byte[] raw = null;
         try (InputStream in = BfNativeBuilder.class.getClassLoader()
                 .getResourceAsStream("com/kbox/runtime/BfSecureLoader.class")) {
@@ -48,7 +48,7 @@ public final class BfNativeBuilder {
         } catch (Exception ignore) { }
         if (raw == null) return null;
         byte[] re = com.kbox.core.packaging.Packager.reSerializeRuntimeClass(
-                raw, "com/kbox/runtime/BfSecureLoader");
+                raw, "com/kbox/runtime/BfSecureLoader", rename);
         return re != null ? re : raw;
     }
 
@@ -131,8 +131,9 @@ public final class BfNativeBuilder {
      *  other detection tables, hashes as plain 64-bit constants, plus the total
      *  declared method count (KBOX_LDCOUNT). Appended into the KBOX_BF_ENCRYPTED
      *  region so M1 erasure never touches the strings. */
-    private static void emitLoaderMethodTable(StringBuilder sb, SecureRandom rnd) {
-        byte[] cls = loaderReSerialized();
+    private static void emitLoaderMethodTable(StringBuilder sb, SecureRandom rnd,
+                                              java.util.Map<String, String> rename) {
+        byte[] cls = loaderReSerialized(rename);
         if (cls == null) return;
         java.util.List<String> names = new java.util.ArrayList<>();
         java.util.List<String> descs = new java.util.ArrayList<>();
@@ -291,12 +292,23 @@ public final class BfNativeBuilder {
      *                by {@link BrainfuckPacker#pack} for this build).
      */
     public static Result build(Path workDir, String cc, BfSymbolSet sym) throws IOException {
+        return build(workDir, cc, sym, null);
+    }
+
+    /**
+     * P3-15 variant: {@code rename} is the per-build BF runtime map. The loader
+     * class is hashed in its RENAMED form (exactly the bytes the packager writes)
+     * and its mapped internal name is compiled into the decoder so
+     * {@code JNI_OnLoad} can {@code FindClass} it.
+     */
+    public static Result build(Path workDir, String cc, BfSymbolSet sym,
+                               java.util.Map<String, String> rename) throws IOException {
         Files.createDirectories(workDir);
         // Per-build salt for the native integrity self-hash. The SAME value is
         // compiled into the decoder (KBOX_TEXT_SALT, injected below) and used to
         // compute the expected image hash over the compiled library.
         long salt = new SecureRandom().nextInt() & 0xFFFFFFFFL;
-        Path src = writeSource(workDir, sym, salt);
+        Path src = writeSource(workDir, sym, salt, rename);
 
         NativeCompiler compiler = new NativeCompiler(cc);
         NativeCompiler.Result cres = compiler.compile(src, workDir, LIB_NAME);
@@ -342,7 +354,8 @@ public final class BfNativeBuilder {
      * the source so the compiled decoder understands this build's Brainfuck
      * alphabet.
      */
-    private static Path writeSource(Path workDir, BfSymbolSet sym, long salt) throws IOException {
+    private static Path writeSource(Path workDir, BfSymbolSet sym, long salt,
+                                    java.util.Map<String, String> rename) throws IOException {
         Path out = workDir.resolve(C_SOURCE);
         String source;
         try (InputStream in = BfNativeBuilder.class.getClassLoader()
@@ -387,6 +400,12 @@ public final class BfNativeBuilder {
             defines.append("#define KBOX_BF_DINV_").append(i).append(' ')
                    .append(dinv[i]).append('\n');
         }
+        // P3-15: the loader class is renamed per build; JNI_OnLoad must
+        // FindClass the mapped internal name (see kbox_bf_loader.c).
+        defines.append("#define KBOX_BF_LOADER_CLASS \"")
+               .append(com.kbox.core.packaging.RuntimeRename.name(
+                       rename, "com/kbox/runtime/BfSecureLoader"))
+               .append("\"\n");
         defines.append('\n');
         String sourceWith = defines + source;
 
@@ -401,7 +420,7 @@ public final class BfNativeBuilder {
         int bi = sourceWith.indexOf(beginMarker);
         int ei = sourceWith.indexOf(endMarker);
         if (bi >= 0 && ei > bi) {
-            String injected = encryptedBlock(sym);
+            String injected = encryptedBlock(sym, rename);
             sourceWith = sourceWith.substring(0, bi)
                        + beginMarker + "\n" + injected + endMarker
                        + sourceWith.substring(ei + endMarker.length());
@@ -444,7 +463,8 @@ public final class BfNativeBuilder {
      * module table is emitted, so the shipped binary carries no foreign
      * plaintext seed and no unused-table warnings.
      */
-    private static String encryptedBlock(BfSymbolSet sym) {
+    private static String encryptedBlock(BfSymbolSet sym,
+                                         java.util.Map<String, String> rename) {
         SecureRandom rnd = new SecureRandom();
         StringBuilder sb = new StringBuilder(2048);
         sb.append("#define KBOX_BF_ENCRYPTED 1\n");
@@ -479,7 +499,7 @@ public final class BfNativeBuilder {
         sb.append("#endif\n");
         // Loader key-method table (main/failIfAgentPresent/<init>/entry-read
         // code[] hashes): name+desc encrypted, hashes as 64-bit constants.
-        emitLoaderMethodTable(sb, rnd);
+        emitLoaderMethodTable(sb, rnd, rename);
         return sb.toString();
     }
 

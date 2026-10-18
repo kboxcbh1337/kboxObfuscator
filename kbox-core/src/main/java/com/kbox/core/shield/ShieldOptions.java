@@ -43,7 +43,7 @@ public final class ShieldOptions {
     /**
      * 是否启用函数级虚拟化（x64）：解析 .pdata 的 RUNTIME_FUNCTION 表，
      * 对可提升的函数逐个虚拟化（入口改写 jmp、原函数体保留为诱饵），
-     * 使普通 EXE/DLL 无需 .textvm* 标记节即可获得 VMProtect 级防护。
+     * 使普通 EXE/DLL 无需 .textvm* 标记节即可获得函数级虚拟化防护。
      */
     public boolean virtualizeFunctions = true;
 

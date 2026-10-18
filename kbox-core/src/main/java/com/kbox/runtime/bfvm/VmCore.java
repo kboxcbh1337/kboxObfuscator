@@ -35,6 +35,19 @@ public final class VmCore {
         int maxLocals = c.u16();
         String desc = c.utf8();
         ClassLoader eff = loader != null ? loader : BfRuntime.class.getClassLoader();
+        // P1-5：异常表（start, end, handler, catchType）。pc 在构建期回填。
+        int handlerCount = c.u16();
+        int[] hStart = new int[handlerCount];
+        int[] hEnd = new int[handlerCount];
+        int[] hPc = new int[handlerCount];
+        String[] hType = new String[handlerCount];
+        for (int i = 0; i < handlerCount; i++) {
+            int hasType = c.u8();
+            hType[i] = hasType != 0 ? c.utf8() : null;
+            hStart[i] = c.i32();
+            hEnd[i] = c.i32();
+            hPc[i] = c.i32();
+        }
         Object[] locals = new Object[Math.max(maxLocals, 1)];
         Class<?>[] argTypes = MethodType.fromMethodDescriptorString(desc, eff).parameterArray();
         if (self != null) {
@@ -47,7 +60,13 @@ public final class VmCore {
         }
         State s = new State();
 
+        // P1-5：try/catch 包住整个分派循环。无异常时 JVM 的 try 是零成本的；
+        // 有异常时按 (pc, 类型) 查异常表：命中则清栈、压异常、跳到 handler。
+        int monitorDepth = 0;
+        try {
         for (;;) {
+            final int pc = c.pc;
+            try {
             int op = c.u8();
             switch (op) {
                 case Opcode.NOP:
@@ -756,7 +775,58 @@ public final class VmCore {
                     if (t instanceof Error) {
                         throw (Error) t;
                     }
-                    throw new BfVmException("ATHROW of non-runtime throwable: " + t, (Throwable) t);
+                    // Non-runtime throwable (e.g. KBox's exception-relay carrier):
+                    // rethrow the ORIGINAL instance so this frame's own exception
+                    // table can match it. Wrapping it in BfVmException loses the
+                    // type and turns a locally-caught carrier into a hard failure.
+                    sneakyThrow((Throwable) t);
+                    break; // unreachable
+                }
+
+                // ---- P1-5：monitor / multianewarray / invokedynamic ----
+                case Opcode.MONITORENTER: {
+                    deref(s.pop());
+                    VM_MONITOR.lock();
+                    monitorDepth++;
+                    break;
+                }
+                case Opcode.MONITOREXIT: {
+                    s.pop();
+                    if (monitorDepth > 0) {
+                        monitorDepth--;
+                        VM_MONITOR.unlock();
+                    }
+                    break;
+                }
+                case Opcode.MULTIANEWARRAY: {
+                    String arrDesc = c.utf8();
+                    int dims = c.u8();
+                    int[] sizes = new int[dims];
+                    for (int i = dims - 1; i >= 0; i--) {
+                        sizes[i] = ((Number) deref(s.pop())).intValue();
+                    }
+                    s.push(multiArray(arrDesc, sizes, eff));
+                    break;
+                }
+                case Opcode.INVOKEDYNAMIC: {
+                    String name = c.utf8();
+                    String d = c.utf8();
+                    int bsmTag = c.u8();
+                    String[] bsmRef = c.ref();
+                    int argc = c.u8();
+                    Object[] bsmArgs = new Object[argc];
+                    for (int i = 0; i < argc; i++) {
+                        bsmArgs[i] = readBsmArg(c, eff);
+                    }
+                    MethodType siteType = MethodType.fromMethodDescriptorString(d, eff);
+                    Object[] argv = popArgs(s, siteType.parameterArray());
+                    java.lang.invoke.MethodHandle target =
+                            indyTarget(bsmTag, bsmRef, name, siteType, bsmArgs, eff, owner);
+                    Object res = target.invokeWithArguments(argv);
+                    if (siteType.returnType() != void.class) {
+                        s.push(stackRep(siteType.returnType(), res));
+                    }
+                    break;
                 }
 
                 // ---- returns ----
@@ -776,6 +846,181 @@ public final class VmCore {
                 default:
                     throw new BfVmException("bad BFVM opcode " + op);
             }
+            } catch (Throwable t) {
+                int target = findHandler(hStart, hEnd, hPc, hType, pc, t, eff);
+                if (target >= 0) {
+                    s.clear();
+                    s.push(t);
+                    c.pc = target;
+                    continue;
+                }
+                if (t instanceof RuntimeException) throw (RuntimeException) t;
+                if (t instanceof Error) throw (Error) t;
+                // Preserve the original type for the caller's own catch table.
+                sneakyThrow(t);
+                throw new AssertionError("unreachable");
+            }
+        }
+        } finally {
+            // 异常逃出本帧时释放还持有的 monitor，避免跨线程死锁。
+            while (monitorDepth > 0) {
+                monitorDepth--;
+                VM_MONITOR.unlock();
+            }
+        }
+    }
+
+    // ---- P1-5 helpers ----
+
+    /** VM 级重入锁：monitorenter/exit 用它做互斥（比真实对象锁粗，但语义正确且可重入）。 */
+    private static final java.util.concurrent.locks.ReentrantLock VM_MONITOR =
+            new java.util.concurrent.locks.ReentrantLock();
+
+    /** 按 (pc, 异常类型) 找异常表条目；返回 handler pc，找不到返回 -1。 */
+    private static int findHandler(int[] start, int[] end, int[] handler, String[] type,
+                                   int pc, Throwable t, ClassLoader eff) {
+        for (int i = 0; i < start.length; i++) {
+            if (pc < start[i] || pc >= end[i]) continue;
+            if (type[i] == null) return handler[i];   // catch-all（finally）
+            try {
+                if (resolveClass(type[i], eff).isInstance(t)) return handler[i];
+            } catch (Throwable ignore) {
+                // 类型解析失败：跳过该条，等价于"不匹配"
+            }
+        }
+        return -1;
+    }
+
+    /** MULTIANEWARRAY：按维度一次性建多维数组。 */
+    private static Object multiArray(String desc, int[] sizes, ClassLoader eff) {
+        String component = desc.substring(desc.lastIndexOf('[') + 1);
+        Class<?> leaf;
+        if (component.startsWith("L") && component.endsWith(";")) {
+            leaf = resolveClass(component.substring(1, component.length() - 1), eff);
+        } else {
+            leaf = primitiveClass(component.charAt(0));
+        }
+        return java.lang.reflect.Array.newInstance(leaf, sizes);
+    }
+
+    private static Class<?> primitiveClass(char c) {
+        switch (c) {
+            case 'Z': return boolean.class;
+            case 'B': return byte.class;
+            case 'C': return char.class;
+            case 'S': return short.class;
+            case 'I': return int.class;
+            case 'J': return long.class;
+            case 'F': return float.class;
+            case 'D': return double.class;
+            default: throw new BfVmException("bad array component " + c);
+        }
+    }
+
+    /** invokedynamic：重建 CallSite 并取出 target。 */
+    private static java.lang.invoke.MethodHandle indyTarget(int bsmTag, String[] bsm, String name,
+            MethodType siteType, Object[] bsmArgs, ClassLoader eff, Class<?> caller) {
+        try {
+            // BSM 自身是公开方法（LambdaMetafactory/StringConcatFactory），用 publicLookup 即可；
+            // 对 JDK 类做 privateLookupIn 会被模块系统拒绝（illegal lookupClass）。
+            java.lang.invoke.MethodHandle bsmMh =
+                    lookupHandle(bsmTag, bsm[0], bsm[1], bsm[2], eff, false);
+            Object[] call = new Object[bsmArgs.length + 3];
+            // caller 必须是<b>被虚拟化的那个类</b>：LambdaMetafactory 用它定义 lambda 类并
+            // 访问实现方法，传 VmCore 会导致非法访问。
+            call[0] = privateLookup(caller != null ? caller : VmCore.class);
+            call[1] = name;
+            call[2] = siteType;
+            System.arraycopy(bsmArgs, 0, call, 3, bsmArgs.length);
+            java.lang.invoke.CallSite cs =
+                    (java.lang.invoke.CallSite) bsmMh.invokeWithArguments(call);
+            return cs.getTarget();
+        } catch (Throwable t) {
+            throw new BfVmException("invokedynamic bootstrap failed: " + name + siteType, t);
+        }
+    }
+
+    /**
+     * 还原一个 MethodHandle 常量。
+     *
+     * <p>LambdaMetafactory 的实现方法通常是 {@code private static}，必须用"带私有访问权"的
+     * lookup 才找得到。</p>
+     */
+    private static java.lang.invoke.MethodHandle lookupHandle(int tag, String owner, String name,
+            String desc, ClassLoader eff, boolean privateAccess) {
+        try {
+            Class<?> c = resolveClass(owner, eff);
+            java.lang.invoke.MethodHandles.Lookup lk = privateAccess
+                    ? privateLookup(c)
+                    : java.lang.invoke.MethodHandles.publicLookup();
+            if (tag == 1 || tag == 2 || tag == 3 || tag == 4) {
+                Class<?> ft = fieldType(desc, eff);
+                switch (tag) {
+                    case 1: return lk.findGetter(c, name, ft);
+                    case 2: return lk.findStaticGetter(c, name, ft);
+                    case 3: return lk.findSetter(c, name, ft);
+                    default: return lk.findStaticSetter(c, name, ft);
+                }
+            }
+            MethodType mt = MethodType.fromMethodDescriptorString(desc, eff);
+            switch (tag) {
+                case 5: return lk.findVirtual(c, name, mt);
+                case 6: return lk.findStatic(c, name, mt);
+                case 7: return lk.findSpecial(c, name, mt, c);
+                case 8: return lk.findConstructor(c, mt);
+                case 9: return lk.findVirtual(c, name, mt);
+                default: throw new BfVmException("bad handle tag " + tag);
+            }
+        } catch (Throwable t) {
+            throw new BfVmException("handle lookup failed: " + owner + "." + name + desc, t);
+        }
+    }
+
+    private static Class<?> fieldType(String desc, ClassLoader eff) {
+        return MethodType.fromMethodDescriptorString("()" + desc, eff).returnType();
+    }
+
+    private static java.lang.invoke.MethodHandles.Lookup privateLookup(Class<?> owner) {
+        // Java 9+：privateLookupIn（编译目标是 8，只能反射调用）。
+        try {
+            java.lang.reflect.Method m = java.lang.invoke.MethodHandles.class.getMethod(
+                    "privateLookupIn", Class.class, java.lang.invoke.MethodHandles.Lookup.class);
+            return (java.lang.invoke.MethodHandles.Lookup)
+                    m.invoke(null, owner, java.lang.invoke.MethodHandles.lookup());
+        } catch (Throwable ignore) {
+            // Java 8 无 privateLookupIn：直接构造 full-privilege Lookup（ALL_MODES = -1）。
+            try {
+                java.lang.reflect.Constructor<java.lang.invoke.MethodHandles.Lookup> c =
+                        java.lang.invoke.MethodHandles.Lookup.class.getDeclaredConstructor(
+                                Class.class, int.class);
+                c.setAccessible(true);
+                return c.newInstance(owner, -1);
+            } catch (Throwable ignore2) {
+                try {
+                    return java.lang.invoke.MethodHandles.publicLookup().in(owner);
+                } catch (Throwable ignore3) {
+                    return java.lang.invoke.MethodHandles.publicLookup();
+                }
+            }
+        }
+    }
+
+    /** 读取一个 invokedynamic 的 BSM 常量参数。 */
+    private static Object readBsmArg(Cursor c, ClassLoader eff) {
+        int tag = c.u8();
+        switch (tag) {
+            case 1: return Integer.valueOf(c.i32());
+            case 2: return Long.valueOf(c.i64());
+            case 3: return Float.valueOf(Float.intBitsToFloat(c.i32()));
+            case 4: return Double.valueOf(Double.longBitsToDouble(c.i64()));
+            case 5: return c.utf8();
+            case 6: return MethodType.fromMethodDescriptorString(c.utf8(), eff);
+            case 7: {
+                int htag = c.u8();
+                String[] r = c.ref();
+                return lookupHandle(htag, r[0], r[1], r[2], eff, true);
+            }
+            default: throw new BfVmException("bad bsm arg tag " + tag);
         }
     }
 
@@ -960,6 +1205,18 @@ public final class VmCore {
     }
 
     private static Object methodInvoke(Method m, Object recv, Object[] argv) {
+        // JDK 17+: Object.clone() is `protected native` in java.base and cannot
+        // be made accessible to the unnamed module. Array clone() is exactly what
+        // enum values() / defensive copies use; reproduce it with a shallow copy
+        // (same semantics) instead of failing with InaccessibleObjectException.
+        if ("clone".equals(m.getName()) && recv != null && recv.getClass().isArray()
+                && (argv == null || argv.length == 0)) {
+            Class<?> comp = recv.getClass().getComponentType();
+            int len = java.lang.reflect.Array.getLength(recv);
+            Object copy = java.lang.reflect.Array.newInstance(comp, len);
+            System.arraycopy(recv, 0, copy, 0, len);
+            return copy;
+        }
         try {
             return m.invoke(recv, argv);
         } catch (IllegalAccessException e) {
@@ -986,7 +1243,18 @@ public final class VmCore {
         if (t instanceof Error) {
             throw (Error) t;
         }
-        return new BfVmException("invoked code threw checked exception: " + t, t);
+        // Invoked Java code threw a checked exception: rethrow the ORIGINAL
+        // instance so the interpreted caller's exception table can match it by
+        // type (KBox's exception-relay carriers are Throwable subclasses that are
+        // neither RuntimeException nor Error).
+        sneakyThrow(t);
+        return null; // unreachable
+    }
+
+    /** Throws any Throwable without a checked-exception declaration. */
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
+        throw (T) t;
     }
 
     // ---- reflection resolution ----
@@ -1007,10 +1275,23 @@ public final class VmCore {
         for (Class<?> k = c; k != null; k = k.getSuperclass()) {
             try {
                 Field f = k.getDeclaredField(name);
-                f.setAccessible(true);
+                // JDK 17+ module system: java.base is not open to the unnamed
+                // module, so setAccessible on e.g. a protected JDK field throws
+                // InaccessibleObjectException. Public fields still work.
+                try { f.setAccessible(true); } catch (RuntimeException ignored) { }
                 return f;
             } catch (NoSuchFieldException e) {
                 // continue up the hierarchy
+            }
+        }
+        // Interface constants (e.g. a static final field declared on an interface
+        // implemented by a superclass) are legal GETSTATIC targets.
+        for (Class<?> iface : allInterfaces(c)) {
+            try {
+                Field f = iface.getDeclaredField(name);
+                try { f.setAccessible(true); } catch (RuntimeException ignored) { }
+                return f;
+            } catch (NoSuchFieldException ignored) {
             }
         }
         throw new BfVmException("field not found: " + c.getName() + "." + name);
@@ -1023,7 +1304,9 @@ public final class VmCore {
                         && MethodType.methodType(m.getReturnType(), m.getParameterTypes())
                                 .toMethodDescriptorString().equals(desc)
                         && Modifier.isStatic(m.getModifiers()) == isStatic) {
-                    m.setAccessible(true);
+                    // Object.clone() is protected in java.base and cannot be made
+                    // accessible; methodInvoke() reproduces array clone() itself.
+                    try { m.setAccessible(true); } catch (RuntimeException ignored) { }
                     return m;
                 }
             }
@@ -1034,7 +1317,7 @@ public final class VmCore {
                         && MethodType.methodType(m.getReturnType(), m.getParameterTypes())
                                 .toMethodDescriptorString().equals(desc)
                         && Modifier.isStatic(m.getModifiers()) == isStatic) {
-                    m.setAccessible(true);
+                    try { m.setAccessible(true); } catch (RuntimeException ignored) { }
                     return m;
                 }
             }
@@ -1046,7 +1329,7 @@ public final class VmCore {
         for (Constructor<?> ct : c.getDeclaredConstructors()) {
             if (MethodType.methodType(void.class, ct.getParameterTypes())
                     .toMethodDescriptorString().equals(desc)) {
-                ct.setAccessible(true);
+                try { ct.setAccessible(true); } catch (RuntimeException ignored) { }
                 return ct;
             }
         }
@@ -1056,7 +1339,13 @@ public final class VmCore {
     private static Set<Class<?>> allInterfaces(Class<?> c) {
         Set<Class<?>> out = new HashSet<>();
         Deque<Class<?>> q = new ArrayDeque<>();
-        q.addAll(Arrays.asList(c.getInterfaces()));
+        // Interfaces of EVERY superclass, not just the runtime class: Guava's
+        // SingletonImmutableList extends ImmutableList (a class) which implements
+        // List/Collection, so Collection#stream (a default method) is only
+        // reachable through a superclass' interface list.
+        for (Class<?> k = c; k != null; k = k.getSuperclass()) {
+            q.addAll(Arrays.asList(k.getInterfaces()));
+        }
         while (!q.isEmpty()) {
             Class<?> i = q.poll();
             if (!out.add(i)) {
@@ -1077,6 +1366,12 @@ public final class VmCore {
                 stack = Arrays.copyOf(stack, stack.length * 2);
             }
             stack[sp++] = v;
+        }
+
+        /** 异常进入 handler 时清空操作数栈（JVM 语义）。 */
+        void clear() {
+            Arrays.fill(stack, 0, sp, null);
+            sp = 0;
         }
 
         Object pop() {

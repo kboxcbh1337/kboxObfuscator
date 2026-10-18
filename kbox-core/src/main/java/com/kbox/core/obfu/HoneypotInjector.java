@@ -144,13 +144,16 @@ public final class HoneypotInjector {
         cl.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_INT));
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, internal, fRound, "[I"));
         int[] round = new int[]{0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344};
+        // Load the array ONCE: the loop body leaves one array ref per IASTORE, so
+        // a per-iteration GETSTATIC stacked N refs (STACK-FAIL stack=3 at RETURN).
+        cl.add(new FieldInsnNode(Opcodes.GETSTATIC, internal, fRound, "[I"));
         for (int i = 0; i < round.length; i++) {
-            cl.add(new FieldInsnNode(Opcodes.GETSTATIC, internal, fRound, "[I"));
             cl.add(new InsnNode(Opcodes.DUP));
             pushInt(cl, i);
             pushInt(cl, round[i]);
             cl.add(new InsnNode(Opcodes.IASTORE));
         }
+        cl.add(new InsnNode(Opcodes.POP));
 
         // MASK = derived (fake); uses no bare secret wording.
         pushInt(cl, 0x0100FE00);

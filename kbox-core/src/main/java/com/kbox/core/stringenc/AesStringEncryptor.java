@@ -101,6 +101,11 @@ public final class AesStringEncryptor {
      *  the NativeCrypto class (which the packager injects only alongside the blob),
      *  so a no-toolchain build is still safe and byte-identical. */
     private final boolean nativeCrypto;
+    /** Emit the {@code AntiDebug.isTampered()} noise branch in the decryptors.
+     *  Mirrors {@code cfg.isAntiDebug()}: when the user turns the anti-debug
+     *  layer off, a tamper flag set by some other component must not silently
+     *  turn every protected string into mojibake. */
+    private final boolean tamperGate;
     /** Per-thread SecureRandom for thread-safe IV generation in parallel mode. */
     private final ThreadLocal<SecureRandom> rng = ThreadLocal.withInitial(SecureRandom::new);
 
@@ -142,6 +147,7 @@ public final class AesStringEncryptor {
         this.graph = graph;
         this.cfg = cfg;
         this.nativeCrypto = nativeCrypto;
+        this.tamperGate = cfg.isAntiDebug();
     }
 
     /**
@@ -723,9 +729,14 @@ public final class AesStringEncryptor {
         d.add(notCached);
 
         // === anti-tamper: if (AntiDebug.isTampered()) goto noise ===
-        d.add(new MethodInsnNode(Opcodes.INVOKESTATIC, ANTIDEBUG_OWNER, "isTampered", "()Z", false));
+        // Only emitted when the anti-debug layer is enabled for this build; a
+        // disabled layer must not corrupt the application's strings because some
+        // unrelated component flipped the shared tamper flag.
         LabelNode noise = new LabelNode();
-        d.add(new JumpInsnNode(Opcodes.IFNE, noise));
+        if (tamperGate) {
+            d.add(new MethodInsnNode(Opcodes.INVOKESTATIC, ANTIDEBUG_OWNER, "isTampered", "()Z", false));
+            d.add(new JumpInsnNode(Opcodes.IFNE, noise));
+        }
 
         // === try: decrypt body ===
         LabelNode tryStart = new LabelNode();

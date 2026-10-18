@@ -59,6 +59,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+/* P3-15: BfNativeBuilder injects the per-build mapped loader class name before
+ * the source; keep a fallback for manual / legacy builds. */
+#ifndef KBOX_BF_LOADER_CLASS
+#define KBOX_BF_LOADER_CLASS "com/kbox/runtime/BfSecureLoader"
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -429,9 +435,21 @@ static void deriveOpPerm(uint32_t seed, uint32_t rleOff, int p[8]) {
 
 /* The *effective* per-chunk op lookup: input unit byte -> dealt dispatch id
  * (0..7) or -1. Reset per decodeEntryInto against that chunk's own permuted
- * table, so the operator table only ever lives inside native decode memory. */
-static int g_chunkConfigured = 0;
-static signed char g_chunkOp[256];
+ * table, so the operator table only ever lives inside native decode memory.
+ *
+ * 线程局部（P0-1 修复）：这两个变量描述的是"当前正在解码的那个 chunk"，
+ * 而 defineClassFromBF 可以被多个线程并发调用（多线程类加载 / 类初始化）。
+ * 用全局变量时，A 线程刚 configure 完 chunk A，B 线程就把它覆盖成 chunk B，
+ * A 线程随后按 B 的表解释字节 → 括号匹配与执行语义错位 → `i` 被写成
+ * (size_t)-1 后回绕、步数爆炸，实测表现为 0xC0000005 / 无 hs_err 的原生崩溃。
+ */
+#if defined(_MSC_VER)
+#define KBOX_BF_TLS __declspec(thread)
+#else
+#define KBOX_BF_TLS __thread
+#endif
+static KBOX_BF_TLS int g_chunkConfigured = 0;
+static KBOX_BF_TLS signed char g_chunkOp[256];
 
 /* Per-build semantic->handler dispatch permutation: the canonical semantic op
  * a unit decodes to (0..7) is executed by handler slot DISP_TAB[sem]. Each
@@ -811,8 +829,8 @@ static char* rleDecode(const unsigned char* rle, size_t rleLen,
 #define BFH_1() do { tape[ptr]--; } while (0)
 #define BFH_2() do { if (ptr + 1 >= BF_TAPE_SIZE) { fail = 1; } else ptr++; } while (0)
 #define BFH_3() do { if (ptr - 1 < 0) { fail = 1; } else ptr--; } while (0)
-#define BFH_4() do { if (tape[ptr] == 0) i = (size_t)match[i]; } while (0)
-#define BFH_5() do { if (tape[ptr] != 0) i = (size_t)match[i]; } while (0)
+#define BFH_4() do { if (tape[ptr] == 0) { if (match[i] < 0) { fail = 1; } else i = (size_t)match[i]; } } while (0)
+#define BFH_5() do { if (tape[ptr] != 0) { if (match[i] < 0) { fail = 1; } else i = (size_t)match[i]; } } while (0)
 #define BFH_6() do { if (o >= outCap) { fail = 1; } else out[o++] = tape[ptr]; } while (0)
 #define BFH_7() do { tape[ptr] = (pi < padLen) ? pad[pi++] : 0; } while (0)
 #define BFH_CAT2(a, b) a##b
@@ -870,7 +888,9 @@ static int bfRun(const char* bf, size_t bfLen,
     int fail = 0;
     int stepOverflow = 0;
     int64_t steps = 0;
-    const int64_t BF_MAX_STEPS = ((int64_t)1 << 31); /* runaway-loop guard (④) */
+    const int64_t BF_MAX_STEPS = ((int64_t)200000000); /* runaway-loop guard (④)
+        * 原来 1<<31（21 亿步）在一次损坏/错表的解码上等于"界面卡死"，且会长时间
+        * 占住 ClassLoader 锁；降到 2 亿与 Java 侧解释器同量级，坏 chunk 立即失败。 */
     while (i < bfLen) {
         if (++steps > BF_MAX_STEPS) { stepOverflow = 1; break; }
         int op = bfOpIndex((unsigned char)bf[i]);  /* canonical semantic (0..7) or -1 */
@@ -1363,6 +1383,8 @@ static jint JNICALL kbox_bf_init(JNIEnv* env, jclass cls, jbyteArray rle);
 static jint JNICALL kbox_bf_initDirect(JNIEnv* env, jclass cls, jobject buf, jint len);
 static jclass JNICALL kbox_bf_defineClassFromBF(JNIEnv* env, jobject thisLoader, jstring name);
 static jobject JNICALL kbox_bf_getResourceBytes(JNIEnv* env, jobject thisLoader, jstring name);
+static jboolean JNICALL kbox_bf_hasResource(JNIEnv* env, jclass cls, jstring name);
+static jboolean JNICALL kbox_bf_hasClass(JNIEnv* env, jclass cls, jstring name);
 static jboolean JNICALL kbox_bf_probeClassFromBF(JNIEnv* env, jclass cls, jstring name);
 static void JNICALL kbox_bf_wipe(JNIEnv* env, jclass cls);
 static void JNICALL kbox_bf_wipeResource(JNIEnv* env, jclass cls, jobject buf);
@@ -1395,6 +1417,8 @@ static const JNINativeMethod kbox_bf_methods[] = {
     { "initDirect",        "(Ljava/nio/ByteBuffer;I)I",      (void*)kbox_bf_initDirect },
     { "defineClassFromBFImpl", "(Ljava/lang/String;)Ljava/lang/Class;", (void*)kbox_bf_defineClassFromBF },
     { "getResourceBytes",  "(Ljava/lang/String;)Ljava/nio/ByteBuffer;", (void*)kbox_bf_getResourceBytes },
+    { "hasResource",       "(Ljava/lang/String;)Z",          (void*)kbox_bf_hasResource },
+    { "hasClass",          "(Ljava/lang/String;)Z",          (void*)kbox_bf_hasClass },
     { "probeClassFromBF",  "(Ljava/lang/String;)Z",          (void*)kbox_bf_probeClassFromBF },
     { "wipe",              "()V",                            (void*)kbox_bf_wipe },
     { "wipeResource",      "(Ljava/nio/ByteBuffer;)V",       (void*)kbox_bf_wipeResource },
@@ -1421,7 +1445,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_8) != JNI_OK || env == NULL) {
         return JNI_ERR;
     }
-    jclass cls = (*env)->FindClass(env, "com/kbox/runtime/BfSecureLoader");
+    /* P3-15: the loader class is renamed per build; BfNativeBuilder injects
+     * KBOX_BF_LOADER_CLASS with the mapped internal name. The fallback keeps
+     * manual/legacy builds working. */
+    jclass cls = (*env)->FindClass(env, KBOX_BF_LOADER_CLASS);
     if (cls == NULL) {
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         return JNI_ERR;
@@ -1787,6 +1814,80 @@ static jobject JNICALL kbox_bf_getResourceBytes
     (JNIEnv* env, jobject thisLoader, jstring name) {
     rleProtect(1);
     jobject r = kbox_getResourceImpl(env, thisLoader, name);
+    rleProtect(0);
+    return r;
+}
+
+/* boolean BfSecureLoader.hasResource(String name) — PURE index lookup: no
+ * decode, no copy, no plaintext window. Lets the Java side implement
+ * ClassLoader.findResource() (which is what ServiceLoader / Class.getResource /
+ * getResources use) without materialising the bytes first. Class bytecode stays
+ * fail-closed exactly like getResourceBytes: a ".class" name is never reported. */
+static jboolean kbox_hasResourceImpl(JNIEnv* env, jobject thisLoader, jstring name) {
+    (void)thisLoader;
+    /* NO kbox_gateCheck() here on purpose: this is a read-only index lookup
+     * (the caller already knows the name) that hands out no plaintext, and the
+     * gate performs module/JVMTI/debugger probes that would run on every
+     * ClassLoader.findResource call. */
+    if (g_state.rle == NULL || !g_state.indexOk) {
+        if (indexParse() != 0) return JNI_FALSE;
+    }
+    if (name == NULL) return JNI_FALSE;
+    const char* nameStr = (*env)->GetStringUTFChars(env, name, NULL);
+    if (nameStr == NULL) return JNI_FALSE;
+    size_t nl = strlen(nameStr);
+    if (nl > 6 && memcmp(nameStr + nl - 6, ".class", 6) == 0) {
+        (*env)->ReleaseStringUTFChars(env, name, nameStr);
+        return JNI_FALSE;
+    }
+    jboolean has = (indexFind(&g_res, nameStr) != NULL) ? JNI_TRUE : JNI_FALSE;
+    (*env)->ReleaseStringUTFChars(env, name, nameStr);
+    return has;
+}
+
+static jboolean JNICALL kbox_bf_hasResource
+    (JNIEnv* env, jclass cls, jstring name) {
+    (void)cls;
+    rleProtect(1);
+    jboolean r = kbox_hasResourceImpl(env, NULL, name);
+    rleProtect(0);
+    return r;
+}
+
+/* boolean BfSecureLoader.hasClass(String name) — PURE class-index lookup (no
+ * decode, no define). Used by the child-first loadClass policy so a blob class
+ * is always defined by BfSecureLoader itself, even when the jar also ships a
+ * plaintext entry stub with the same name (`java -cp ... <MainClass>`).
+ * Accepts both "a/b/C" and "a/b/C.class". */
+static jboolean kbox_hasClassImpl(JNIEnv* env, jstring name) {
+    /* No gate check: pure index lookup, no plaintext handed over (see
+     * kbox_hasResourceImpl). The real define path still gates per class. */
+    if (g_state.rle == NULL || !g_state.indexOk) {
+        if (indexParse() != 0) return JNI_FALSE;
+    }
+    if (name == NULL) return JNI_FALSE;
+    const char* nameStr = (*env)->GetStringUTFChars(env, name, NULL);
+    if (nameStr == NULL) return JNI_FALSE;
+    size_t nl = strlen(nameStr);
+    if (nl > 6 && memcmp(nameStr + nl - 6, ".class", 6) == 0) nl -= 6;
+    jboolean has = JNI_FALSE;
+    if (g_classes.n > 0 && g_classes.e != NULL) {
+        for (int i = 0; i < g_classes.n; i++) {
+            if (g_classes.e[i].nameLen == (int)nl &&
+                memcmp(g_classes.e[i].name, nameStr, nl) == 0) {
+                has = JNI_TRUE;
+                break;
+            }
+        }
+    }
+    (*env)->ReleaseStringUTFChars(env, name, nameStr);
+    return has;
+}
+
+static jboolean JNICALL kbox_bf_hasClass(JNIEnv* env, jclass cls, jstring name) {
+    (void)cls;
+    rleProtect(1);
+    jboolean r = kbox_hasClassImpl(env, name);
     rleProtect(0);
     return r;
 }

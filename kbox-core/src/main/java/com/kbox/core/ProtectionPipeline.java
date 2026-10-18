@@ -88,37 +88,25 @@ public final class ProtectionPipeline {
         // A standalone opt-in scheme (防内存Dump / 防静态分析): the whole output
         // jar is converted to classes.bf.rle (with an embedded name->(offset,len)
         // index header parsed only in native memory) and reassembled in native
-        // memory at startup. It replaces the jar layout, so every feature that
-        // depends on plain loadable classes / a guard loader is incompatible and
-        // is forced off here (the Java-level passes — control flow, strings,
-        // renaming, anti-decompiler — stay fully active).
-        // NOTE: these flags are restored if the BF mode later degrades (library/
-        // mod/Spring Boot input), so a degraded run keeps full class/resource
-        // protection.
-        final boolean wantClassEnc = cfg.isEncryptClasses();
-        final boolean wantResObf = cfg.isObfuscateResources();
-        if (cfg.isBrainfuckLoader()) {
-            if (cfg.isEncryptClasses()) {
-                cfg.setEncryptClasses(false);
-                KBoxLog.info(TAG, "  [BF] encryptClasses forced off (classes live in the BF blob)");
-            }
-            if (cfg.isObfuscateResources()) {
-                cfg.setObfuscateResources(false);
-                KBoxLog.info(TAG, "  [BF] obfuscateResources forced off (resources live in the BF blob)");
-            }
-            // VMP and JNIC are now BF-coexistent:
-            //  - VMP: its runtime (VmpInterpreter/VmpMethod/ChaCha20/HardwareKeyRing)
-            //    is injected as PLAIN jar entries resolvable via BfSecureLoader's
-            //    parent loader; VMP-translated blob classes call into them directly.
-            //  - JNIC: its native lib ships as META-INF/kbox/jnic.bin (NOT native.bin,
-            //    which holds the BF decoder); BfSecureLoader loads it and registers
-            //    natives per class via NativeLoader.registerNatives0(Class).
-            // We keep them enabled and let BfSecureLoader drive their runtime setup.
-        }
+        // memory at startup. The Java-level passes — control flow, strings,
+        // renaming, anti-decompiler — stay fully active.
+        //
+        // P1-7: the blob is the ONLY carrier of class bytes / resource bodies,
+        // so class-body encryption and resource renaming are SUBSUMED, not
+        // "forced off": the user's encryptClasses / obfuscateResources values are
+        // left untouched (they are reported as covered by the blob) and the
+        // corresponding passes are skipped through isBfBlobActive().
+        // VMP and JNIC are BF-coexistent:
+        //  - VMP: its runtime (VmpInterpreter/VmpMethod/ChaCha20/HardwareKeyRing)
+        //    is injected as PLAIN jar entries resolvable via BfSecureLoader's
+        //    parent loader; VMP-translated blob classes call into them directly.
+        //  - JNIC: its native lib ships as META-INF/kbox/jnic.bin (NOT native.bin,
+        //    which holds the BF decoder); BfSecureLoader loads it and registers
+        //    natives per class via NativeLoader.registerNatives0(Class).
 
         long startMs = System.currentTimeMillis();
         KBoxLog.info(TAG, "========================================================");
-        KBoxLog.info(TAG, "KBox Obfuscator — ZKM-level + JNIC + VMP protection");
+        KBoxLog.info(TAG, "KBox Obfuscator — Java application protection");
         KBoxLog.info(TAG, "========================================================");
         KBoxLog.info(TAG, "Input jar:  " + inputJar);
         KBoxLog.info(TAG, "Output jar: " + outputJar);
@@ -140,6 +128,33 @@ public final class ProtectionPipeline {
         KBoxLog.progress(100, "Loaded " + totalClasses + " classes, "
                 + totalResources + " resources (" + analyzeMs + "ms)");
         KBoxLog.info(TAG, "  Classes: " + totalClasses);
+
+        // P2-9: explicit entry point (--main-class / mainClass=). It overrides the
+        // manifest Main-Class / Start-Class so that (a) inputs without a
+        // Main-Class, launched via `java -cp <jar> <class>`, get a real entry and
+        // (b) the packer can emit an Original-Main-Class + `-cp` entry stub.
+        if (cfg.getMainClass() != null) {
+            if (graph.isSpringBootFatJar()) {
+                graph.setManifestStartClass(cfg.getMainClass());
+            } else {
+                graph.setManifestMainClass(cfg.getMainClass());
+            }
+            KBoxLog.info(TAG, "  Entry point override: " + cfg.getMainClass());
+        }
+
+        // P2-11: multi-release jar support. Versioned copies under
+        // META-INF/versions/N/ ship raw (the JVM resolves them by CLASS NAME, so
+        // rewriting their path would hide them), which in turn requires the base
+        // class to keep its original name.
+        if (!graph.getMultiReleaseClasses().isEmpty()) {
+            int mrCount = 0;
+            for (String c : graph.getMultiReleaseClasses()) {
+                cfg.getKeepPrefixes().add(c.replace('/', '.'));
+                mrCount++;
+            }
+            KBoxLog.info(TAG, "  Multi-release jar: " + mrCount + " base class(es) kept "
+                    + "un-renamed (META-INF/versions/N copies ship raw)");
+        }
 
         // Self-obfuscation guard: when the input jar IS this obfuscator itself
         // (it carries kbox-core), class-body encryption and resource renaming
@@ -200,72 +215,89 @@ public final class ProtectionPipeline {
         }
 
         // Brainfuck chaos mode suitability guards (need the analyzed graph).
-        // When the input cannot be bootstrapped by BfSecureLoader (no Main-Class,
-        // Spring Boot fat jar, or a loader-scanning mod), we GRACEFULLY DEGRADE to
-        // non-BF full protection instead of failing the whole build: rename +
-        // strings + VMP + JNIC + BFVM + BrainfuckShield + Shield all stay active,
-        // only the Brainfuck-RLE blob loader is skipped. This honors neverFail=true
-        // so library/mod inputs (a legitimate category) are never hard-blocked.
+        //
+        // P1-6: the old guard degraded the WHOLE BF loader for every
+        // non-standalone input, even when a supported path existed. Now:
+        //  - MC mods (fabric.mod.json / mods.toml / neoforge.mods.toml /
+        //    TweakClass) AUTO-ENABLE hybrid mode (was opt-in, so the degrade
+        //    branch was the only reachable one by default) and never degrade.
+        //    Hybrid keeps the loader-critical surface plaintext while the rest
+        //    lives in the blob, so it works with or without a Main-Class.
+        //  - Spring Boot fat jars keep the boot layout: Main-Class stays the
+        //    boot launcher, Start-Class becomes BfSecureLoader (injected under
+        //    BOOT-INF/classes/) and nested BOOT-INF/lib/*.jar stay plaintext.
+        //  - Inputs without a Main-Class use --main-class (cfg.mainClass) or a
+        //    UNIQUE public static void main(String[]) as the entry point.
+        //  - JNIC/VMP no longer degrade: the 0xC0000005 they used to trigger was
+        //    the decoder's non-TLS scratch state (g_chunkOp), fixed in
+        //    kbox_bf_loader.c; both are documented BF-coexistent (see above).
+        // Only an input with no discoverable entry point degrades.
         if (cfg.isBrainfuckLoader()) {
             KBoxLog.stage(++stage, TOTAL_STAGES, "Brainfuck chaos (防内存Dump)");
-            String reason = null;
-            boolean mcMod = false;
-            if (graph.getResources().containsKey("fabric.mod.json")
+            boolean mcMeta = graph.getResources().containsKey("fabric.mod.json")
                     || graph.getResources().containsKey("META-INF/mods.toml")
-                    || graph.getResources().containsKey("META-INF/neoforge.mods.toml")) {
-                // MC metadata checked FIRST: a Fabric/Forge mod often ships no
-                // Main-Class at all, and hybrid mode must be reachable for it
-                // (the loader discovers the mod via metadata, not Main-Class).
-                mcMod = true;
-                reason = "MC mod loader metadata present (fabric.mod.json / mods.toml / "
-                        + "neoforge.mods.toml — the loader reads these + the entry classes "
-                        + "straight from the jar; a single opaque Brainfuck payload is "
-                        + "incompatible, keep + string/VMP/JNIC protection still apply)";
-            } else if (graph.getManifestMainClass() == null) {
-                reason = "input jar has no Main-Class (library / mod / plugin — "
-                        + "not a standalone executable jar)";
-            } else if (graph.isSpringBootFatJar()) {
-                reason = "Spring Boot fat jar (nested BOOT-INF/lib jars cannot be hidden)";
-            } else if (graph.getManifest() != null && new String(
-                    graph.getManifest(), StandardCharsets.UTF_8).contains("TweakClass:")) {
-                // Forge/Fabric (incl. 1.8.9 launcher-wrapper mods) load through a
-                // TweakClass and scan raw jar bytes. Mark as mcMod so the HYBRID
-                // path (metadata / entry classes / mixin package stay plaintext)
-                // is reachable instead of an unconditional degrade.
-                mcMod = true;
-                reason = "Forge/Fabric mod loader detected (TweakClass — loader scans raw jar bytes)";
+                    || graph.getResources().containsKey("META-INF/neoforge.mods.toml")
+                    || graph.getResources().containsKey("mcmod.info");
+            boolean tweak = graph.getManifest() != null && new String(
+                    graph.getManifest(), StandardCharsets.UTF_8).contains("TweakClass:");
+            String entry = resolveEntryPoint(cfg, graph);
+            String reason = null;
+            if (mcMeta) {
+                // A mod jar: the host mod loader defines every mod class from the
+                // jar itself. Hybrid mode would keep the mod classes plaintext but
+                // hide the engine classes they now reference (VmpInterpreter,
+                // JnicIndy, ...) in the blob, which the host loader cannot see ->
+                // NoClassDefFoundError during mod construction.
+                reason = "mod jar (the host mod loader owns class loading)";
+            } else if (tweak) {
+                if (!cfg.isBrainfuckMcHybrid()) {
+                    cfg.setBrainfuckMcHybrid(true);
+                    KBoxLog.info(TAG, "  [BF] MC " + (mcMeta ? "loader metadata" : "TweakClass")
+                            + " detected — HYBRID mode auto-enabled: loader metadata / entry "
+                            + "classes / mixin package stay plaintext, the rest hides in the blob");
+                }
+            } else if (entry == null) {
+                reason = "no entry point (no Main-Class / Start-Class, no --main-class, "
+                        + "and no unique public static void main(String[]))";
             }
-            if (mcMod && cfg.isBrainfuckMcHybrid()) {
-                // BF-MC hybrid (opt-in): keep the RLE blob for the bulk of the
-                // classes but preserve the loader-critical surface as plaintext
-                // (metadata + entry classes + mixin package). The packer detects
-                // the loader again and splits the jar accordingly; BfSecureLoader
-                // is attached from each entry class' <clinit>.
-                KBoxLog.info(TAG, "  [BF] MC-mod HYBRID mode: loader metadata / entry "
-                        + "classes / mixin package stay plaintext; remaining classes "
-                        + "hide inside the Brainfuck-RLE blob. (Only classes reachable "
-                        + "from the plaintext entry surface can resolve blob classes.)");
-                // Class-encryption / resource-obfuscation stay force-disabled: the
-                // blob replaces the jar layout either way in BF mode.
-            } else if (reason != null) {
+            if (reason == null) {
+                cfg.setBfBlobActive(true);
+                if (entry != null && graph.getManifestMainClass() == null
+                        && !graph.isSpringBootFatJar()) {
+                    // No manifest entry: record the discovered/declared one so the
+                    // packer can emit Original-Main-Class (and an entry stub).
+                    graph.setManifestMainClass(entry);
+                }
+                KBoxLog.info(TAG, "  [BF] protecting " + totalClasses + " classes inside "
+                        + "a Brainfuck-RLE payload (no plain class bytes on disk)"
+                        + (graph.isSpringBootFatJar()
+                            ? " [Spring Boot: BOOT-INF layout preserved]" : ""));
+                if (cfg.isEncryptClasses() || cfg.isObfuscateResources()) {
+                    KBoxLog.info(TAG, "  [BF] encryptClasses=" + cfg.isEncryptClasses()
+                            + ", obfuscateResources=" + cfg.isObfuscateResources()
+                            + " kept as configured — both are subsumed by the BF blob "
+                            + "(a second layer would be unreadable at runtime)");
+                }
+            } else {
                 KBoxLog.warn(TAG, "  [BF] Brainfuck mode incompatible: " + reason);
                 KBoxLog.warn(TAG, "  [BF] Degrading to non-BF full protection "
                         + "(rename+strings+VMP+JNIC+BFVM+BrainfuckShield+Shield remain active). "
                         + "Set brainfuckLoader=false to silence this.");
                 cfg.setBrainfuckLoader(false);
-                // Restore class-encryption / resource-obfuscation that were
-                // force-disabled earlier only because the BF blob replaces the
-                // jar layout — in degraded non-BF mode they are compatible again.
-                if (wantClassEnc) {
-                    cfg.setEncryptClasses(true);
-                }
-                if (wantResObf) {
-                    cfg.setObfuscateResources(true);
-                }
-            } else {
-                KBoxLog.info(TAG, "  [BF] protecting " + totalClasses + " classes inside "
-                        + "a Brainfuck-RLE payload (no plain class bytes on disk)");
             }
+        }
+
+        // P3-15: per-build rename map for the BF runtime surface. Generated AFTER
+        // the BF suitability decision (a degraded run no longer needs it, but VMP/
+        // BFVM still inject BfInterpreter/bfvm, so they also opt in). Skipped for
+        // self-obfuscation: the engine's own graph already contains these classes
+        // and renaming only the injected copies would desync blob references.
+        if (!selfObfuscation
+                && (cfg.isBrainfuckLoader() || cfg.isEnableVmp() || cfg.isEnableBfvm())) {
+            cfg.setRuntimeRenameMap(com.kbox.core.packaging.RuntimeRename.build(
+                    new java.security.SecureRandom()));
+            KBoxLog.debug(TAG, "  BF runtime rename map installed ("
+                    + cfg.getRuntimeRenameMap().size() + " classes)");
         }
 
         // ---- Stage 1a: Auto Minecraft mod adaptation (explicit opt-in) ----
@@ -431,7 +463,7 @@ public final class ProtectionPipeline {
             allFindings.addAll(stackResult.findings);
         }
 
-        // ---- 商业级适配性验收报告：四支柱 + 现代技术栈 + JDK 8..25 + 10 年来源矩阵。----
+        // ---- 适配性验收报告：四支柱 + 现代技术栈 + JDK 8..25 + 来源类别矩阵。----
         // 汇总 SilentShield 发现 + ModernStackAdapter 结果，输出供合规审查的验收报告。
         if ((cfg.getAdaptabilityReport() != null || cfg.getSilentShieldReport() != null)
                 && stackResult != null) {
@@ -484,7 +516,7 @@ public final class ProtectionPipeline {
         KBoxLog.stage(++stage, TOTAL_STAGES, "Auto JNIC/VMP method selection");
         new com.kbox.core.analysis.AutoJnicVmpSelector(graph, cfg).select();
 
-        // ---- Stage 6: Control-flow obfuscation (ZKM-style) ----
+        // ---- Stage 6: Control-flow obfuscation ----
         // Must run BEFORE JNIC so the obfuscated Java is what gets translated
         // to C. Also runs before VMP so VMP-dispatched code is already obscured.
         KBoxLog.stage(++stage, TOTAL_STAGES, "Control-flow obfuscation");
@@ -508,6 +540,9 @@ public final class ProtectionPipeline {
         // semantic metadata useful to reverse engineers.
         KBoxLog.stage(++stage, TOTAL_STAGES, "Annotation erasure");
         new com.kbox.core.obfu.AnnotationEraser(graph, cfg).apply();
+        // 元数据擦除：SourceFile/LineNumberTable/LVT/MethodParameters（+可选 Signature/
+        // InnerClasses/EnclosingMethod）。不擦 SourceFile 时"改名"可被 100% 反查原名。
+        new com.kbox.core.obfu.DebugMetadataEraser(graph, cfg).apply();
 
         // ---- Stage 6d: Call-graph hiding ----
         // Injects dead-code decoy calls to obscure the true call graph.
@@ -599,6 +634,18 @@ public final class ProtectionPipeline {
                         try {
                             ClassNode remapped = nameObfuscator.apply(e.getValue());
                             remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
+                        } catch (Throwable t) {
+                            // NEVER drop a class: a remap failure used to kill the
+                            // whole future-wait loop (pool.shutdownNow aborted the
+                            // rest), so classes vanished from the jar and the app
+                            // died with ClassNotFoundException at startup.
+                            StringBuilder tb = new StringBuilder();
+                            for (int fi = 0; fi < Math.min(6, t.getStackTrace().length); fi++) {
+                                tb.append(" | ").append(t.getStackTrace()[fi]);
+                            }
+                            KBoxLog.warn(TAG, "Rename failed for " + e.getKey() + " (" + t
+                                    + tb + ") — keeping the original class");
+                            remappedClasses.put(e.getKey(), e.getValue());
                         } finally {
                             int d = renameDone.incrementAndGet();
                             if (renameTotal > 100 && d % (renameTotal / 10 + 1) == 0) {
@@ -608,20 +655,30 @@ public final class ProtectionPipeline {
                         }
                     }));
                 }
-                for (java.util.concurrent.Future<?> f : renameFutures) f.get();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                KBoxLog.warn(TAG, "Parallel remap interrupted: " + ie.getMessage());
-            } catch (java.util.concurrent.ExecutionException ee) {
-                KBoxLog.warn(TAG, "Parallel remap failed for a class: " + ee.getMessage());
+                for (java.util.concurrent.Future<?> f : renameFutures) {
+                    try {
+                        f.get();
+                    } catch (java.util.concurrent.ExecutionException ee) {
+                        KBoxLog.warn(TAG, "Rename task failed: " + ee.getCause());
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             } finally {
                 pool.shutdownNow();
             }
         } else {
             int renameIdx = 0;
             for (Map.Entry<String, ClassNode> e : allClasses) {
-                ClassNode remapped = nameObfuscator.apply(e.getValue());
-                remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
+                try {
+                    ClassNode remapped = nameObfuscator.apply(e.getValue());
+                    remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
+                } catch (Throwable t) {
+                    KBoxLog.warn(TAG, "Rename failed for " + e.getKey() + " (" + t
+                            + ") — keeping the original class");
+                    remappedClasses.put(e.getKey(), e.getValue());
+                }
                 renameIdx++;
                 if (renameTotal > 100 && renameIdx % (renameTotal / 10 + 1) == 0) {
                     KBoxLog.progress(33 + (66 * renameIdx / renameTotal),
@@ -631,6 +688,11 @@ public final class ProtectionPipeline {
         }
         graph.getClasses().clear();
         graph.getClasses().putAll(remappedClasses);
+        if (graph.getClasses().size() < renameTotal) {
+            KBoxLog.warn(TAG, "RENAME LOST CLASSES: " + (renameTotal - graph.getClasses().size())
+                    + " of " + renameTotal + " disappeared during the remap stage — "
+                    + "the output would fail with ClassNotFoundException");
+        }
         KBoxLog.progress(100, "All classes remapped (" + renameTotal + " total)");
 
         // Remap JNIC/VMP method keys to use renamed class names so
@@ -671,7 +733,15 @@ public final class ProtectionPipeline {
 
         // ---- Stage 8: String encryption ----
         KBoxLog.stage(++stage, TOTAL_STAGES, "String encryption");
-        if (cfg.getStringEncryptionStrength() >= 3) {
+        // NOTE: the AES branch MUST be gated on cfg.isEncryptStrings(). The strength
+        // knob defaults to 3, so `strength >= 3` alone made the AES string encryption
+        // run even when the user had turned string encryption OFF — which then
+        // referenced runtime classes (AntiDebug / HardwareKeyRing / KbnlKey) that the
+        // packager only injects for isEncryptStrings() builds, so packaging aborted
+        // ("would reference N missing KBox runtime class(es)") or the protected jar
+        // died at run time with NoClassDefFoundError. This is exactly how the HTML
+        // UI's default job failed.
+        if (cfg.isEncryptStrings() && cfg.getStringEncryptionStrength() >= 3) {
             KBoxLog.info(TAG, "  Mode: AES-256-CTR (per-string IV, centralized decryptor, lazy cache"
                     + (nativeCryptoBlob != null ? ", native-decrypt sink" : "") + ")");
             // Native string-decrypt sink: when the native crypto layer is present the
@@ -772,11 +842,39 @@ public final class ProtectionPipeline {
         // (com.kbox.runtime.bfvm). Runs AFTER every other body-mutating pass so the
         // virtualized form is final; methods claimed by VMP/JNIC, ctors and bodies BFVM
         // cannot translate are skipped and keep their current obfuscated body.
-        if (cfg.isEnableBfvm() && !cfg.getBfvmMethods().isEmpty()) {
+        com.kbox.core.bfvm.BfvmMethodInjector.Result bfvmResult = null;
+        if (cfg.isEnableBfvm()) {
+            // P1-4：未显式点名时自动选方法（enableBfvm 单独打开也有意义）。
+            java.util.Set<String> bfvmTargets = cfg.getBfvmMethods();
+            if (bfvmTargets == null || bfvmTargets.isEmpty()) {
+                bfvmTargets = com.kbox.core.bfvm.BfvmMethodInjector.autoSelect(
+                        graph, cfg, cfg.getVmpMethods(), cfg.getNativeMethods(), 1500);
+                KBoxLog.info(TAG, "  BFVM auto-select: " + bfvmTargets.size() + " candidate method(s)");
+            }
             KBoxLog.stage(++stage, TOTAL_STAGES, "BFVM full method virtualization");
-            new com.kbox.core.bfvm.BfvmMethodInjector(
-                    cfg.getBfvmMethods(), cfg.getVmpMethods(), cfg.getNativeMethods())
+            bfvmResult = new com.kbox.core.bfvm.BfvmMethodInjector(
+                    bfvmTargets, cfg.getVmpMethods(), cfg.getNativeMethods())
                     .apply(graph);
+        }
+
+        // ---- Stage 9d: K-OTP one-time programs (native-seeded) ----
+        // 自写方案：把尚未被 BFVM/VMP/JNIC 认领的方法体编译成 BFVM 指令流，用
+        // JNIC 原生库内隐藏的构建种子加密成 share 写入类文件；运行期还原 → 执行 →
+        // 用运行期熵就地重随机。静态产物中没有稳定可反编译的方法体。
+        if (cfg.isEnableOtp()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "K-OTP one-time programs");
+            // Engine classes (honeypots / shield / runtime) must never be OTP'd.
+            // They may have been renamed into a random package (renamePackages),
+            // so resolve their FINAL names from the original com/kbox/ keys.
+            java.util.Set<String> engineFinal = new java.util.LinkedHashSet<>();
+            for (Map.Entry<String, String> en : classMap.entrySet()) {
+                if (en.getKey().startsWith("com/kbox/")) engineFinal.add(en.getValue());
+            }
+            new com.kbox.core.otp.OtpMethodInjector(
+                    graph, cfg, cfg.getVmpMethods(), cfg.getNativeMethods(),
+                    bfvmResult == null ? null : new java.util.LinkedHashSet<>(bfvmResult.transformed),
+                    engineFinal)
+                    .apply();
         }
 
         // Mark CF-modified classes: any non-library class whose bytecode was
@@ -798,7 +896,7 @@ public final class ProtectionPipeline {
         KBoxLog.stage(++stage, TOTAL_STAGES, "Resource obfuscation (rename + encrypt)");
         ResourceMapping resMapping = null;
         byte[] resSeed = null;
-        if (cfg.isObfuscateResources()) {
+        if (cfg.isObfuscateResources() && !cfg.isBfBlobActive()) {
             // Forge/FML uses its own LaunchWrapper ClassLoader chain which
             // bypasses KBox's ResourceGuardClassLoader. Obfuscated resource
             // paths cannot be resolved, leading to NPE at runtime when
@@ -817,6 +915,9 @@ public final class ProtectionPipeline {
                 new ResourceEncryptor(graph, cfg, resSeed).apply(resMapping);
                 KBoxLog.progress(100, "Resource obfuscation complete");
             }
+        } else if (cfg.isObfuscateResources()) {
+            KBoxLog.info(TAG, "  Resource obfuscation subsumed by the BF blob "
+                    + "(resources are packed into the RLE payload, not left readable)");
         } else {
             KBoxLog.info(TAG, "  Resource obfuscation disabled, skipping");
         }
@@ -850,7 +951,7 @@ public final class ProtectionPipeline {
             com.kbox.core.brainfuck.BfSymbolSet bfSym =
                     com.kbox.core.brainfuck.BfSymbolSet.random();
             byte[] bfNativeBlob = com.kbox.core.brainfuck.BfNativeBuilder
-                    .build(workDir, cfg.getCc(), bfSym).packedBlob;
+                    .build(workDir, cfg.getCc(), bfSym, cfg.getRuntimeRenameMap()).packedBlob;
             Packager packager = new Packager();
             packager.writeBrainfuck(inputJar, outputJar, graph, mapping,
                     bfNativeBlob, jnicResult.packedBlob, cfg, bfSym, vmpBlob,
@@ -881,6 +982,32 @@ public final class ProtectionPipeline {
         KBoxLog.complete("Done in " + (totalMs / 1000.0) + "s — " + totalClasses + " classes protected");
     }
 
+    /** Resolves the application entry point: explicit override → manifest
+     *  Main-Class → Spring Boot Start-Class → the single
+     *  {@code public static void main(String[])} in the graph. Returns
+     *  {@code null} when there is none or the scan is ambiguous (the caller then
+     *  needs {@code --main-class}). */
+    private static String resolveEntryPoint(ProtectionConfig cfg, ClassGraph graph) {
+        if (cfg.getMainClass() != null) return cfg.getMainClass();
+        String m = graph.getManifestMainClass();
+        if (m == null) m = graph.getManifestStartClass();
+        if (m != null) return m;
+        String found = null;
+        for (java.util.Map.Entry<String, org.objectweb.asm.tree.ClassNode> e
+                : graph.getClasses().entrySet()) {
+            org.objectweb.asm.tree.ClassNode cn = e.getValue();
+            if ((cn.access & org.objectweb.asm.Opcodes.ACC_PUBLIC) == 0) continue;
+            for (org.objectweb.asm.tree.MethodNode mn : cn.methods) {
+                if (!"main".equals(mn.name) || !"([Ljava/lang/String;)V".equals(mn.desc)) continue;
+                int need = org.objectweb.asm.Opcodes.ACC_STATIC | org.objectweb.asm.Opcodes.ACC_PUBLIC;
+                if ((mn.access & need) != need) continue;
+                if (found != null) return null;   // ambiguous → require --main-class
+                found = cn.name.replace('/', '.');
+            }
+        }
+        return found;
+    }
+
     /** Prints a summary of which features are enabled/disabled. */
     private void printFeatureSummary() {
         KBoxLog.info(TAG, "Feature summary:");
@@ -890,14 +1017,19 @@ public final class ProtectionPipeline {
         KBoxLog.info(TAG, "  [x] Control-flow obf:       " + cfg.isObfuscateControlFlow()
                 + " (strength=" + cfg.getControlFlowStrength() + ")");
         KBoxLog.info(TAG, "  [x] Class encryption:       " + cfg.isEncryptClasses()
-                + (cfg.isEncryptClasses() ? " (AES-256-GCM, anti-dump)" : ""));
+                + (cfg.isEncryptClasses()
+                    ? (cfg.isBrainfuckLoader() ? " (subsumed by BF blob)"
+                                               : " (AES-256-GCM, anti-dump)")
+                    : ""));
         KBoxLog.info(TAG, "  [x] VMP:                    " + cfg.isEnableVmp());
         KBoxLog.info(TAG, "  [x] BFVM (full BF VM):     " + cfg.isEnableBfvm()
                 + (cfg.isEnableBfvm() ? " (" + cfg.getBfvmMethods().size() + " methods)" : ""));
         KBoxLog.info(TAG, "  [x] BrainfuckShield(2nd VM):" + cfg.isBrainfuckShield()
                 + (cfg.isBrainfuckShield() ? " (tape-dialect L3, level=" + cfg.getBrainfuckShieldLevel() + ")" : ""));
         KBoxLog.info(TAG, "  [x] JNIC:                   " + cfg.isEnableJnic());
-        KBoxLog.info(TAG, "  [x] Resource obfuscation:   " + cfg.isObfuscateResources());
+        KBoxLog.info(TAG, "  [x] Resource obfuscation:   " + cfg.isObfuscateResources()
+                + (cfg.isObfuscateResources() && cfg.isBrainfuckLoader()
+                    ? " (subsumed by BF blob)" : ""));
         KBoxLog.info(TAG, "  [x] Kotlin metadata fix:   " + cfg.isFixKotlinMetadata());
         KBoxLog.info(TAG, "  [x] Anti-decompiler level: " + cfg.getAntiDecompilerLevel()
                 + (cfg.getAntiDecompilerLevel() >= 3 ? " (max: goto-chain+ex-bomb+inner-cycle+cp-bomb)"

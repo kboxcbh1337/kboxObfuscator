@@ -331,21 +331,22 @@ final class Flattener {
         int h = 0;
         for (int i = 0; i < total; i++) {
             if (isBlockStart[i] && h != 0) {
-                return isJumpTarget[i] ? "non-empty-stack" : "fall-thru-stack";
+                return (isJumpTarget[i] ? "non-empty-stack@" : "fall-thru-stack@") + i
+                        + ":op" + insns[i].getOpcode() + ":h" + h;
             }
             int e = stackEffect(insns[i]);
             h += e;
-            if (h < 0) return "stack-underflow";
+            if (h < 0) return "stack-underflow@" + i + ":op" + insns[i].getOpcode();
             AbstractInsnNode n = insns[i];
             if (n instanceof JumpInsnNode) {
                 int op = n.getOpcode();
                 if (op == Opcodes.GOTO) {
                     // GOTO transfers the whole stack; successor must be empty.
-                    if (h != 0) return "fall-thru-stack";
+                    if (h != 0) return "fall-thru-stack@" + i + ":goto:h" + h;
                 } else if (op != Opcodes.JSR) {
                     // Conditional: pops its condition on BOTH paths; successors
                     // (target + fall-through) must both be empty.
-                    if (h != 0) return "non-empty-stack";
+                    if (h != 0) return "non-empty-stack@" + i + ":cond:h" + h;
                 }
             }
         }
@@ -365,8 +366,11 @@ final class Flattener {
             case Opcodes.ICONST_1: case Opcodes.ICONST_2: case Opcodes.ICONST_3:
             case Opcodes.ICONST_4: case Opcodes.ICONST_5: case Opcodes.BIPUSH:
             case Opcodes.SIPUSH: case Opcodes.FCONST_0: case Opcodes.FCONST_1:
-            case Opcodes.FCONST_2: case Opcodes.NEW: case Opcodes.NEWARRAY:
+            case Opcodes.FCONST_2: case Opcodes.NEW:
                 return 1;
+            // NEWARRAY pops the element count and pushes the array reference.
+            case Opcodes.NEWARRAY:
+                return 0;
             case Opcodes.LCONST_0: case Opcodes.LCONST_1: case Opcodes.DCONST_0:
             case Opcodes.DCONST_1:
                 return 2;
@@ -444,6 +448,19 @@ final class Flattener {
                 break;
         }
         if (n instanceof VarInsnNode) {
+            // Short forms (raw opcodes 26..45 loads / 59..78 stores) are
+            // normalized to the generic opcodes by ASM's ClassReader, but a
+            // MethodNode built by another pass may still carry them. Groups of
+            // four: I, L, F, D, A; L and D occupy two slots. ASM's Opcodes
+            // interface does not export named constants for these.
+            if (op >= 26 && op <= 45) {
+                int g = (op - 26) / 4;
+                return (g == 1 || g == 3) ? 2 : 1;
+            }
+            if (op >= 59 && op <= 78) {
+                int g = (op - 59) / 4;
+                return (g == 1 || g == 3) ? -2 : -1;
+            }
             switch (op) {
                 case Opcodes.ILOAD: case Opcodes.FLOAD: case Opcodes.ALOAD: return 1;
                 case Opcodes.LLOAD: case Opcodes.DLOAD: return 2;
@@ -474,16 +491,23 @@ final class Flattener {
             }
         }
         if (n instanceof MethodInsnNode || n instanceof InvokeDynamicInsnNode) {
-            int v = Type.getArgumentsAndReturnSizes(
-                    (n instanceof MethodInsnNode)
-                            ? ((MethodInsnNode) n).desc
-                            : ((InvokeDynamicInsnNode) n).desc);
-            int argSlots = v >>> 2;
+            String desc = (n instanceof MethodInsnNode)
+                    ? ((MethodInsnNode) n).desc
+                    : ((InvokeDynamicInsnNode) n).desc;
+            int v = Type.getArgumentsAndReturnSizes(desc);
+            // ASM counts the implicit `this` in EVERY descriptor, regardless of
+            // the invocation kind: `v >>> 2` is (receiver + real args) for an
+            // instance call and (1 + real args) for static/indy. The old code
+            // subtracted a receiver for instance calls AND used the raw value
+            // for static ones — i.e. it popped one slot too many in both cases.
+            // Result: every method containing a call (StringBuilder.append,
+            // Kind.values(), ...) failed the height walk with a bogus
+            // "stack-underflow", so nothing was ever flattened.
+            int slotsInclThis = v >>> 2;
             int retSlots = v & 0x03; // 0=void, 1=one slot, 2=long/double
-            if (n instanceof MethodInsnNode && op != Opcodes.INVOKESTATIC) {
-                return retSlots - (argSlots + 1); // receiver
-            }
-            return retSlots - argSlots;
+            boolean hasReceiver = n instanceof MethodInsnNode && op != Opcodes.INVOKESTATIC;
+            int pops = hasReceiver ? slotsInclThis : slotsInclThis - 1;
+            return retSlots - pops;
         }
         return 0; // unknown instruction: neutral (never reached for valid bytecode)
     }

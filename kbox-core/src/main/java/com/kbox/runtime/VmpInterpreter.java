@@ -127,6 +127,13 @@ public final class VmpInterpreter {
 
     /** A compiled VMP method: code + cp + exception table. */
     public static final class VmpMethod {
+        /** Defining class of the virtualized method. Set by the injected {@code <clinit>}
+         *  via {@link VmpInterpreter#bindOwner}. Used to resolve referenced classes
+         *  through the SAME loader the JVM would use for this class (the context
+         *  class loader is not always that loader: mod loaders and app servers
+         *  install their own TCCL, which can produce a second copy of a class and
+         *  break reference-identity comparisons such as Gson's ExclusionStrategy). */
+        public Class<?> owner;
         public final Object[] cp;            // resolved pool entries (lazy fill)
         public final Object[] cpRaw;         // null under keyed constant-pool (specs via specAt)
         private final Object[] cpRes;        // per-run re-keyed CIPHERTEXT spec strings
@@ -905,7 +912,39 @@ public final class VmpInterpreter {
         verifySelf();
     }
 
+    /** Binds the defining class of a virtualized method (called from its {@code <clinit>}). */
+    public static void bindOwner(VmpMethod m, Class<?> owner) {
+        if (m != null) m.owner = owner;
+    }
+
+    /** Sentinel meaning "no owner loader on this frame". */
+    private static final ClassLoader NO_LOADER = new ClassLoader(null) { };
+    private static final ThreadLocal<java.util.ArrayDeque<ClassLoader>> LOADER_STACK =
+            ThreadLocal.withInitial(java.util.ArrayDeque::new);
+
+    private static ClassLoader currentOwnerLoader() {
+        java.util.ArrayDeque<ClassLoader> s = LOADER_STACK.get();
+        ClassLoader l = s.peek();
+        return (l == null || l == NO_LOADER) ? null : l;
+    }
+
     public static Object execute(VmpMethod m, Object instance, Object[] args) throws Throwable {
+        // Resolve classes with the defining loader of the virtualized method, exactly
+        // like the JVM's ldc/invoke resolution does. The TCCL may belong to another
+        // layer (Forge SecureModuleClassLoader, app servers, ...) and can return a
+        // different Class object for the same name, which breaks == comparisons in
+        // the interpreted code.
+        ClassLoader ownerLoader = (m != null && m.owner != null) ? m.owner.getClassLoader() : null;
+        LOADER_STACK.get().push(ownerLoader == null ? NO_LOADER : ownerLoader);
+        try {
+            return execute0(m, instance, args);
+        } finally {
+            java.util.ArrayDeque<ClassLoader> s = LOADER_STACK.get();
+            if (!s.isEmpty()) s.pop();
+        }
+    }
+
+    private static Object execute0(VmpMethod m, Object instance, Object[] args) throws Throwable {
         // Optional VM原生化: run the interpreter body in native code when the packed
         // VMP library is present. On any unavailability the seam returns NOT_NATIVE and
         // we fall through to the identical Java interpreter below (no behavioral change).
@@ -1468,6 +1507,14 @@ public final class VmpInterpreter {
             return Array.newInstance(classForName(elem), 0).getClass();
         }
         try {
+            ClassLoader owner = currentOwnerLoader();
+            if (owner != null) {
+                try {
+                    return Class.forName(name, false, owner);
+                } catch (ClassNotFoundException ignored) {
+                    // fall through to the TCCL (bootstrap classes, cross-layer refs)
+                }
+            }
             return Class.forName(name, false, Thread.currentThread().getContextClassLoader());
         } catch (ClassNotFoundException e) {
             throw new RuntimeException("VMP: class not found " + name, e);

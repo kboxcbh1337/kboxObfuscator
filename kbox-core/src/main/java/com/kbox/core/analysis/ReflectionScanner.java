@@ -161,18 +161,31 @@ public final class ReflectionScanner {
 
     /** Captured method/handle from a lambda or method-reference bootstrap. */
     private void handleLambda(ClassGraph graph, InvokeDynamicInsnNode id) {
+        // LambdaMetafactory's bootstrap arguments are pure symbolic references
+        // (MethodHandle for the implementation, MethodType for the SAM). ASM's
+        // ClassRemapper rewrites owner/name/desc in both, so they do NOT need to
+        // enter the keep-set. Keeping them prevented renaming of
+        // `lambda$xxx$0` implementation methods and of the functional interface
+        // itself, leaving both verbatim in the output (measured on StressApp:
+        // `lambda$viaLambda$0` survived a full-strength rename).
+        boolean symbolic = id.bsm != null
+                && "java/lang/invoke/LambdaMetafactory".equals(id.bsm.getOwner());
         for (Object o : id.bsmArgs) {
             if (o instanceof Handle) {
                 Handle h = (Handle) o;
                 if (!h.getOwner().startsWith("java/")) {
-                    graph.keep(new MemberRef(h.getOwner(), h.getName(), h.getDesc()));
+                    if (!symbolic) {
+                        graph.keep(new MemberRef(h.getOwner(), h.getName(), h.getDesc()));
+                    }
                     graph.addReference(id.name.length() == 0 ? "lambda" : id.name, h.getOwner());
                 }
             } else if (o instanceof Type) {
                 Type t = (Type) o;
+                // MethodType/other sorts have no internal class name.
+                if (t.getSort() != Type.OBJECT && t.getSort() != Type.ARRAY) continue;
                 String in = t.getInternalName();
                 if (in != null && !in.startsWith("java/") && !in.startsWith("[")) {
-                    graph.keep(MemberRef.ofClass(in));
+                    if (!symbolic) graph.keep(MemberRef.ofClass(in));
                 }
             }
         }

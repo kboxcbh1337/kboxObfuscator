@@ -1,10 +1,16 @@
 # 电脑版 ↔ 手机版 同步脚本
-# 把最新 kboxObfPro\dist 的混淆器 jar 同步进 mobile-monitor 目录的 dist 参考副本，
+# 把最新 dist（原始代码\dist\release-v3.0.1 或 kbox-cli\target）的混淆器 jar 同步进 mobile-monitor 目录的 dist 参考副本，
 # 并回显当前使用版本，保证电脑版与手机版能力一致。
 $ErrorActionPreference = "Stop"
 
 $Here   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$SrcDir = Join-Path $Here "..\kboxObfPro\dist"
+# 依优先级寻找电脑版产物目录（新版 dist / Maven 构建产物 / 历史 kboxObfPro）。
+$Candidates = @(
+    (Join-Path $Here "..\原始代码\dist\release-v3.0.1"),
+    (Join-Path $Here "..\高级先行版源码\kbox-cli\target"),
+    (Join-Path $Here "..\kboxObfPro\dist")
+)
+$SrcDir = $Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 $DstDir = Join-Path $Here "dist"
 
 if (-not (Test-Path $SrcDir)) {
@@ -14,7 +20,7 @@ if (-not (Test-Path $SrcDir)) {
 
 New-Item -ItemType Directory -Force -Path $DstDir | Out-Null
 
-$jars = Get-ChildItem -Path $SrcDir -Filter "kboxObfusc*.jar" | Sort-Object LastWriteTime -Descending
+$jars = Get-ChildItem -Path $SrcDir -Filter "kbox*.jar" | Sort-Object LastWriteTime -Descending
 if (-not $jars) {
     Write-Host "未在 $SrcDir 下找到 kboxObfusc*.jar" -ForegroundColor Yellow
     exit 1

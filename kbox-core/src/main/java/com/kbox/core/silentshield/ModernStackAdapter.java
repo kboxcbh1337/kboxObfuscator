@@ -10,10 +10,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * ModernStackAdapter — 现代技术栈自动适配（"10 年商业级混淆适配性"的主动适配层）。
+ * ModernStackAdapter — 现代技术栈自动适配（主动适配层）。
  *
- * <p>与 {@link AdaptationAuditor}（扫描"其他混淆器弱点模式"）互补，本组件对输入 jar
- * 做<b>主动适配</b>，把现代 JVM 生态十年演进引入的易碎点提前规避：
+ * <p>与 {@link AdaptationAuditor}（扫描"同类工具弱点模式"）互补，本组件对输入 jar
+ * 做<b>主动适配</b>，把现代 JVM 生态长期演进引入的易碎点提前规避：
  *
  * <ul>
  *   <li><b>JDK 版本感知（Java 8..25）</b>：统计输入 jar 的类文件主版本跨度（52..69），
@@ -22,7 +22,7 @@ import java.util.List;
  *       （try/finally/恢复点），下沉 JNIC/VMP 或破坏性控制流变换会破坏协程恢复——
  *       自动把此类加入 nativeExcludePrefixes + excludeControlFlowPrefixes。</li>
  *   <li><b>multi-release / JPMS / GraalVM / 现代字节码</b>：识别并如实记录，
- *       供 {@link AdaptabilityReport} 输出商业级验收报告。</li>
+ *       供 {@link AdaptabilityReport} 输出适配性验收报告。</li>
  * </ul>
  *
  * <p>只做保守动作（宁可少混淆也不破坏语义），在 SilentShield 之后运行。

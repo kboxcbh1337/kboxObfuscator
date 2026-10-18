@@ -386,6 +386,13 @@ public final class JniBytecodeInterp {
                 .append("_bc,").append(raw.length).append(");\n");
 
         body.append("  static int _init=0;\n");
+        // The class that declared this native method: a jclass for static methods,
+        // the receiver for instance methods. Used as the anchor loader when
+        // resolving referenced classes (see kbox_find_class in the interpreter).
+        boolean isStaticMethod = (mn.access & org.objectweb.asm.Opcodes.ACC_STATIC) != 0;
+        String ownerExpr = mn.name.equals("<init>") ? "(jclass)_cls"
+                : (isStaticMethod ? "(jclass)_recv" : "(jclass)(*env)->GetObjectClass(env,_recv)");
+        body.append("  jclass _owner=").append(ownerExpr).append(";\n");
         // NOTE: cached jclass/jfieldID/jmethodID are created on the FIRST call and
         // reused by every subsequent call. FindClass returns a LOCAL reference that
         // is invalidated when the native method returns, so we must promote every
@@ -395,9 +402,9 @@ public final class JniBytecodeInterp {
         body.append("  if (!_init) {\n");
         // Pre-resolve classes (promoted to global refs).
         for (int i : clsKeys) {
-            body.append("    { jclass _l=(*env)->FindClass(env,\"")
+            body.append("    { jclass _l=kbox_find_class(env,_owner,\"")
                     .append(rcp.classes.get(i)).append("\"); _cpclsR[").append(i)
-                    .append("]=(jclass)(*env)->NewGlobalRef(env,_l); }\n");
+                    .append("]=_l?(jclass)(*env)->NewGlobalRef(env,_l):NULL; }\n");
         }
         // Pre-resolve field IDs. Track each field's OWNER class (global ref) and
         // whether it is static: static fields MUST be resolved with
@@ -407,26 +414,28 @@ public final class JniBytecodeInterp {
         for (int i : fldKeys) {
             String[] f = rcp.fields.get(i);
             boolean st = "1".equals(f[3]);
-            body.append("    { jclass c=(*env)->NewGlobalRef(env,(*env)->FindClass(env,\"").append(f[0])
-                    .append("\")); _cpfldClsR[").append(i).append("]=c; ")
+            body.append("    { jclass c=kbox_find_class(env,_owner,\"").append(f[0])
+                    .append("\"); if (c) c=(jclass)(*env)->NewGlobalRef(env,c); _cpfldClsR[").append(i).append("]=c; ")
+                    .append("if (c) { ")
                     .append(st ? "_cpfldR[" + i + "]=(*env)->GetStaticFieldID(env,c,\"" + f[1] + "\",\"" + f[2] + "\");"
                                 : "_cpfldR[" + i + "]=(*env)->GetFieldID(env,c,\"" + f[1] + "\",\"" + f[2] + "\");")
                     .append(" if (!_cpfldR[").append(i).append("]) { fprintf(stderr,\"[JNIC] FIELDFAIL ")
                     .append((st ? "STATIC " : "INST  ")).append(f[0]).append("\\t").append(f[1]).append("\\t").append(f[2]).append("\\n\"); ")
-                    .append("if ((*env)->ExceptionCheck(env)) (*env)->ExceptionDescribe(env), (*env)->ExceptionClear(env); }\n");
+                    .append("if ((*env)->ExceptionCheck(env)) (*env)->ExceptionDescribe(env), (*env)->ExceptionClear(env); } }\n");
             body.append("    }\n");
         }
         // Pre-resolve method IDs.
         for (int i : midKeys) {
             String[] m = rcp.methods.get(i);
-            body.append("    { jclass c=(*env)->NewGlobalRef(env,(*env)->FindClass(env,\"").append(m[0])
-                    .append("\")); _cpmidCls[").append(i).append("]=c; ");
+            body.append("    { jclass c=kbox_find_class(env,_owner,\"").append(m[0])
+                    .append("\"); if (c) c=(jclass)(*env)->NewGlobalRef(env,c); _cpmidCls[").append(i).append("]=c; ")
+                    .append("if (c) { ");
             if ("1".equals(m[3]))
                 body.append("_cpmidR[").append(i).append("]=(*env)->GetStaticMethodID(env,c,\"")
-                        .append(m[1]).append("\",\"").append(m[2]).append("\"); }\n");
+                        .append(m[1]).append("\",\"").append(m[2]).append("\"); } }\n");
             else
                 body.append("_cpmidR[").append(i).append("]=(*env)->GetMethodID(env,c,\"")
-                        .append(m[1]).append("\",\"").append(m[2]).append("\"); }\n");
+                        .append(m[1]).append("\",\"").append(m[2]).append("\"); } }\n");
         }
         body.append("    _init=1;\n  }\n");
 

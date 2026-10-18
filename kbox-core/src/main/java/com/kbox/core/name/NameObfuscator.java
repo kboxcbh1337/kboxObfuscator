@@ -8,8 +8,11 @@ import com.kbox.core.log.KBoxLog;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.commons.ClassRemapper;
 import org.objectweb.asm.commons.Remapper;
+import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.AnnotationNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 
 import java.util.ArrayList;
@@ -20,7 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * ZKM-style identifier obfuscation: renames classes (simple name only; packages
+ * Identifier obfuscation: renames classes (simple name only; packages
  * are preserved to keep Spring/component-scan &amp; resource-path lookups working),
  * methods and fields while respecting override equivalence and the retention
  * decision tree.
@@ -118,10 +121,21 @@ public final class NameObfuscator {
             }
         }
         for (String internal : graph.getClasses().keySet()) {
-            if (decision.keepClass(internal)) continue;
+            if (decision.keepClass(internal)) {
+                KBoxLog.debug(TAG, "keep-class " + internal + " (retention: keepSet="
+                        + graph.getKeepSet().contains(com.kbox.core.analysis.MemberRef.ofClass(internal))
+                        + " cfgKept=" + cfg.isKept(internal)
+                        + " keepPrefixes=" + cfg.getKeepPrefixes()
+                        + " mc=" + graph.getManifestMainClass()
+                        + " lib=" + cfg.isLibraryClass(internal) + ")");
+                continue;
+            }
             // Library classes are never renamed (single canonical decision via
             // LibraryClassifier — covers JDK, commons-lang3, Guava, Spring, etc.).
-            if (!cfg.shouldTransformClass(internal)) continue;
+            if (!cfg.shouldTransformClass(internal)) {
+                KBoxLog.debug(TAG, "keep-class " + internal + " (library/kept/scope)");
+                continue;
+            }
             int slash = internal.lastIndexOf('/');
             String newName;
             // Z9 incremental reuse: if the old mapping already renamed this
@@ -283,12 +297,148 @@ public final class NameObfuscator {
 
     // ---------- apply to a single class ----------
 
+    /**
+     * Rewrites class-name strings stored in annotation values. Forge resolves
+     * {@code @Mod(clientSide=..., serverSide=...)} / {@code @SidedProxy} proxies
+     * and several other annotations by reflection on the literal string, so a
+     * renamed target must be rewritten here or the loader fails with
+     * {@code ClassNotFoundException: <old.Proxy.Class>} after a successful scan.
+     */
+    private void rewriteAnnotationStringConstants(ClassNode cn) {
+        if (mapping.getClassMap().isEmpty()) return;
+        rewriteAnnotations(cn.visibleAnnotations);
+        rewriteAnnotations(cn.invisibleAnnotations);
+        if (cn.fields != null) {
+            for (Object fo : cn.fields) {
+                FieldNode fn = (FieldNode) fo;
+                rewriteAnnotations(fn.visibleAnnotations);
+                rewriteAnnotations(fn.invisibleAnnotations);
+            }
+        }
+        if (cn.methods != null) {
+            for (Object mo : cn.methods) {
+                MethodNode mn = (MethodNode) mo;
+                rewriteAnnotations(mn.visibleAnnotations);
+                rewriteAnnotations(mn.invisibleAnnotations);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void rewriteAnnotations(java.util.List<AnnotationNode> annos) {
+        if (annos == null) return;
+        for (AnnotationNode an : annos) {
+            if (an == null || an.values == null) continue;
+            java.util.List<Object> vals = an.values;
+            for (int i = 1; i < vals.size(); i += 2) {
+                Object v = vals.get(i);
+                if (v instanceof String) {
+                    String r = remapTextualClassName((String) v);
+                    if (r != null) vals.set(i, r);
+                } else if (v instanceof java.util.List) {
+                    java.util.List<Object> arr = (java.util.List<Object>) v;
+                    for (int j = 0; j < arr.size(); j++) {
+                        Object e = arr.get(j);
+                        if (e instanceof String) {
+                            String r = remapTextualClassName((String) e);
+                            if (r != null) arr.set(j, r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Rewrites {@code LDC "some.Class.Name"} constants that name a class which
+     * this build renames, so textual class references keep resolving after the
+     * class is moved.
+     *
+     * <p>The JVM resolves {@code Class.forName(String)},
+     * {@code ClassLoader.loadClass(String)}, {@code getResourceAsStream("a/B.class")}
+     * and similar APIs from a <em>string</em>, which {@link ClassRemapper} cannot
+     * see. Without this pass renaming any class that an application loads by
+     * name breaks the app ({@code ClassNotFoundException} /
+     * {@code SecurityException} from the reflection gate), even though every
+     * symbolic reference in the bytecode was remapped correctly.
+     *
+     * <p>Both internal ({@code a/b/C}) and dotted ({@code a.b.C}) forms are
+     * handled, plus {@code L...;} descriptors. Strings that do not exactly match
+     * a renamed class are left untouched.
+     */
+    private void rewriteReflectionStringConstants(ClassNode cn) {
+        if (cn.methods == null || mapping.getClassMap().isEmpty()) return;
+        for (Object mo : cn.methods) {
+            MethodNode mn = (MethodNode) mo;
+            if (mn == null || mn.instructions == null) continue;
+            for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
+                if (!(ins instanceof LdcInsnNode)) continue;
+                Object cst = ((LdcInsnNode) ins).cst;
+                if (!(cst instanceof String)) continue;
+                String repl = remapTextualClassName((String) cst);
+                if (repl != null) ((LdcInsnNode) ins).cst = repl;
+            }
+        }
+    }
+
+    /** Returns the renamed spelling of {@code s} in the same textual form, or
+     *  {@code null} when the string is not exactly a renamed class name. */
+    private String remapTextualClassName(String s) {
+        if (s == null || s.isEmpty()) return null;
+        Map<String, String> cm = mapping.getClassMap();
+        String internal = cm.get(s);
+        if (internal != null && !internal.equals(s)) return internal;
+        // Dotted form: replace package separators only (simple names never contain '.').
+        if (s.indexOf('/') < 0 && s.indexOf('.') >= 0) {
+            String asInternal = s.replace('.', '/');
+            String mapped = cm.get(asInternal);
+            if (mapped != null && !mapped.equals(asInternal)) return mapped.replace('/', '.');
+        }
+        // Field descriptor form: Lpkg/Cls; (used by getDeclaredField/getMethod).
+        if (s.length() > 2 && s.charAt(0) == 'L' && s.charAt(s.length() - 1) == ';') {
+            String asInternal = s.substring(1, s.length() - 1);
+            String mapped = cm.get(asInternal);
+            if (mapped != null && !mapped.equals(asInternal)) return "L" + mapped + ";";
+        }
+        return null;
+    }
+
     /** Rewrite one ClassNode in place using the computed mapping. */
     public ClassNode apply(ClassNode src) {
+        // Pre-pass: keep textual class references in sync with the rename map.
+        rewriteReflectionStringConstants(src);
+        // Same for class names carried inside annotation values (Forge
+        // @Mod(clientSide="...") / @SidedProxy(clientSide="..."), etc.).
+        rewriteAnnotationStringConstants(src);
         // Pre-pass: rewrite LambdaMetafactory SAM-method names so lambda
         // invokedynamic bootstrap args stay consistent after renaming the
         // functional-interface method (see rewriteLambdas javadoc).
         rewriteLambdas(src);
+        // Defensive: some earlier passes append attribute entries without
+        // null-checking (observed: a null in innerClasses / nestMembers makes
+        // ClassNode.accept throw NullPointerException, which used to abort the
+        // whole remap and silently drop the class from the jar).
+        if (src.innerClasses != null) {
+            src.innerClasses.removeIf(n -> n == null || n.name == null);
+        }
+        if (src.nestMembers != null) src.nestMembers.removeIf(java.util.Objects::isNull);
+        // ClassNode.accept() dereferences interfaces/methods/fields directly
+        // (`new String[interfaces.size()]`), so a pass that nulled one of these
+        // lists makes the whole remap throw NPE at accept(). Restore empty lists.
+        if (src.interfaces == null) src.interfaces = new java.util.ArrayList<>();
+        if (src.methods == null) src.methods = new java.util.ArrayList<>();
+        if (src.fields == null) src.fields = new java.util.ArrayList<>();
+        if (src.innerClasses == null) src.innerClasses = new java.util.ArrayList<>();
+        if (src.interfaces != null) src.interfaces.removeIf(java.util.Objects::isNull);
+        if (src.methods != null) {
+            src.methods.removeIf(java.util.Objects::isNull);
+            for (Object mo : src.methods) {
+                org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) mo;
+                if (mn.instructions == null) mn.instructions = new org.objectweb.asm.tree.InsnList();
+                if (mn.tryCatchBlocks == null) mn.tryCatchBlocks = new java.util.ArrayList<>();
+            }
+        }
+        if (src.fields != null) src.fields.removeIf(java.util.Objects::isNull);
         ClassNode out = new ClassNode();
         ClassRemapper remapper = new ClassRemapper(out, new KBoxRemapper(graph, mapping, decision));
         src.accept(remapper);

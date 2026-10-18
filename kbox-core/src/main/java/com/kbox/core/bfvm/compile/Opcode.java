@@ -174,4 +174,14 @@ public final class Opcode {
 
     public static final int ARRAYLENGTH = 190;
     public static final int ATHROW = 191;
+
+    // ---- P1-5 additions（运行时 Opcode 必须同步）----
+    /** {@code MULTIANEWARRAY}：后跟 u8 dims + utf8 数组类型描述符。 */
+    public static final int MULTIANEWARRAY = 250;
+    /** {@code INVOKEDYNAMIC}：后跟 name/desc/BSM 引用/常量参数表。 */
+    public static final int INVOKEDYNAMIC = 251;
+    /** {@code MONITORENTER}：VM 的全局重入锁加锁。 */
+    public static final int MONITORENTER = 252;
+    /** {@code MONITOREXIT}：VM 的全局重入锁解锁。 */
+    public static final int MONITOREXIT = 253;
 }

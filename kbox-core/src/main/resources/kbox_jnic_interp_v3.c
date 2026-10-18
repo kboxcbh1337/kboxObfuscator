@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <limits.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -36,6 +37,39 @@
   #define KBOX_TRAP()     __builtin_trap()
   #define KBOX_INLINE     static inline
 #endif
+
+/* ===== Class resolution that matches JVM semantics ===== */
+/*
+ * JNI FindClass resolves through the native method's declaring class loader,
+ * which is not always the loader the JVM would use for an ldc/invoke in the
+ * interpreted class (mod loaders install a module-aware TCCL; dedicated
+ * servers omit client-only classes from the layer). A failure here must NOT
+ * abort a method that merely *mentions* an absent class in a branch the JVM
+ * would never execute: resolve with the owner loader first, and return NULL
+ * (exception cleared) when the class is genuinely unavailable.
+ */
+static jclass kbox_find_class(JNIEnv* env, jclass owner, const char* internal) {
+    jclass c = (*env)->FindClass(env, internal);
+    if (c) return c;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (!owner) return NULL;
+    char buf[1024];
+    size_t n = strlen(internal);
+    if (n >= sizeof(buf)) return NULL;
+    for (size_t i = 0; i <= n; i++) buf[i] = (internal[i] == '/') ? '.' : internal[i];
+    jclass cc = (*env)->FindClass(env, "java/lang/Class");
+    if (!cc) { (*env)->ExceptionClear(env); return NULL; }
+    jmethodID gcl = (*env)->GetMethodID(env, cc, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jmethodID fn  = (*env)->GetStaticMethodID(env, cc, "forName",
+                        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+    if (!gcl || !fn) { (*env)->ExceptionClear(env); return NULL; }
+    jobject loader = (*env)->CallObjectMethod(env, owner, gcl);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return NULL; }
+    jstring nm = (*env)->NewStringUTF(env, buf);
+    jclass r = (jclass)(*env)->CallStaticObjectMethod(env, cc, fn, nm, JNI_FALSE, loader);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    return r;
+}
 
 /* ===== Embedded core structures (kbox_jnic_core.h inline) ===== */
 
@@ -754,6 +788,18 @@ HANDLER(SIPUSH) {
 #define K_LDC_TAG_MASK   0xF800u
 #define K_LDC_IDX_MASK   0x07FFu
 
+/* Throw NoClassDefFoundError for a class literal that could not be resolved at
+ * method-entry pre-resolution time (absent on this runtime, e.g. client-only
+ * classes on a dedicated server). Only reached when the instruction actually
+ * executes — matching JVM lazy resolution. */
+static int kbox_throw_ncdfe(kbox_ctx_t* ctx, const char* name) {
+    JNIEnv* env = ctx->env;
+    jclass ce = (*env)->FindClass(env, "java/lang/NoClassDefFoundError");
+    if (!ce) { (*env)->ExceptionClear(env); return 0; }
+    (*env)->ThrowNew(env, ce, name ? name : "KBox");
+    return 1;
+}
+
 HANDLER(LDC) {
     uint16_t raw = (uint16_t)FETCH_S16(ctx);
     int ii = (int)(raw & K_LDC_IDX_MASK);
@@ -770,10 +816,25 @@ HANDLER(LDC) {
     case K_LDC_TAG_FLOAT:
         ctx->stack[ctx->sp].f = (ii < ctx->cp_float_n) ? ctx->cp_float[ii] : 0.0f;
         break;
-    case K_LDC_TAG_CLASS:
-        /* jclass IS the java.lang.Class object: push it as a reference. */
-        ctx->stack[ctx->sp].ptr = (ii < ctx->cp_cls_n) ? (jobject)ctx->cp_cls[ii] : NULL;
+    case K_LDC_TAG_CLASS: {
+        /* jclass IS the java.lang.Class object: push it as a reference.
+         * If the class was absent during pre-resolution (cleared to NULL), this
+         * instruction is the first real use — resolve lazily and, if it is still
+         * unavailable, throw NoClassDefFoundError exactly like the JVM would. */
+        jclass c = (ii < ctx->cp_cls_n) ? ctx->cp_cls[ii] : NULL;
+        if (!c && ii < ctx->cp_cls_names_n && ctx->cp_cls_names[ii]) {
+            const char* nm = ctx->cp_cls_names[ii];
+            c = (*ctx->env)->FindClass(ctx->env, nm);
+            if (!c) {
+                (*ctx->env)->ExceptionClear(ctx->env);
+                kbox_throw_ncdfe(ctx, nm);
+                return;
+            }
+            ctx->cp_cls[ii] = (jclass)(*ctx->env)->NewGlobalRef(ctx->env, c);
+        }
+        ctx->stack[ctx->sp].ptr = (jobject)c;
         break;
+    }
     default: {
         jstring s = NULL;
         if (ii < ctx->cp_str_n && ctx->cp_str[ii]) {
@@ -890,8 +951,38 @@ HANDLER(SWAP)     { kbox_slot_t t=ctx->stack[ctx->sp-1];ctx->stack[ctx->sp-1]=ct
 HANDLER(IADD) { ctx->sp--; ctx->stack[ctx->sp-1].i += ctx->stack[ctx->sp].i; }
 HANDLER(ISUB) { ctx->sp--; ctx->stack[ctx->sp-1].i -= ctx->stack[ctx->sp].i; }
 HANDLER(IMUL) { ctx->sp--; ctx->stack[ctx->sp-1].i *= ctx->stack[ctx->sp].i; }
-HANDLER(IDIV) { ctx->sp--; ctx->stack[ctx->sp-1].i /= ctx->stack[ctx->sp].i; }
-HANDLER(IREM) { ctx->sp--; ctx->stack[ctx->sp-1].i %= ctx->stack[ctx->sp].i; }
+/* Division by zero must surface as a Java ArithmeticException (JVMS idiv/irem),
+ * NOT trap in C: an unchecked `a / 0` raises #DE on x86 and kills the process
+ * with EXCEPTION_INT_DIVIDE_BY_ZERO (observed on `safeDiv(1,0)` inside a
+ * try/catch). INT_MIN / -1 likewise overflows in C (UB / #DE) while Java
+ * defines the result as INT_MIN. Both cases are handled explicitly; the
+ * pending exception is dispatched by the interpreter loop against the method's
+ * own exception table.
+ * NOTE: keep sp consistent (pop both operands) before any early return. */
+static int kbox_throw_div0(kbox_ctx_t* ctx) {
+    JNIEnv* env = ctx->env;
+    jclass ae = (*env)->FindClass(env, "java/lang/ArithmeticException");
+    if (ae != NULL) {
+        (*env)->ThrowNew(env, ae, "/ by zero");
+        (*env)->DeleteLocalRef(env, ae);
+    }
+    return 0;
+}
+
+HANDLER(IDIV) {
+    jint b = ctx->stack[ctx->sp-1].i, a = ctx->stack[ctx->sp-2].i;
+    ctx->sp -= 2;
+    if (b == 0) { kbox_throw_div0(ctx); return; }
+    if (b == -1 && a == INT_MIN) { ctx->stack[ctx->sp++].i = INT_MIN; return; }
+    ctx->stack[ctx->sp++].i = a / b;
+}
+HANDLER(IREM) {
+    jint b = ctx->stack[ctx->sp-1].i, a = ctx->stack[ctx->sp-2].i;
+    ctx->sp -= 2;
+    if (b == 0) { kbox_throw_div0(ctx); return; }
+    if (b == -1) { ctx->stack[ctx->sp++].i = 0; return; }
+    ctx->stack[ctx->sp++].i = a % b;
+}
 HANDLER(INEG) { ctx->stack[ctx->sp-1].i = -ctx->stack[ctx->sp-1].i; }
 HANDLER(ISHL) { ctx->sp--; ctx->stack[ctx->sp-1].i <<= (ctx->stack[ctx->sp].i & 0x1F); }
 HANDLER(ISHR) { ctx->sp--; ctx->stack[ctx->sp-1].i >>= (ctx->stack[ctx->sp].i & 0x1F); }
@@ -905,8 +996,22 @@ HANDLER(IINC) { int idx = FETCH(ctx); int8_t incr = (int8_t)FETCH(ctx); ctx->loc
 HANDLER(LADD) { ctx->sp--; ctx->stack[ctx->sp-1].j += ctx->stack[ctx->sp].j; }
 HANDLER(LSUB) { ctx->sp--; ctx->stack[ctx->sp-1].j -= ctx->stack[ctx->sp].j; }
 HANDLER(LMUL) { ctx->sp--; ctx->stack[ctx->sp-1].j *= ctx->stack[ctx->sp].j; }
-HANDLER(LDIV) { ctx->sp--; ctx->stack[ctx->sp-1].j /= ctx->stack[ctx->sp].j; }
-HANDLER(LREM) { ctx->sp--; ctx->stack[ctx->sp-1].j %= ctx->stack[ctx->sp].j; }
+/* Long division: same #DE hazard as the int form (ldiv/lrem also throw
+ * ArithmeticException in Java, and LONG_MIN / -1 overflows in C). */
+HANDLER(LDIV) {
+    jlong b = ctx->stack[ctx->sp-1].j, a = ctx->stack[ctx->sp-2].j;
+    ctx->sp -= 2;
+    if (b == 0) { kbox_throw_div0(ctx); return; }
+    if (b == -1 && a == LLONG_MIN) { ctx->stack[ctx->sp++].j = LLONG_MIN; return; }
+    ctx->stack[ctx->sp++].j = a / b;
+}
+HANDLER(LREM) {
+    jlong b = ctx->stack[ctx->sp-1].j, a = ctx->stack[ctx->sp-2].j;
+    ctx->sp -= 2;
+    if (b == 0) { kbox_throw_div0(ctx); return; }
+    if (b == -1) { ctx->stack[ctx->sp++].j = 0; return; }
+    ctx->stack[ctx->sp++].j = a % b;
+}
 HANDLER(LNEG) { ctx->stack[ctx->sp-1].j = -ctx->stack[ctx->sp-1].j; }
 HANDLER(LAND) { ctx->sp--; ctx->stack[ctx->sp-1].j &= ctx->stack[ctx->sp].j; }
 HANDLER(LOR)  { ctx->sp--; ctx->stack[ctx->sp-1].j |= ctx->stack[ctx->sp].j; }

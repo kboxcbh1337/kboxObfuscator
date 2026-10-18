@@ -81,10 +81,19 @@ public final class AntiDebug {
         watchdog = t;
     }
 
-    /** Light scan of {@code java.io.tmpdir} for JVM crash/dump residue that a
-     *  live-debug/hprof session would leave behind. Silent; no user-files policy. */
+    /** Light scan of {@code java.io.tmpdir} for JVM crash/dump residue belonging to
+     *  <em>this</em> process. Silent; no user-files policy.
+     *
+     *  <p>Only dumps whose PID matches the current JVM are considered. A stale
+     *  {@code hs_err_pid*.log} left in the temp directory by any other JVM (every
+     *  developer machine accumulates them after a crash) must never trip the
+     *  canary: a false positive flips {@link #tampered} and makes every protected
+     *  string decrypt to noise for the whole run, which looks like a broken
+     *  obfuscation build. */
     private static void checkCrashDumpResidue() {
         try {
+            long pid = currentPid();
+            if (pid <= 0L) return;
             String[] dirs = { System.getProperty("java.io.tmpdir", "."), "/tmp" };
             for (String d : dirs) {
                 java.io.File dir = new java.io.File(d);
@@ -93,16 +102,27 @@ public final class AntiDebug {
                 if (files == null) continue;
                 for (java.io.File f : files) {
                     String n = f.getName();
-                    if (n.startsWith("hs_err_pid") || n.startsWith("replay_pid")
-                            || n.startsWith("java_pid") || n.contains(".hprof")) {
-                        // A crash/JVMTI dump is present in the trace directory.
+                    if (n.startsWith("hs_err_pid" + pid) || n.startsWith("replay_pid" + pid)
+                            || n.startsWith("java_pid" + pid)) {
+                        // A crash/JVMTI dump for this VM is present in the trace directory.
                         tampered = true;
                         return;
                     }
-                    // Self detector: if we ever double-dump, flag (rare).
                 }
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    /** Current process id, derived from the JVM's {@code pid@host} runtime name
+     *  (Java 6+; avoids {@code ProcessHandle} so the runtime stays Java 8 clean). */
+    private static long currentPid() {
+        try {
+            String n = ManagementFactory.getRuntimeMXBean().getName();
+            int at = n.indexOf('@');
+            return Long.parseLong(at > 0 ? n.substring(0, at) : n);
+        } catch (Throwable t) {
+            return -1L;
         }
     }
 
@@ -285,8 +305,12 @@ public final class AntiDebug {
                 totalCpu += (cpuEnd - cpuStart);
             }
 
-            // Wall time check: > 5ms per round average => single-stepping
-            if (totalWall / rounds > 5_000_000L) {
+            // Wall time check: > 50ms per round average => single-stepping.
+            // The canary loop is a few thousand trivial integer ops, so even on a
+            // heavily loaded/oversubscribed machine it stays well under 50ms; the
+            // old 5ms threshold tripped on ordinary scheduling jitter and silently
+            // corrupted every protected string for the whole run.
+            if (totalWall / rounds > 50_000_000L) {
                 tampered = true;
             }
 
@@ -298,8 +322,10 @@ public final class AntiDebug {
                     tampered = true;
                 }
                 // If wall time >> CPU time, a hook is delaying syscall returns
-                // (e.g. ptrace adds context-switch overhead not visible in CPU time)
-                if (totalWall > totalCpu * 10 && totalWall > 10_000_000L) {
+                // (e.g. ptrace adds context-switch overhead not visible in CPU time).
+                // Require a large absolute gap so a descheduled thread on a busy
+                // host is not mistaken for a tracer.
+                if (totalWall > totalCpu * 20 && totalWall > 250_000_000L) {
                     tampered = true;
                 }
             }

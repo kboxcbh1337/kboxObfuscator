@@ -235,6 +235,19 @@ public final class NativeCompiler {
      */
     public static String assembleInterpSource(List<JniBytecodeInterp.InterpFn> fns,
                                               java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts) {
+        return assembleInterpSource(fns, classMethodCounts, 0L);
+    }
+
+    /**
+     * @param otpSeed K-OTP 原生种子（0 = 不生成）。非 0 时额外导出
+     *                {@code Java_com_kbox_runtime_KotpRuntime_nativeSeed}，并在
+     *                {@code registerNatives0} 中把它绑定到
+     *                {@code com.kbox.runtime.KotpRuntime.nativeSeed()J}。种子只存在于
+     *                该原生库内（库本身还会被 KBNL + kboXShield 加壳），Java 侧无法静态获得。
+     */
+    public static String assembleInterpSource(List<JniBytecodeInterp.InterpFn> fns,
+                                              java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts,
+                                              long otpSeed) {
         StringBuilder sb = new StringBuilder();
         appendInterpHeader(sb);
         for (JniBytecodeInterp.InterpFn fn : fns) {
@@ -256,6 +269,10 @@ public final class NativeCompiler {
 
         // === Java-side RegisterNatives entry point. ===
         // Called from ResourceGuardClassLoader after the JNIC class is loaded.
+        if (otpSeed != 0L) {
+            // Forward declaration: registerNatives0 references this export below.
+            sb.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed(JNIEnv*, jclass);\n\n");
+        }
         sb.append("/* === registerNatives0 (called from Java). === */\n");
         sb.append("JNIEXPORT void JNICALL Java_com_kbox_runtime_NativeLoader_registerNatives0\n");
         sb.append("    (JNIEnv* env, jclass loaderClass, jclass targetClass) {\n");
@@ -287,7 +304,31 @@ public final class NativeCompiler {
             sb.append("  }\n");
             regIdx++;
         }
+        if (otpSeed != 0L) {
+            // K-OTP: bind nativeSeed() on com.kbox.runtime.KotpRuntime through the
+            // same RegisterNatives path used for app classes — works for classes
+            // defined by the guard / BF loader, unlike loader-scoped JNI lookup.
+            sb.append("  static JNINativeMethod _methodsKotp[] = {\n");
+            sb.append("    { \"nativeSeed\", \"()J\", (void*)Java_com_kbox_runtime_KotpRuntime_nativeSeed },\n");
+            sb.append("  };\n");
+            sb.append("  if (strcmp(_targetName, \"com.kbox.runtime.KotpRuntime\") == 0) {\n");
+            sb.append("    if ((*env)->RegisterNatives(env, targetClass, _methodsKotp, 1) != 0) {\n");
+            sb.append("      if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+            sb.append("    }\n");
+            sb.append("  }\n");
+        }
         sb.append("}\n\n");
+
+        if (otpSeed != 0L) {
+            // The K-OTP seed exists only here (inside the packed native image).
+            sb.append("/* === K-OTP native build seed (one-time-program key root). === */\n");
+            sb.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed\n");
+            sb.append("    (JNIEnv* env, jclass cls) {\n");
+            sb.append("  (void)env; (void)cls;\n");
+            sb.append("  uint64_t s = 0x").append(String.format("%016x", otpSeed)).append("ULL;\n");
+            sb.append("  return (jlong)(s ^ (s >> 33) ^ 0xA24BAED4963EE407ULL);\n");
+            sb.append("}\n\n");
+        }
 
         // === JNI-named exports with correct parameter types. ===
         // The JVM validates declared JNI parameter types against the Java signature.
@@ -426,9 +467,16 @@ public final class NativeCompiler {
             List<JniBytecodeInterp.InterpFn> fns,
             java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts,
             int shards) {
+        return assembleInterpSourceSharded(fns, classMethodCounts, shards, 0L);
+    }
+
+    public static java.util.List<String> assembleInterpSourceSharded(
+            List<JniBytecodeInterp.InterpFn> fns,
+            java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts,
+            int shards, long otpSeed) {
         if (shards <= 1) {
             return java.util.Collections.singletonList(
-                    assembleInterpSource(fns, classMethodCounts));
+                    assembleInterpSource(fns, classMethodCounts, otpSeed));
         }
         shards = Math.min(shards, Math.max(1, fns.size()));
         // Deterministic round-robin split (build-reproducible).
@@ -451,6 +499,9 @@ public final class NativeCompiler {
         main.append("  return JNI_VERSION_1_8;\n");
         main.append("}\n\n");
         main.append("/* === registerNatives0 (called from Java). === */\n");
+        if (otpSeed != 0L) {
+            main.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed(JNIEnv*, jclass);\n\n");
+        }
         main.append("JNIEXPORT void JNICALL Java_com_kbox_runtime_NativeLoader_registerNatives0\n");
         main.append("    (JNIEnv* env, jclass loaderClass, jclass targetClass) {\n");
         main.append("  (void)loaderClass;\n");
@@ -466,7 +517,26 @@ public final class NativeCompiler {
         for (int i = 0; i < shards; i++) {
             main.append("  kbox_register_part").append(i).append("(env, targetClass, _targetName);\n");
         }
+        if (otpSeed != 0L) {
+            main.append("  static JNINativeMethod _methodsKotp[] = {\n");
+            main.append("    { \"nativeSeed\", \"()J\", (void*)Java_com_kbox_runtime_KotpRuntime_nativeSeed },\n");
+            main.append("  };\n");
+            main.append("  if (strcmp(_targetName, \"com.kbox.runtime.KotpRuntime\") == 0) {\n");
+            main.append("    if ((*env)->RegisterNatives(env, targetClass, _methodsKotp, 1) != 0) {\n");
+            main.append("      if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
+            main.append("    }\n");
+            main.append("  }\n");
+        }
         main.append("}\n\n");
+        if (otpSeed != 0L) {
+            main.append("/* === K-OTP native build seed (one-time-program key root). === */\n");
+            main.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed\n");
+            main.append("    (JNIEnv* env, jclass cls) {\n");
+            main.append("  (void)env; (void)cls;\n");
+            main.append("  uint64_t s = 0x").append(String.format("%016x", otpSeed)).append("ULL;\n");
+            main.append("  return (jlong)(s ^ (s >> 33) ^ 0xA24BAED4963EE407ULL);\n");
+            main.append("}\n\n");
+        }
         out.add(main.toString());
 
         // ---- Shard files: header + stubs + part register + JNI-named exports. ----

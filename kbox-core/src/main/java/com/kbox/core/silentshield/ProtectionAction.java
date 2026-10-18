@@ -7,7 +7,7 @@ package com.kbox.core.silentshield;
  * SilentShield 从 {@link WeaknessCatalog} 中查询该模式族对应的防护动作，
  * 并将动作落地到配置 / keep 集，从而"预防问题"而非等运行时报错。
  *
- * <p>动作设计对齐商业混淆器的"渐进降级 / 最小侵入"哲学：宁可少混淆，
+ * <p>动作设计遵循"渐进降级 / 最小侵入"哲学：宁可少混淆，
  * 也不破坏语义。
  */
 public enum ProtectionAction {

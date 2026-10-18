@@ -6,12 +6,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * ZKM-style descriptor and internal-name parser. Provides utilities for
+ * Descriptor and internal-name parser. Provides utilities for
  * parsing JVM method descriptors ({@code (Ljava/lang/String;I)V}) and
  * internal names ({@code com/example/MyClass}) into their component parts,
  * enabling precise member matching for annotation-based targeting.
  *
- * <p>This is the "地基" (foundation) layer of ZKM compatibility — every
+ * <p>This is the "地基" (foundation) layer of bytecode-level compatibility — every
  * advanced feature (native translation, VMP, name retention) depends on
  * the ability to understand and decompose JVM type system elements.
  */

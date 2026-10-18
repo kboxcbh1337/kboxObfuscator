@@ -6,7 +6,7 @@
 #
 # 模块发布目标:
 #   kbox-core / kbox-cli -> --release 8   （受保护运行时需注入 Java 8 目标）
-#   kbox-gui             -> --release 17  （HTML UI 使用 Java 9+ API）
+#   kbox-gui             -> --release 17  （桌面 UI 使用 Java 9+ API）
 #
 # 用法: powershell -ExecutionPolicy Bypass -File build.ps1
 #
@@ -126,7 +126,7 @@ $mf = Join-Path $BuildDir 'MANIFEST.MF'
 
 # 用 python zipfile 打包（逐文件读取带重试）：jar.exe 大读盘时若被外部进程
 # 独占/删除文件会中途失败；且对含非 ASCII 路径的参数传递也更稳。
-$packArgs = @($JarOut, $mf, $Classes, $Libs) + $MustClasses + @('com\kbox\gui\ProtectorGui.class')
+$packArgs = @($JarOut, $mf, $Classes, $Libs) + $MustClasses + @('com\kbox\gui\DesktopGui.class')
 $coreSrc = Join-Path $Root 'kbox-core\src\main\java'
 $jarOk = $false
 for ($i = 0; $i -lt 8 -and -not $jarOk; $i++) {

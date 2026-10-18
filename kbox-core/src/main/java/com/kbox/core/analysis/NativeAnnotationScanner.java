@@ -13,7 +13,7 @@ import java.util.Set;
 
 /**
  * Scans the class graph for {@code @Native} and {@code @NotNative} annotations
- * and seeds the native-method config automatically. This is the ZKM-style
+ * and seeds the native-method config automatically. This is the
  * annotation-based targeting mechanism that gives developers fine-grained
  * control over which code is translated to native (JNI/C++) vs. kept as Java.
  *

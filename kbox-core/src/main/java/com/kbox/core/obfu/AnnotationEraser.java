@@ -248,6 +248,12 @@ public final class AnnotationEraser {
             "Lkotlin/",
             "Lorg/spongepowered/asm/mixin/",
             "Lnet/fabricmc/",
+            // Minecraft mod loaders resolve entry points/events from annotations at
+            // runtime and during their raw-byte class scan: @Mod, @Mod.EventHandler,
+            // @Mod.EventBusSubscriber, @SubscribeEvent, @ObjectHolder, @Config, ...
+            "Lcpw/mods/",
+            "Lnet/minecraftforge/",
+            "Lnet/neoforged/",
     };
 
     private static boolean keep(AnnotationNode a) {

@@ -36,10 +36,44 @@ public final class ResourceGuardLauncher {
     private static final String ENCRYPTED_CLASSES_PATH = "META-INF/kbox/encrypted-classes.list";
     private static final String JNIC_CLASSES_PATH = "META-INF/kbox/jnic-classes.list";
     private static final String PARENT_DELEGATE_PATH = "META-INF/kbox/parent-delegate.list";
+    /** 每构建唯一的种子：遮蔽清单（jnic-classes.list / method_epd.bin）的 keystream 来源。 */
+    private static final String BUILD_SEED_PATH = "META-INF/kbox/seed.bin";
     /** Manifest attribute that carries the real main class (dotted FQN). */
     public static final String ORIGINAL_MAIN_CLASS_ATTR = "Original-Main-Class";
 
+    /** True once a bootstrap has been performed (either `-jar` through
+     *  {@link #main} or `-cp` through {@link #bootstrapCp}). Shared across the
+     *  system and guard copies of the application main class because this class
+     *  is always parent-delegated. */
+    private static volatile boolean _booted;
+
+    /**
+     * P2-9 entry hook for {@code java -cp out.jar <MainClass>}.
+     *
+     * <p>The packer injects a call to this method at the very start of the
+     * application's {@code main}. The first (system-loader) invocation performs
+     * the normal launcher bootstrap — install the guard loader, decrypt, invoke
+     * the real main through it — and returns {@code true} so the caller stops.
+     * The guard-loaded second copy of {@code main} calls it again and gets
+     * {@code false}, i.e. it runs the real body.</p>
+     */
+    public static boolean bootstrapCp(String[] args) throws Exception {
+        if (_booted) return false;
+        synchronized (ResourceGuardLauncher.class) {
+            if (_booted) return false;
+            _booted = true;
+        }
+        main(args);
+        return true;
+    }
+
     public static void main(String[] args) throws Exception {
+        // P2-9: mark the bootstrap as done BEFORE dispatching. The application
+        // main class carries a prologue that calls bootstrapCp() so a
+        // `java -cp out.jar <MainClass>` launch is redirected through this
+        // launcher; the guard-loaded second copy of main must then fall through
+        // to its real body instead of recursing.
+        _booted = true;
         ClassLoader sys = ResourceGuardLauncher.class.getClassLoader();
 
         // 0. Anti-debug canary (silent — corrupts results on detection).
@@ -150,6 +184,10 @@ public final class ResourceGuardLauncher {
 
     /** Reads the encrypted-classes list from the classpath. Returns null if absent. */
     private static java.util.Set<String> readEncryptedClassList(ClassLoader loader) {
+        // New artifacts: masked with the build-seed keystream (P1-1); fall back to
+        // the legacy plaintext format for older builds.
+        java.util.Set<String> masked = readMaskedNameList(loader, ENCRYPTED_CLASSES_PATH);
+        if (masked != null) return masked;
         try (InputStream in = loader.getResourceAsStream(ENCRYPTED_CLASSES_PATH)) {
             if (in == null) return null;
             byte[] data = readAll(in);
@@ -167,7 +205,29 @@ public final class ResourceGuardLauncher {
 
     /** Reads the JNIC-classes list from the classpath. Returns null if absent. */
     private static java.util.Set<String> readJnicClassList(ClassLoader loader) {
+        // 新产物：清单被构建种子派生的 keystream 遮蔽（明文清单会泄漏"哪些类被 JNIC 保护"）。
+        java.util.Set<String> masked = readMaskedNameList(loader, JNIC_CLASSES_PATH);
+        if (masked != null) return masked;
+        // 兼容旧产物：未遮蔽的明文清单。
         return readNameList(loader, JNIC_CLASSES_PATH);
+    }
+
+    /** 读取被 {@code KboxListMask} 遮蔽的清单；不是遮蔽格式时返回 null（回落明文解析）。 */
+    private static java.util.Set<String> readMaskedNameList(ClassLoader loader, String path) {
+        try (InputStream in = loader.getResourceAsStream(path);
+             InputStream seedIn = loader.getResourceAsStream(BUILD_SEED_PATH)) {
+            if (in == null || seedIn == null) return null;
+            String text = com.kbox.runtime.KboxListMask.unmaskText(readAll(in), readAll(seedIn));
+            if (text == null) return null;
+            java.util.Set<String> set = new java.util.HashSet<>();
+            for (String line : text.split("\n")) {
+                line = line.trim();
+                if (!line.isEmpty()) set.add(line);
+            }
+            return set;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** Reads a newline-separated internal-name list resource. Returns null if absent. */
@@ -175,6 +235,12 @@ public final class ResourceGuardLauncher {
         try (InputStream in = loader.getResourceAsStream(path)) {
             if (in == null) return null;
             byte[] data = readAll(in);
+            // 遮蔽读失败时调用方会回落到这里；密文是任意字节，若当成类名解析会得到
+            // 一堆垃圾（JNIC 注册因此静默失效）。非可打印内容直接判为"不是明文清单"。
+            for (byte b : data) {
+                if (b == '\n' || b == '\r' || b == '\t') continue;
+                if (b < 0x20 || b > 0x7e) return null;
+            }
             String text = new String(data, java.nio.charset.StandardCharsets.UTF_8);
             java.util.Set<String> set = new java.util.HashSet<>();
             for (String line : text.split("\n")) {

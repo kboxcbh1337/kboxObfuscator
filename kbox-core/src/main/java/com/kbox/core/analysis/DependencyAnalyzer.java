@@ -105,7 +105,18 @@ public final class DependencyAnalyzer {
         if (name.endsWith(".class") && name.startsWith(clsRoot)) {
             String internal = name.substring(clsRoot.length(), name.length() - ".class".length());
             if (internal.startsWith("META-INF/versions/")) {
-                // multi-release: treat as normal class but keep original path prefix for output
+                // P2-11 multi-release jar: the versioned copy MUST NOT enter the
+                // graph (it would overwrite the base class under the same internal
+                // name and ship as the runtime class on every JDK). Keep it as a
+                // raw structural resource and remember the base name so the
+                // pipeline can keep that class un-renamed — otherwise the JVM's
+                // MR lookup (which resolves by the RENAMED name) finds nothing.
+                String rest = internal.substring("META-INF/versions/".length());
+                int slash = rest.indexOf('/');
+                String real = slash >= 0 ? rest.substring(slash + 1) : rest;
+                graph.getMultiReleaseClasses().add(real);
+                graph.getResources().put(name, readAll(zf.getInputStream(e)));
+                return;
             }
             byte[] bytes = readAll(zf.getInputStream(e));
             parseClass(internal, bytes, name);

@@ -209,7 +209,7 @@ public final class LibraryClassifier {
      * kept classes (explicit keep-prefix / entry-point) so their method bodies
      * are still encrypted and flattened — only their names are preserved.
      *
-     * <p>This mirrors how commercial obfuscators (ZKM, Allatori, etc.) treat
+     * <p>This mirrors how established obfuscators treat
      * entry points: the class/method name is kept so the JVM can launch and
      * reflection still resolves, but the body is still protected. The only
      * things that must never be touched are library classes, KBox runtime

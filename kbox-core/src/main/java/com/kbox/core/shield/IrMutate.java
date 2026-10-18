@@ -7,7 +7,7 @@ import java.util.List;
  * IrMutate — 指令变异（Instruction Mutation）。
  *
  * <p>在 IR 层把可辨识的二元/一元运算重写为代数等价的更长指令序列
- * （等价于 VMProtect/Themida 的 mutation 引擎思想）：每个构建以随机种子
+ * （mutation 引擎思想）：每个构建以随机种子
  * 选取变体，消除「单指令即单语义」的字节级签名。变异只作用于 32 位
  * 运算（IR 编译器对 64 位 BIN/UN 报错），且新增的临时虚拟寄存器通过
  * {@link IrLiveness} 保证不活跃于插入点。</p>

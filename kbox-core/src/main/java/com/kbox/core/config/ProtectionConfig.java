@@ -51,6 +51,18 @@ public final class ProtectionConfig {
      *  {@code com.kbox.runtime.bfvm} 的 Brainfuck VM 解释执行。是 BrainfuckShield
      *  （VMP 磁带化）之外的独立虚拟化路线：把真实 JVM 字节码整体变成 BF 程序。 */
     private boolean enableBfvm = false;
+    /**
+     * K-OTP：自写「一次性程序」保护（Native-Seeded One-Time Program）。
+     *
+     * <p>每个被选中的方法体先编译成 BFVM 指令流 {@code P}，再用**原生库内隐藏的
+     * 构建种子**派生的 keystream 加密成 share {@code A = P ⊕ ks(seed, site, epoch, chain)}；
+     * 类文件里只保留 A 与运行期状态 {@code (epoch, chain)}。首次调用前 native 种子不可得，
+     * 静态读到的 A 与明文无关；每次调用结束后用 {@code nanoTime/线程/参数指纹} 重定密钥并
+     * 就地重写 A（self-re-keying），因此磁盘/内存里都不存在稳定的可反编译程序。</p>
+     *
+     * <p>依赖 {@link #enableJnic}（种子由 JNIC 原生库导出）；JNIC 关闭时该开关自动失效。</p>
+     */
+    private boolean enableOtp = false;
     /** VortexVM/L2 VM interleave strength (0 = disabled). Inserts irregular {@code NOP}
      *  micro-ops between translated VMP instructions so the interpreter stream is never a
      *  linear, analysable opcode sequence. Max useful strength: 4. */
@@ -97,6 +109,11 @@ public final class ProtectionConfig {
      *  renaming entry classes and producing a jar that can never start. No-op for
      *  ordinary jars (the detector returns "not a mod"). */
     private boolean autoAdaptMinecraft = true;
+    /** Keep VMP enabled even when the input is detected as a Minecraft mod.
+     *  Default false: the mod layer's class-identity semantics break some
+     *  interpreter-side lookups. Set true for maximum strength on a jar whose
+     *  runtime you control/verify. */
+    private boolean mcForceVmp = false;
 
     // --- Anti-analysis toggles ---
     /** 0=off, 1=light, 2=medium, 3=aggressive. Injects goto chains, exception-table
@@ -126,6 +143,17 @@ public final class ProtectionConfig {
     private boolean methodInlineExtract = false;
     /** Erase runtime-visible annotations except those needed by the framework. */
     private boolean eraseAnnotations = false;
+    /**
+     * 擦除调试/结构元数据（{@code SourceFile}、{@code LineNumberTable}、
+     * {@code LocalVariableTable}、{@code MethodParameters}、{@code Exceptions}）。
+     * 默认 <b>开</b>：这些属性不会影响运行，却是"改名可反查原名"的直接原因。
+     */
+    private boolean eraseDebugInfo = true;
+    /**
+     * 额外擦除 {@code Signature} / {@code InnerClasses} / {@code EnclosingMethod}。
+     * 默认关（会牺牲泛型反射与部分框架能力），{@code allMax} 会打开。
+     */
+    private boolean eraseSignatures = false;
     /** Hide the call graph by rerouting direct calls through synthetic indirection. */
     private boolean hideCallGraph = false;
     /** Inject fake (bogus) local-variable / line-number debug info to mislead decompilers. */
@@ -151,7 +179,7 @@ public final class ProtectionConfig {
      * constants, this one rewrites the <b>live arithmetic between two run-time values</b>
      * — every {@code IADD/ISUB/IAND/IOR/IXOR} becomes an algebraically exact tree of
      * bitwise primitives (e.g. {@code a + b} -> {@code (a^b) + ((a&b)<<1)}), recursively
-     * re-expanded per level so each site's shape differs. This is the ZKM/OPS-class
+     * re-expanded per level so each site's shape differs. This is the classic
      * arithmetic obfuscation KBox previously relied on only for constants. Higher =
      * deeper trees = larger methods.</p>
      */
@@ -264,7 +292,7 @@ public final class ProtectionConfig {
     /** 现代技术栈自动适配（现代JDK特性/Kotlin协程/multi-release/JPMS/GraalVM，JDK 8..25 感知）。
      *  默认随 {@link #silentShield} 联动：在深度自检之后运行，做主动的保守排除。 */
     private boolean modernStackAdapt = true;
-    /** 商业级适配性验收报告输出路径（10年矩阵+四支柱+JDK 8..25）。{@code null} = 写入 work dir。 */
+    /** 适配性验收报告输出路径（来源类别矩阵+四支柱+JDK 8..25）。{@code null} = 写入 work dir。 */
     private String adaptabilityReport = null;
 
     /**
@@ -287,7 +315,7 @@ public final class ProtectionConfig {
     /** S6 flattener EPL sweet-spot: only flatten methods whose real (non-label)
      *  instruction count is within [flattenerMinInsns, flattenerMaxInsns]. A huge
      *  flattened switch risks StackMapTable precision blow-up (the primary static
-     *  weakness ZKM avoids by selecting); a tiny method gains nothing from a
+     *  weakness we avoid by selecting); a tiny method gains nothing from a
      *  dispatcher. Default window [16, 256] selects genuine business methods. */
     private int flattenerMinInsns = 16;
     private int flattenerMaxInsns = 256;
@@ -592,6 +620,42 @@ public final class ProtectionConfig {
 
     private final List<String> entryPoints = new ArrayList<>(); // main classes / SPI impls
 
+    /** Explicit application entry point (dotted FQN). Overrides the manifest
+     *  {@code Main-Class} / {@code Start-Class} and enables inputs that ship no
+     *  Main-Class at all (libraries launched via {@code java -cp ... <class>}).
+     *  When unset, a unique {@code public static void main(String[])} is used as
+     *  a last resort. */
+    private String mainClass;
+
+    /** Internal marker, never parsed from a config file: true while the BF blob
+     *  carries every class + resource of this build. The user's
+     *  {@code encryptClasses} / {@code obfuscateResources} values are left
+     *  untouched — the BF packer subsumes both passes (the blob is the only
+     *  carrier, so a second layer would be unreadable at runtime). */
+    private boolean bfBlobActive;
+
+    /** Report-driven self-scan: after packaging, re-read the input jar, extract
+     *  class / member / string-literal tokens and grep the produced jar for them.
+     *  A hit means original plaintext survived in the artifact (loud warning).
+     *  On by default; harmless for builds with nothing to hide. */
+    private boolean plaintextAudit = true;
+
+    /** P3-15: per-build rename map for the BF runtime surface (old internal name
+     *  → new internal name). Generated once by the pipeline and shared with
+     *  {@code BfNativeBuilder} + the packager. Never parsed from a config file;
+     *  null/empty means "keep the original names". */
+    private java.util.Map<String, String> runtimeRenameMap;
+
+    public java.util.Map<String, String> getRuntimeRenameMap() { return runtimeRenameMap; }
+    public void setRuntimeRenameMap(java.util.Map<String, String> m) { runtimeRenameMap = m; }
+
+    public String getMainClass() { return mainClass; }
+    public void setMainClass(String v) { mainClass = (v == null || v.isEmpty()) ? null : v; }
+    public boolean isBfBlobActive() { return bfBlobActive; }
+    public void setBfBlobActive(boolean v) { bfBlobActive = v; }
+    public boolean isPlaintextAudit() { return plaintextAudit; }
+    public void setPlaintextAudit(boolean v) { plaintextAudit = v; }
+
     public boolean isRenameIdentifiers() { return renameIdentifiers; }
     public void setRenameIdentifiers(boolean v) { renameIdentifiers = v; }
     public boolean isEncryptStrings() { return encryptStrings; }
@@ -606,6 +670,8 @@ public final class ProtectionConfig {
     public void setEnableVmp(boolean v) { enableVmp = v; }
     public boolean isEnableBfvm() { return enableBfvm; }
     public void setEnableBfvm(boolean v) { enableBfvm = v; }
+    public boolean isEnableOtp() { return enableOtp && enableJnic; }
+    public void setEnableOtp(boolean v) { enableOtp = v; }
     public int getVmpInterleave() { return vmpInterleave; }
     public void setVmpInterleave(int v) { vmpInterleave = Math.max(0, v); }
     public boolean isBrainfuckShield() { return brainfuckShield; }
@@ -630,6 +696,8 @@ public final class ProtectionConfig {
     public void setFixKotlinMetadata(boolean v) { fixKotlinMetadata = v; }
     public boolean isAutoAdaptMinecraft() { return autoAdaptMinecraft; }
     public void setAutoAdaptMinecraft(boolean v) { autoAdaptMinecraft = v; }
+    public boolean isMcForceVmp() { return mcForceVmp; }
+    public void setMcForceVmp(boolean v) { mcForceVmp = v; }
 
     public int getAntiDecompilerLevel() { return antiDecompilerLevel; }
     public void setAntiDecompilerLevel(int v) { antiDecompilerLevel = Math.max(0, Math.min(3, v)); }
@@ -654,6 +722,10 @@ public final class ProtectionConfig {
     public void setMethodInlineExtract(boolean v) { methodInlineExtract = v; }
     public boolean isEraseAnnotations() { return eraseAnnotations; }
     public void setEraseAnnotations(boolean v) { eraseAnnotations = v; }
+    public boolean isEraseDebugInfo() { return eraseDebugInfo; }
+    public void setEraseDebugInfo(boolean v) { eraseDebugInfo = v; }
+    public boolean isEraseSignatures() { return eraseSignatures; }
+    public void setEraseSignatures(boolean v) { eraseSignatures = v; }
     public boolean isHideCallGraph() { return hideCallGraph; }
     public void setHideCallGraph(boolean v) { hideCallGraph = v; }
     public boolean isFakeDebugInfo() { return fakeDebugInfo; }
@@ -950,6 +1022,7 @@ public final class ProtectionConfig {
         c.enableVmp = enableVmp;
         c.vmpProtectRuntime = vmpProtectRuntime;
         c.enableBfvm = enableBfvm;
+        c.enableOtp = enableOtp;
         c.vmpInterleave = vmpInterleave;
         c.brainfuckShield = brainfuckShield;
         c.brainfuckShieldLevel = brainfuckShieldLevel;
@@ -961,6 +1034,7 @@ public final class ProtectionConfig {
         c.brainfuckMcHybrid = brainfuckMcHybrid;
         c.fixKotlinMetadata = fixKotlinMetadata;
         c.autoAdaptMinecraft = autoAdaptMinecraft;
+        c.mcForceVmp = mcForceVmp;
         c.antiDecompilerLevel = antiDecompilerLevel;
         c.antiDebug = antiDebug;
         c.vmpSelfCheck = vmpSelfCheck;
@@ -991,6 +1065,8 @@ public final class ProtectionConfig {
         c.jnicFullCoverage = jnicFullCoverage;
         c.vmpFullCoverage = vmpFullCoverage;
         c.entryPoints.addAll(entryPoints);
+        c.mainClass = mainClass;
+        c.plaintextAudit = plaintextAudit;
         c.encryptResourcePatterns.addAll(encryptResourcePatterns);
         c.excludeResourcePatterns.addAll(excludeResourcePatterns);
         c.encryptClassPrefixes.addAll(encryptClassPrefixes);
@@ -1010,6 +1086,8 @@ public final class ProtectionConfig {
         c.suppressWarnings = suppressWarnings;
         c.methodInlineExtract = methodInlineExtract;
         c.eraseAnnotations = eraseAnnotations;
+        c.eraseDebugInfo = eraseDebugInfo;
+        c.eraseSignatures = eraseSignatures;
         c.hideCallGraph = hideCallGraph;
         c.fakeDebugInfo = fakeDebugInfo;
         c.whiteboxStrings = whiteboxStrings;
@@ -1056,7 +1134,7 @@ public final class ProtectionConfig {
                 + ", vmpChk=" + vmpSelfCheck + ", scatter=" + scatterStrings
                 + ", wm=" + (watermark != null) + ", integ=" + integrityCheck
                 + ", exJmp=" + exceptionJumpObf + ", ntvHook=" + nativeAntiHook
-                + ", nullGuard=" + nullGuard
+                + ", nullGuard=" + nullGuard + ", otp=" + isEnableOtp()
                 + ", keepPrefix=" + keepPrefixes + ", cc=" + cc
                 + ", nativeLibs=" + protectNativeLibs
                 + ", shieldNativeOutput=" + shieldNativeOutput
@@ -1122,6 +1200,11 @@ public final class ProtectionConfig {
         hideCallGraph = true;
         fakeDebugInfo = true;
         methodInlineExtract = true;
+        // 元数据擦除：调试属性（SourceFile/LineNumberTable/LVT/MethodParameters）默认已开——
+        // SourceFile 未擦会让"改名"100% 可反查原名（v3.0.1 强度测试报告 P0）。最大强度
+        // 额外擦除 Signature/InnerClasses/EnclosingMethod（牺牲泛型反射，换取结构信息不泄漏）。
+        eraseDebugInfo = true;
+        eraseSignatures = true;
         // eraseAnnotations is deliberately NOT part of the max preset: erasing
         // RUNTIME annotations changes observable application semantics (an app
         // that reads its own annotations suddenly sees null), and the erase list
@@ -1156,6 +1239,8 @@ public final class ProtectionConfig {
         enableBfvm = true;
         brainfuckShield = true;
         brainfuckShieldLevel = 3;
+        // ---- K-OTP 一次性程序（依赖 JNIC 原生种子） ----
+        enableOtp = true;
         // ---- native shell ----
         nativeShell = 3;
         // ---- jar 自带原生库完整加壳（.dll 走 kboXShield PE 壳 + 虚拟化；.so/.dylib 加密） ----

@@ -21,7 +21,7 @@ import java.nio.file.Paths;
  *   <li>{@code --input PATH} — input jar (plain or Spring Boot fat jar)</li>
  *   <li>{@code --output PATH} — output jar path</li>
  *   <li>{@code --config PATH} — protection config file (optional; defaults applied)</li>
- *   <li>{@code --gui}        — launch the HTML UI (embedded HTTP server + browser) instead of running headless</li>
+ *   <li>{@code --gui}        — launch the KBox desktop UI (Swing) instead of running headless</li>
  *   <li>{@code --verbose}    — enable DEBUG logging (full progress + stack traces)</li>
  *   <li>{@code --debug-cf}   — per-file control-flow debug to stdout (always visible)</li>
  * </ul>
@@ -32,9 +32,9 @@ import java.nio.file.Paths;
 public final class ProtectorCli {
 
     public static void main(String[] args) {
-        // 双击 / 无参数启动：默认打开 HTML UI（命令行带参数才是指令操控）。
+        // 双击 / 无参数启动：默认打开桌面界面（命令行带参数才是指令操控）。
         if (args.length == 0) {
-            launchGui(null, null, null, false, "ask");
+            launchGui(null, null, null, false);
             return;
         }
         // kboXShield 独立功能线（PE 加壳）：--shield <in.exe> <out.exe>
@@ -52,7 +52,6 @@ public final class ProtectorCli {
         String mcPreset = null;
         boolean autoMc = false;
         boolean gui = false, verbose = false, debugCf = false;
-        String ui = "ask"; // --ui html|zkm|ask
         java.util.List<String> includePatterns = new java.util.ArrayList<>();
         java.util.List<String> excludePatterns = new java.util.ArrayList<>();
         String scope = null;
@@ -68,6 +67,7 @@ public final class ProtectorCli {
         Boolean shieldNativeOutput = null; // --shield-native-output <true|false>
         boolean neverFail = true; // safe default
         String logFile = null;    // optional UTF-8 log tap (fixes console mojibake)
+        String mainClass = null;  // --main-class: explicit application entry point
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--input": case "-i": in = next(args, i++); break;
@@ -75,7 +75,6 @@ public final class ProtectorCli {
                 case "--config": case "-c": cfgPath = next(args, i++); break;
                 case "--mapping": case "-mapping": mappingPath = next(args, i++); break;
                 case "--gui": gui = true; break;
-                case "--ui": ui = next(args, i++).trim().toLowerCase(); break;
                 case "--verbose": case "-v": verbose = true; break;
                 case "--debug-cf": debugCf = true; break;
                 case "--mc-preset": mcPreset = next(args, i++); break;
@@ -86,6 +85,9 @@ public final class ProtectorCli {
                 case "--shield-native-output": case "--shieldNativeOutput":
                     shieldNativeOutput = bool(next(args, i++)); break;
                 case "--log": case "--log-file": logFile = next(args, i++); break;
+                // Explicit entry point for inputs without a manifest Main-Class
+                // (`java -cp out.jar <class>` launches).
+                case "--main-class": case "--mainClass": mainClass = next(args, i++); break;
                 // ---- ProGuard-style adaptive flags ----
                 case "-keep": case "--keep":
                     keepSpecs.add(next(args, i++)); break;
@@ -128,7 +130,7 @@ public final class ProtectorCli {
 
         if (gui) {
             // Launch GUI directly (kbox-gui is now a dependency of kbox-cli).
-            launchGui(in, out, cfgPath, verbose, ui);
+            launchGui(in, out, cfgPath, verbose);
             return;
         }
         if (in == null || out == null) {
@@ -173,6 +175,8 @@ public final class ProtectorCli {
             if (mappingPath != null) cfg.setMappingFile(mappingPath);
             // --shield-native-output overrides the config key of the same name.
             if (shieldNativeOutput != null) cfg.setShieldNativeOutput(shieldNativeOutput);
+            // --main-class overrides the manifest entry point.
+            if (mainClass != null) cfg.setMainClass(mainClass);
             // Apply Minecraft mod preset if requested.
             if (mcPreset != null) {
                 applyMcPreset(cfg, mcPreset);
@@ -272,7 +276,7 @@ public final class ProtectorCli {
     }
 
     private static void printHelp() {
-        System.out.println("KBox Obfuscator — ZKM-level + JNIC + VMP Java protection");
+        System.out.println("KBox Obfuscator — Java application protection system");
         System.out.println("Usage: java -jar kbox-protector.jar --input <in.jar> --output <out.jar>");
         System.out.println("                                [--config kbox.conf] [--gui] [--verbose] [--debug-cf]");
         System.out.println("                                [--mc-preset NEOFORGE|FORGE|FABRIC|BUKKIT|MIXIN]");
@@ -281,16 +285,14 @@ public final class ProtectorCli {
         System.out.println("                                [ProGuard-style adaptive flags]");
         System.out.println("                                [--list-presets]");
         System.out.println();
-        System.out.println("  (无参数直接双击/运行 = 打开 HTML UI；带参数 = 命令行指令操控)");
+        System.out.println("  (无参数直接双击/运行 = 打开桌面界面；带参数 = 命令行指令操控)");
         System.out.println("Flags:");
         System.out.println("  --input, -i PATH        Input jar (plain or Spring Boot fat jar)");
         System.out.println("  --output, -o PATH       Output jar path");
         System.out.println("  --mapping PATH          Write a ProGuard-compatible deobfuscation mapping file");
         System.out.println("                          (reverse obfuscation for stack traces; overrides mappingFile in config)");
         System.out.println("  --config, -c PATH       Protection config file (optional)");
-        System.out.println("  --gui                   Launch the UI (asks which one; see --ui)");
-        System.out.println("  --ui html|zkm|ask       Which GUI to use (default ask):");
-        System.out.println("                           html = 原版内嵌 HTML UI; zkm = ZKM 式原生 Swing UI");
+        System.out.println("  --gui                   Launch the KBox desktop UI (Swing)");
         System.out.println("  --verbose, -v           Enable DEBUG logging (full progress + stack traces)");
         System.out.println("  --debug-cf              Per-file control-flow debug to stdout (always visible)");
         System.out.println("  --log PATH              Also write every log line to PATH as UTF-8");
@@ -306,8 +308,8 @@ public final class ProtectorCli {
         System.out.println("                           SELECTIVE = only obfuscate files matching --include");
         System.out.println("                           EXCLUDE = obfuscate all except files matching --exclude");
         System.out.println("  --shield-native-output B kboXShield-pack the JNIC/VMP/native-crypto libs");
-        System.out.println("                           (native.bin/vmp.bin) before KBNL packing: true|false");
-        System.out.println("                           (default true; false = plain KBNL only). Same as the");
+        System.out.println("                           (native.bin/vmp.bin) before container packing: true|false");
+        System.out.println("                           (default true; false = store the raw container only). Same as the");
         System.out.println("                           shieldNativeOutput config key.");
         System.out.println("  --include PATTERN        Class pattern to include (repeatable).");
         System.out.println("                           e.g. com/example/** com/foo/Bar");
@@ -343,18 +345,9 @@ public final class ProtectorCli {
         System.out.println("Adaptive example: java -jar kbox.jar -i app.jar -o out.jar -keep com.example.Main -dontwarn");
     }
 
-    /**
-     * Launches a GUI. Which one is decided by {@code ui}:
-     * <ul>
-     *   <li>{@code html} — the original embedded HTTP UI ({@code ProtectorGui})</li>
-     *   <li>{@code zkm}  — the ZKM-style native Swing UI ({@code ZkmStyleGui})</li>
-     *   <li>{@code ask}  — prompt at run time (default); falls back to {@code html}
-     *       when the environment is headless</li>
-     * </ul>
-     */
-    private static void launchGui(String in, String out, String cfgPath, boolean verbose, String ui) {
-        String chosen = resolveUi(ui);
-        String cls = "zkm".equals(chosen) ? "com.kbox.gui.ZkmStyleGui" : "com.kbox.gui.ProtectorGui";
+    /** 启动 KBox 桌面界面（{@code com.kbox.gui.DesktopGui}，反射调用）。 */
+    private static void launchGui(String in, String out, String cfgPath, boolean verbose) {
+        String cls = "com.kbox.gui.DesktopGui";
         try {
             Class<?> guiCls = Class.forName(cls);
             guiCls.getMethod("launch", String.class, String.class, String.class, boolean.class)
@@ -369,35 +362,6 @@ public final class ProtectorCli {
             System.err.println();
             printHelp();
             System.exit(2);
-        }
-    }
-
-    /** {@code --ui html|zkm} decides directly; {@code ask} prompts (headless → html). */
-    private static String resolveUi(String ui) {
-        if ("html".equals(ui) || "zkm".equals(ui)) return ui;
-        try {
-            if (java.awt.GraphicsEnvironment.isHeadless()) return "html";
-            final String[] result = { "html" };
-            try {
-                javax.swing.SwingUtilities.invokeAndWait(() -> {
-                    Object[] options = { "原版 HTML UI", "ZKM 式 UI" };
-                    int r = javax.swing.JOptionPane.showOptionDialog(null,
-                            "请选择要使用的混淆器界面：\n\n"
-                                    + "· 原版 HTML UI：内嵌 HTTP 服务 + 浏览器（现有界面）\n"
-                                    + "· ZKM 式 UI：原生 Swing（菜单栏 / 类浏览器 / 选项标签页 / 日志）\n\n"
-                                    + "（下次可用 --ui html 或 --ui zkm 直接指定，跳过本询问）",
-                            "KBox Obfuscator — 选择界面",
-                            javax.swing.JOptionPane.DEFAULT_OPTION,
-                            javax.swing.JOptionPane.QUESTION_MESSAGE,
-                            null, options, options[0]);
-                    result[0] = (r == 1) ? "zkm" : "html";
-                });
-            } catch (Throwable t) {
-                return "html";
-            }
-            return result[0];
-        } catch (Throwable t) {
-            return "html";
         }
     }
 }

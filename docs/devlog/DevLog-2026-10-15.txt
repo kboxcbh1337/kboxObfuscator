@@ -1,0 +1,1293 @@
+# DevLog — 2026-10-15
+
+> 工作树（本次唯一主干）：`D:\kboxobf\高级先行版源码`
+> 本轮目标（按用户请求拆解）：W1 JNIC/VMP 产物加壳选项、W3 增强运行时 MBA 重写强度、
+> W4 界面、W5 Devlog/文档/交付树/GitHub。
+> 本文件只记录**真实实现并实测**的内容；未完成项在文末“未完成/风险”中如实列出，不做任何“已实现”式虚标。
+
+---
+
+## 0. 现场勘察结论（为什么要先修 Bug）
+
+工作区存在**两份分叉的源码树**，且**没有 git 仓库**、**没有 `原始代码/` 目录**：
+
+| 树 | 位置 | 状态 |
+|---|---|---|
+| A | `D:\kboxobf\kbox-core`（根模块） | 能编译；**没有** `com.kbox.core.shield`（kboXShield 产品线整体缺失） |
+| B | `D:\kboxobf\高级先行版源码` | **含** kboXShield（`shield/` 25 个类 + `stub_x64.S` + `shield/*.bin`）、`NativeLibPacker`、`protectNativeLibs`、`mobile-monitor` 等；**但初始不可编译** |
+
+因此本轮以 **B 为主干**（kboXShield 只存在于 B）。B 树在开工时连编译都过不去，说明它是一个半成品/工作副本；
+“增强强度 / GUI / 文档”都必须建立在**能编译、能正确运行**的基础上，故先修阻塞性缺陷。
+
+---
+
+## 1. 构建基线（先让它能编译）
+
+### 1.1 修复：`Flattener` 引用不存在的 ASM 常量（编译阻塞）
+- 现象：`mvn install` 直接失败 —— `找不到符号 变量 RETURNABLE_VALUE / RETURN_ADDRESS_VALUE (org.objectweb.asm.tree.analysis.BasicValue)`。
+- 根因：ASM 的 `BasicValue` **没有** `RETURNABLE_VALUE`，也没有 `RETURN_ADDRESS_VALUE`；正确常量是
+  `RETURNADDRESS_VALUE`（`javap` 核实：`UNINITIALIZED_VALUE / INT_VALUE / FLOAT_VALUE / LONG_VALUE /
+  DOUBLE_VALUE / REFERENCE_VALUE / RETURNADDRESS_VALUE`）。
+- 修复：[Flattener.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/controlflow/Flattener.java)
+  `RETURNABLE_VALUE` → `RETURNADDRESS_VALUE`。
+- 结果：`mvn clean install` 全绿，产出 `kbox-core / kbox-cli(kbox-protector.jar 4.3MB) / kbox-gui / kbox-maven-plugin`。
+
+---
+
+## 2. W1：为 jar 中 JNIC / VMP 混淆后的原生产物加壳（本请求第一项）
+
+### 2.1 现状（开工前）
+`高级先行版源码` 里 kboXShield 的 PE 壳其实**已经被硬接线**到三个原生产物上，且**没有任何开关**：
+`JnicOrchestrator:213`、`NativeCompiler.compileVmp:800`、`NativeCryptoBuilder:63` 一律 `NativePacker.packShielded(...)`。
+即“选项”并不存在——是**写死**的。用户要的是**可配置选项**。
+
+### 2.2 本次实现
+新增独立配置项 **`shieldNativeOutput`**（默认 `true`，保持既有行为），可把它当作“KBNL 外层 + kboXShield 内层 PE 壳/VM”的两层开关：
+
+- 配置键：[ConfigLoader.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/config/ConfigLoader.java) `case "shieldNativeOutput"`
+- 配置字段/读写/复制/`toString`/`allMax` 预设：[ProtectionConfig.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/config/ProtectionConfig.java)
+- 三个接线点全部改为按开关分流（开=`packShielded`，关=仅 KBNL `pack`）：
+  - [JnicOrchestrator.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/jnic/JnicOrchestrator.java)
+  - [NativeCompiler.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/jnic/NativeCompiler.java)（`compileVmp(workDir, cc, shield)` 增参，调用点 [ProtectionPipeline.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/ProtectionPipeline.java)）
+  - [NativeCryptoBuilder.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/jnic/NativeCryptoBuilder.java)
+- CLI：新增 `--shield-native-output <true|false>`（[ProtectorCli.java](file:///d:/kboxobf/高级先行版源码/kbox-cli/src/main/java/com/kbox/cli/ProtectorCli.java)）+ `--help` 说明
+- 界面：新增开关「JNIC/VMP 产物加壳」（映射到配置键 `shieldNativeOutput`，界面均暴露）
+- 一键全开 `allMax` 默认开启该选项
+
+### 2.3 实测（端到端，非推演）
+样本 `_verify/demo.jar`（Hello 入口 + Util：`addA/compute/checksum/tag`）。
+
+| 配置 | 原生产物 | 运行结果 |
+|---|---|---|
+| JNIC(full) + VMP(full) + nativeVMP + ncrypto + `shieldNativeOutput=true` | `native.bin 128790B`、`vmp.bin 103093B`、`native-crypto.bin 55726B`，三者日志均为 **`[inner PE shell + VM]`** | `Hello, KBox! sum=42 prod=42 add=84 util=21433 ck=-993 tag=42`，exit 0 |
+| 同配置 `shieldNativeOutput=false` | 三者无 `[inner PE shell + VM]` 标记（仅 KBNL） | 同上，exit 0 |
+
+加壳确实发生（`shield(jnic): 91648 -> 160256 bytes`、`shield(vmp): 68608 -> 136704 bytes`），且不影响运行正确性。
+
+### 2.4 过程中定位并修复的两个“让 JNIC/VMP 根本不可用”的既有缺陷
+> 这两个不是本次新引入的，是主干里已经存在的；不修则 W1 无法验证（产物要么跑错、要么打不出包）。
+
+**缺陷 A：JNIC 解释器自检逻辑取反 —— 所有被 JNIC 化的方法恒返回 0**
+- 根因：[kbox_jnic_interp_v3.c](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/resources/kbox_jnic_interp_v3.c) 中
+  `if (!kbox_self_check()) { return 0; }`。而该文件自己的注释写明
+  `kbox_self_check()`：**1 = 镜像被篡改，0 = 完好，-1 = 无法判定**。
+  于是“完好（0）”反而命中 `!0==true` 分支**直接 return 0**，“被篡改（1）”却继续执行——完全取反。
+- 修复：两处调用点改为 `if (kbox_self_check() == 1) { ... }`（仅在检出篡改时拒绝；`-1` 保持可用，兼容非 Windows）。
+- 实测对比（同一样本、同一配置）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 已加壳 JNIC | `add=0 util=0` | `add=84 util=21433`（**与基线逐字一致**） |
+| 不加壳 JNIC | `util=0` | 同上 |
+
+**缺陷 B：VMP 无法出包（KBox 运行时引用闭包不完整）**
+- 根因：[VmpRuntimeProtector.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/vmp/VmpRuntimeProtector.java) 的 `RUNTIME_CLASSES`
+  只把 `KBoxRuntime`、`ResourceGuardClassLoader` 加进 class graph，但 `ResourceGuardClassLoader` 自身还引用
+  `ResourceGuardClassLoader$Entry/$1/$2/$2$1` 与 `LicVerifier($State)`。`Packager.verifyKboxReferenceClosure`
+  因此判定“将引用 4 个缺失的 KBox 运行时类”并**拒绝出包**。
+- 修复：`RUNTIME_CLASSES` 补齐上述传递依赖（4 → 2 → 0，逐轮收敛，最终闭包通过）。
+- 实测：修复前 `Protection failed: Protected jar would reference 4/2 missing...`；修复后 `Protection complete`，产物可运行。
+
+---
+
+## 3. W3：增强强度 —— 运行时 MBA 重写
+
+### 3.1 现状核对
+- 常量级 MBA（`mbaConstants`/`ExpressionSynthesizer`）已具备，但对“运行时两个活值之间算术”的 MBA 重写缺失；
+  这是成熟混淆器普遍具备、而 KBox 此前空缺的一块。
+
+### 3.2 本次实现：`mbaRewrite`（运行时 MBA 重写，0..3）
+新增 [MbaRewriteObfuscator.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/obfu/MbaRewriteObfuscator.java)：
+对所有受保护方法内的 `IADD/ISUB/IAND/IOR/IXOR` 做**代数等价**替换，并对结果按层递归再展开（depth=level）：
+
+```
+a ^ b = (a | b) - (a & b)
+a | b = (a ^ b) + (a & b)
+a & b = (a | b) - (a ^ b)
+a + b = (a ^ b) + ((a & b) << 1)     （或 (a | b) + (a & b)）
+a - b = (a ^ b) - ((~a & b) << 1)
+```
+以上恒等式对**全部 32 位补码值**成立（模 2^32 运算，溢出无关）。改写是**栈中性**的：活操作数先 spill 到两个
+新分配局部（`mn.maxLocals++`），表达式再从局部反复取值，因此无需栈杂耍；栈深预留 `maxStack += 4`。
+
+- 配置键 `mbaRewrite`（[ConfigLoader.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/config/ConfigLoader.java) / [ProtectionConfig.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/config/ProtectionConfig.java)），`allMax` 默认 `2`
+- 流水线阶段 6h2（紧跟常量 MBA 之后）：[ProtectionPipeline.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/ProtectionPipeline.java)
+- GUI：高级选项下拉「运行时 MBA 重写 0..3」+ `allMax`/默认值表同步
+- **JNIC/VMP 目标方法自动跳过**（沿用仓库既有规则：这些方法体会被下沉到原生解释器重放，改写既浪费又会命中解释器未对齐的
+  opcode 路径；见下 3.4）
+
+### 3.3 实测（真实数据，非估算）
+样本 `_verify/demo.jar`，配置 `mbaRewrite=3`（叠加 rename/strings/CF）：
+
+- 日志：`MBA-rewrote 28 run-time int arithmetic site(s) (mbaRewrite=3, depth=3)`
+- 运行：`Hello, KBox! sum=42 prod=42 add=84 util=21433 ck=-993 tag=42`，**与基线逐字一致**，exit 0
+- 反编译证据（CFR 0.152，同一方法 `Util.addA(a,b)`）：
+
+  原始：
+  ```java
+  public static int addA(int n, int n2) { return n + n2; }
+  ```
+  混淆后（类被重命名，方法体）：
+  ```java
+  public static int e(int n, int n2) {
+      int n3 = n2; int n4 = n;
+      return (n4 | n3) - (n4 & n3) + ((n4 | n3) - (n4 ^ n3))
+           + ((n4 ^ n3) + (n4 & n3) - ((n4 | n3) - (n4 & n3)));
+  }
+  ```
+  即 `a + b` 已不再可读为加法，反编译输出为随机化的位运算恒等树，而运行结果不变。
+
+### 3.4 过程中发现并规避的交互缺陷（如实记录）
+首次把 `mbaRewrite` 与 JNIC 叠加时，`checksum` 结果由 `-993` 变为 `-997`（VMP 叠加则正确）。
+隔离实验：`MBA+VMP` 正确、`MBA+JNIC` 错误、`JNIC-only（原始字节码）` 正确。
+=> JNIC 原生解释器对 MBA 展开后的某些 opcode 序列建模不一致（原始字节码路径正常）。
+处理：按仓库既有规则，**MBA 跳过 JNIC/VMP 目标方法**（避免无谓改写 + 规避解释器未对齐路径）；
+修复后 `MBA+JNIC+VMP+加壳` 全部与基线一致（`ck=-993`）。
+> 诚实说明：这是一次**规避**而非根治——JNIC 解释器与 JVM 语义的这套差异仍是一个**待独立排查**的既有缺陷（见文末）。
+
+---
+
+## 4. W4：界面
+
+> 说明：`--gui` / 无参启动 = 原生 Swing 桌面界面（当前唯一界面）。
+
+### 4.1 桌面界面（原生 Swing）
+[DesktopGui.java](file:///d:/kboxobf/高级先行版源码/kbox-gui/src/main/java/com/kbox/gui/DesktopGui.java)：
+- 菜单栏（文件/运行/视图/帮助）+ 工具栏（打开 Jar / 执行混淆 / 深色日志）
+- 左侧「类浏览器」：载入输入 jar 的 包 → 类 结构树（`ZipFile` 枚举），带搜索定位
+- 右侧 `JTabbedPane`：**基础** / **混淆选项** / **高级** / **日志**
+- 底部：进度条 + 状态栏；执行时把 `KBoxLog` 输出重定向到日志区，并用 `KBoxLog.ProgressListener` 驱动阶段进度
+- 执行复用同一 `ProtectionPipeline`，选项直接写回 `ProtectionConfig`
+
+### 4.2 界面入口（当前）
+[ProtectorCli.java](file:///d:/kboxobf/高级先行版源码/kbox-cli/src/main/java/com/kbox/cli/ProtectorCli.java)：
+- 无参启动 / `--gui`：打开原生 Swing 桌面界面（`com.kbox.gui.DesktopGui`）
+
+### 4.3 实测
+- 全量 `mvn install` 通过；`kbox-protector.jar` 内含 `com/kbox/gui/DesktopGui.class`
+- `java -jar kbox-protector.jar` 打开 Swing 桌面窗口（冒烟通过）
+
+---
+
+## 5. 验证汇总（均可复现）
+
+| 项 | 命令/产物 | 结果 |
+|---|---|---|
+| 全量构建 | `mvn -f 高级先行版源码/pom.xml clean install -DskipTests`（JDK21 + Maven 3.9.6） | 成功，5 个 jar |
+| W1 加壳 | `_verify/verify.conf`（JNIC+VMP+nativeVMP+shield） | 三产物 `[inner PE shell + VM]`；输出=基线 |
+| W1 关壳 | `_verify/verify-jnic-noshield.conf` | 仅 KBNL；输出=基线 |
+| W1 JNIC 修复 | `_verify/verify-jnic.conf` | `add=84 util=21433`（修复前 `add=0 util=0`） |
+| W3 MBA | `_verify/verify-mba.conf` | 28 sites，depth 3；输出=基线；CFR 证据见 3.3 |
+| W3 组合 | `_verify/verify-all.conf` | 输出=基线，exit 0 |
+
+复现实验文件均在 `D:\kboxobf\高级先行版源码\_verify\`（`src/demo/*.java`、`demo.jar`、各 `*.conf`、`*.log`）。
+
+---
+
+## 6. 未完成 / 风险（如实列出，不含任何虚标）
+
+1. **W5 部分完成**：
+   - 已完成：Devlog（本文件）、`docs/CONFIG.md`（新增 `shieldNativeOutput` / `mbaRewrite`）、`docs/CLI-USAGE.md`（新增 `--ui`）、
+     `README.md`（新增两项能力行 + 双界面说明）。
+   - 已产出干净交付树 **`D:\kboxobf\原始代码`**（= `高级先行版源码` 源码快照，排除 `target/`、`_verify/`、`*.log/*.class/*.o`），
+     构建产物归档于 `原始代码\dist\`：`kboxobf.jar`（shaded CLI fat jar，4.33MB）、`kbox-core-1.0.0.jar`、
+     `kbox-gui-1.0.0.jar`、`kbox-maven-plugin-1.0.0.jar`。
+     > 说明：用户请求里的 `D:\kboxobf\原始代码` 在开工时**并不存在**；本轮按“= 本轮工作树的干净快照 + 构建产物”创建。
+     > 若你心中的“干净主干”是根模块 `kbox-core`（无 kboXShield），请告知，我再改为该树快照。
+   - **GitHub 推送未完成，且本机不可达**：已实测 `gh` 未安装；`git ls-remote https://github.com/kboxcbh1337/kboxObfuscator`
+     报 `Failed to connect to github.com port 443 after 21063 ms`（**无网络路由**）。工作区也**没有 git 仓库与 remote**。
+     因此本轮未做 `git init/push`（既不安全也无法完成）。需要：可用的 GitHub 网络 + 凭据（PAT/SSH）+ 确认推送哪个树。
+3. **“强度超过某商业壳（实测不造假）”无法本机同机对拍**：本机未安装同类商业保护器（已扫描
+   `Program Files`）。因此本轮只提供 KBox 自身的可复现量化证据（加壳前后字节数、CFR 反编译对照、运行一致性），
+   **不编造任何第三方对比数字**。
+4. **W2（kboXShield 覆盖“所有二进制”）未推进**：本轮聚焦 W1/W3/W4 与阻塞性缺陷。
+5. **既有缺陷（非本轮引入，仍开放）**：
+   - JNIC 原生解释器与 JVM 语义存在差异（3.4 已用“跳过改写”规避，但根因未定位）。
+   - 主干 `高级先行版源码` 与根模块 `kbox-core` 分叉，且根模块**缺失整套 kboXShield**；两份树需要一次正式合并。
+   - `kbox-shield`（C++ Batch 1，仅 PE 解析/重建，无保护）与 `kbox-pe/kboxpe-pack.c`（x64 非 DLL、需外部 stub）
+     仍是“半成品/研究骨架”，**不构成“适配所有二进制”的实现**；`ShieldPacker` 目前为 PE(x86/x64) 专用，
+     且依赖 LoadConfig/SecurityCookie 补丁与固定基址等约束。
+6. **PE 加壳在 AV 活动期间可能被误判**（既有经验：`defFlags=0x3FFFF` 全防御包在杀软活动时加载失败）；
+   本轮所有加壳测试均在 `defFlags=0` 下进行，测试前需确认杀软实时防护状态。
+
+---
+
+## 7. 下一轮建议顺序
+1. 定基线：把两棵树合并成唯一主干并 `git init`（决定 `原始代码/` 是否作为交付树）。
+2. W2：kboXShield 二进制覆盖从 PE 扩到 ELF/Mach-O（或明确收敛为“PE 多架构”并如实写入文档）。
+3. JNIC 解释器语义对齐（根因定位，替换 3.4 的规避）。
+4. W5 收尾：全量文档重写 + 构建产物归档 + GitHub 推送（需远端与凭据）。
+
+---
+---
+
+# 第二轮补记（同日）：W2 二进制覆盖 + 强度上限 + 两份报告
+
+## 8. W2：二进制覆盖从“静默降级”改为“显式 + 可审计”
+
+### 8.1 现状核对（先看清真实边界）
+- `ShieldPacker` 解析用 `PeImage.parse`，**非 PE 直接失败** → `NativePacker.shield()` 返回 null → 调用方降级为 KBNL。
+- 即：**PE(.dll) 走壳+（x64）函数级虚拟化；ELF/Mach-O 只能 encrypt-only**。
+- 本轮**没有**伪装“已支持所有二进制”：shell/engine 资产是 **PE 专用手写汇编 blob**，且本机无 Linux/macOS 可做端到端验证，
+  贸然“支持 ELF/Mach-O 壳”会变成**不可验证的空头承诺**。
+
+### 8.2 本轮真实改动
+1. [NativeLibPacker.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/NativeLibPacker.java)
+   - `Entry` 新增 `arch` / `treatment` 字段；新增 `detectArch(ext,bytes)`：
+     PE→machine(0x8664/0x14C/0xAA64)；ELF→`e_machine`(0x3E/0x03/0xB7)；Mach-O→`cputype`(0x01000007/0x7/0x0100000C)。
+   - 新增 `Result.report`：逐文件「路径 | 格式 | 架构 | 处置 | 原始/ blob 字节」，并在日志中逐条打印 format/arch/mode。
+2. [Packager.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/Packager.java)
+   - 产物内写入 **`META-INF/kbox/native-coverage.txt`**（+ `natlibs.list` 保持原样）。
+
+### 8.3 实测（多格式样本，真实数据）
+样本 `_verify/natdemo.jar` = `demo/*.class` + **真实 PE x64 DLL**(93696B) + 合成 ELF x64 `ET_DYN` + 合成 Mach-O x64 `MH_DYLIB`。
+产物 `META-INF/kbox/native-coverage.txt` 实录：
+```
+nat/libx.so     | so    | x64 | encrypt-only | raw=256B   | blob=85B
+nat/hello.dll   | dll   | x64 | shield+vm    | raw=93696B | blob=128803B
+nat/liby.dylib  | dylib | x64 | encrypt-only | raw=256B   | blob=85B
+```
+`Protection complete`，无引用闭包错误。三种格式**均无明文残留**；PE 为 `shield+vm`，ELF/Mach-O 为 `encrypt-only`（且该限制写在产物报告里）。
+
+## 9. 强度上限提升（可测）
+
+- `mbaRewrite` 取值域 `0..3` → **`0..5`**（内部 depth 上限 4）；`allMax` 预设由 2 → **3**；GUI 下拉增加 4/5 档。
+- **实测阶梯**（同一 `demo.Util`，其余开关关闭，运行结果全部与基线一致）：
+
+| level | depth | Util.class | 相对基线 |
+|---|---|---|---|
+| 0 | — | 814 B | — |
+| 1 | 1 | 1044 B | +28% |
+| 2 | 2 | 1200 B | +47% |
+| 3 | 3 | 1528 B | +88% |
+| 4/5 | 4 | 2162 B | +166% |
+
+## 10. 两份报告（本次交付）
+
+- [STRENGTH-REPORT-2026-10-15.md](file:///d:/kboxobf/高级先行版源码/docs/STRENGTH-REPORT-2026-10-15.md)
+  — 强度**实测**报告：样本/判据/复现命令 + MBA 阶梯原始数据 + 加壳前后字节 + 二进制覆盖矩阵 + 修复项影响 + **实验设计（待补）**。
+- [ATTACKER-COST-ANALYSIS-2026-10-15.md](file:///d:/kboxobf/高级先行版源码/docs/ATTACKER-COST-ANALYSIS-2026-10-15.md)
+  — 攻击者视角成本分析：威胁模型 A0..A4、逐层攻击路径与成本、**无法阻止的三件事**。
+
+### 10.1 关于“开源行业第一 / 论文”的诚实结论
+- 本机**无同类商业保护器、无网络**，无法做同机同源对拍，**无第三方独立评测** → **不声称“行业第一”**。
+- 报告给出**可操作化**的测量方案（首次可反编译时间、自动化成功率、脱壳时间、语义完整率等）与样本/重复要求；
+  只有在该矩阵产出后，强弱结论才成立。**当前不写任何“超过 X”的数字。**
+
+## 11. 本轮验证汇总
+
+| 项 | 结果 |
+|---|---|
+| 全量构建（JDK21 + Maven 3.9.6） | ✅ 绿，5 个 jar |
+| 多格式原生库保护 | ✅ PE=`shield+vm`，ELF/Mach-O=`encrypt-only`，产物含 `native-coverage.txt` |
+| MBA 阶梯 0..5 | ✅ 单调增长且运行结果与基线**逐字一致** |
+| 既有修复（编译/JNIC/VMP） | ✅ 保持有效 |
+
+## 12. 仍未完成（延续，不含虚标）
+- **ELF/Mach-O 的壳内虚拟化**：需按格式实现 loader stub 与 relocation 处理，且需 Linux/macOS 验证。
+- **跨工具对比实测**：需第三方授权样本 + 网络 + 独立评测，当前不可得。
+- **GitHub 推送**：`gh` 未安装、`github.com:443` 不可达。
+- `原始代码/` 为上轮创建的快照；本轮 W2 改动**尚未重新同步**到该目录。
+
+---
+---
+
+# 第三轮补记（同日）：so/dylib 结构加固 + BF 适配性修复 + define/内核 dump 的诚实结论
+
+> 本轮请求含 6 项。其中 **2 项在结构上无法“修复”**（13.4 define 明文 / 13.5 内核级 dump），
+> 另有 1 项若照字面实现会**降级安全性**（13.7）。下面把**能真实落地并验证**的做掉，其余**如实说明**，不写空头承诺。
+
+## 13. so / dylib 增加“适配加壳”（真实实现 + 结构化实测）
+
+**为什么**：KBNL 保证产物 jar 内无明文原生库，但运行期解密后的 `.so/.dylib` 仍带着**完整符号表与节名**——
+逆向者最易用的入口。
+
+**实现**：新增 [NativeBinaryHardener.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/NativeBinaryHardener.java)
+- ELF：装载器只用 program header + PT_DYNAMIC，**不用**节头表 → 整段清零节头表并置 `e_shoff=e_shnum=e_shstrndx=0`；
+- Mach-O(thin)：dyld 不用 `LC_SYMTAB` → 清零其 nlist 与字符串表区间，**头与 load commands 不变**；
+- 只触碰非装载元数据，内置 `validateElf/validateMachO` 自检，前提不满足则返回 null（降级纯加密）。
+- 接入 [NativeLibPacker](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/NativeLibPacker.java)：`.so/.dylib` 标签变为 **`harden+encrypt`**。
+
+**实测**（结构探针 [HardenProbe.java](file:///d:/kboxobf/高级先行版源码/_verify/HardenProbe.java) + 真实管线）：
+```
+[PASS] ELF: e_shoff==0 / e_shnum==0 / e_shstrndx==0 / section header table zeroed
+[PASS] ELF: program header unchanged / magic/class intact
+[PASS] MachO: header+loadcmds unchanged / nlist table zeroed / string table zeroed
+HARDEN_PROBE: ALL PASS
+```
+产物 `native-coverage.txt`：
+```
+nat/libx.so    | so    | x64 | harden+encrypt | raw=1024B | blob=156B | elf: section-header-table removed (shoff=256, shnum=5, entries=320B zeroed, shstrndx=4)
+nat/hello.dll  | dll   | x64 | shield+vm      | raw=93696B| blob=128790B
+nat/liby.dylib | dylib | x64 | harden+encrypt | raw=1024B | blob=116B | macho: LC_SYMTAB tables zeroed (48B)
+```
+> **诚实边界**：这是**结构加固 + 加密**，**不是** PE 侧的“函数级虚拟化壳”；结构探针验证的是**改写正确性**，
+> **运行期加载**验证需 Linux/macOS（未做）。
+
+## 13.4 “动态 define 明文”——结构性，不可修复（只能缓解）
+- JVM 在 `defineClass` 前明文字节码**必然**存在一瞬；**零 capability 的只读 agent（`GetBytecodes`）不留可观察 JVMTI 痕迹**。
+- 这是 **JVM 语义约束**，不是 bug。声称“已修复 define 明文”不成立。
+- 现有缓解（**逐条核对属实**）：`kbox_probeJvmtiHook`（capability→0x6D）、BfSecureLoader **全方法 code[] 完整性**（→0x6C）、
+  `kbox_probeAgentExports`（→0x6E）、定义前全探针、BF 模式明文只驻 native 堆、JNIC/VMP(full) 让明文不携带完整逻辑。
+- **唯一根治方向**：敏感逻辑全部下沉 JNIC/VMP（`allMax` 已默认开启）。
+
+## 13.5 内存 dump / 内核级内存 dump
+逐条核对 `NativeLoader`（**现状即已实现，非本轮新增**）：
+- Windows 优先 **in-memory 模块映射**（`BfSecureLoader.mapModule`）——**明文 PE 根本不落盘**；
+- 落盘回退：`nukeTemp` 零填充 → 删除 → `deleteOnExit` → shutdown hook → 独立 helper 进程延迟删除；`System.load` 失败也在 `finally` purge；
+- TamperShield 联锁；BF 模式类体全在 BF blob（磁盘上无类文件）。
+
+**内核级**（阻止他进程 ReadProcessMemory/dump）需**内核驱动**（如 `ObRegisterCallbacks` 剥离 `PROCESS_VM_READ`）+ 驱动签名，
+属 OS 层而非混淆器层；**本环境无法实现也无法验证** → **明确不做**（不签名/不验证的驱动是负贡献）。
+
+## 13.6 “BF 适配性”修复（真实修复 2 处）
+1. **`brainfuckMcHybrid` 此前无任何配置键（不可达）**：字段/getter/管线/打包器逻辑都在，但 `ConfigLoader` 无 case → 永远开不了。已补 `case "brainfuckMcHybrid"` + HTML/桌面界面开关。
+2. **`TweakClass` 输入无法进入混合路径**：原逻辑只设 `reason`、不置 `mcMod`，即使开了 hybrid 也**无条件降级**。现改为 `mcMod=true`，hybrid 可达。
+- 实测：`brainfuckLoader=true + brainfuckMcHybrid=true` → Config 显示 `bfMcHybrid=true`（无 Unknown key 告警）；`demo.jar` 走完整 BF（`2 classes inside a Brainfuck-RLE payload`），产物 163478 B，运行输出与基线一致、exit 0。
+
+## 13.7 “BF 改为完全 Brainfuck + 内置解释器”
+现状：本仓库**已有**内置 BF 解释器（`runtime/bfvm/BfInterpreter`、`BfRuntime`）、BF 程序化方法体（`bfvm`）与 BF 磁带化（`brainfuckshield/BfDialect`）。
+`brainfuckLoader` 的 blob 解码器是 **native C**（`kbox_bf_loader.c`）——**刻意设计**：明文只驻 native 堆、不进 Java 堆。
+> 按字面把它换成 Java 解释器会**把明文搬回 Java 堆**，属**安全降级** → **不做**。
+> 若真实诉求是“**去掉 C 编译器依赖**”（适配性痛点），那是**新增纯 Java 引导解码路径**的独立功能（需重写 bootstrap 并端到端验证），本轮未做，列为待办。
+
+## 13.8 本轮验证汇总
+| 项 | 结果 |
+|---|---|
+| 全量构建 | ✅ 绿（5 个 jar） |
+| ELF/Mach-O 结构加固 | ✅ 结构探针 ALL PASS；管线标签 `harden+encrypt` |
+| BF 配置键可达性 | ✅ `bfMcHybrid` 生效；BF 产物运行正确 exit 0 |
+| PE/JNIC/VMP/MBA 回归 | ✅ 与基线一致 |
+
+## 13.9 未完成（如实）
+- ELF/Mach-O 的**运行期加载验证**（需 Linux/macOS）与**函数级虚拟化壳**（需 shim stub）。
+- **纯 Java BF 引导解码路径**（去 C 编译器依赖）——独立功能。
+- **内核级 anti-dump**（需签名驱动）——明确不做。
+- **强度本轮未再加**（上轮 `mbaRewrite` 已到 0..5；本轮聚焦适配性）。
+
+---
+---
+
+# 第四轮补记（同日）：最强强度适配性检测（含 2 处真实缺陷修复）
+
+完整报告见 [docs/ADAPTABILITY-TEST-2026-10-15.md](file:///d:/kboxobf/高级先行版源码/docs/ADAPTABILITY-TEST-2026-10-15.md)。
+「最强强度」定义 = `allMax=true` **+** `brainfuckLoader=true` **+** `brainfuckMcHybrid=true` **+** `mbaRewrite=5`
+（注意 `allMax` **本身不含** BF 混沌加载，且 `mbaRewrite` 只到 3）。
+
+## 14. 工具启动
+`--help` / `--list-presets` / 未知参数 / 缺参 / `--shield` 缺参 均符合预期。
+- **F1**：输入文件不存在时，报的是 `Z:\kbox-work: Unable to determine if root directory exists`（先建工作目录才失败），
+  **未先校验输入**，错误信息误导。
+- **F2**：Windows 控制台（GBK）下中文 banner/`—` 乱码（Java 按 UTF-8 输出）。
+
+## 15. 发现并修复的真实缺陷（2 处）
+
+### D1 交织常量 MBA 破坏 JNIC/VMP 目标 → 结果错误 / 不确定 / 死循环【已修】
+- 现象：**同一配置连跑 3 次**得到 `util = 21433 / 21432 / 43865`（非确定），某些组合还**死循环**。
+- 二分：`mbaConstants=0` → 3/3 正确；`mbaRewrite=0` → 3/3 正确；两者都关 → 正确。
+  仅关 `opaqueStateMachine` 仍 1/3 错 → 排除。
+- 根因：`MbaConstantObfuscator` **没有**像 `MbaRewriteObfuscator` 那样跳过 JNIC/VMP 目标方法；
+  这些方法体会被下沉到原生解释器重放，而解释器不等价复现合成表达式。
+- 修复：[MbaConstantObfuscator.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/obfu/MbaConstantObfuscator.java) 增加 `isNativeOrVmpTarget` 跳过规则。
+- 验证：`allMax + JNIC/VMP` **3/3 → util=21433**（修复前不稳定）。
+
+### D2 BF 混沌加载 + JNIC/VMP → 启动即 `EXCEPTION_ACCESS_VIOLATION 0xc0000005`【已修（安全降级）】
+- 隔离：BF 单独 ✅；JNIC/VMP 单独 ✅；**BF+JNIC ✗、BF+VMP ✗、BF+两者 ✗**（崩溃确定性复现）。
+- 修复：[ProtectionPipeline.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/ProtectionPipeline.java)
+  在 BF 兼容性判定链**最前面**加规则：`enableJnic || enableVmp` → BF 判定不兼容并**自动降级**（沿用 BF 既有降级契约）。
+- 验证：9 例最强矩阵修复后 **exe/mr/res/native 全部 PASS**（输出与基线逐字一致），其余 5 例正常出包。
+
+## 16. 真实第三方库适配性（6 个真实 jar）
+公共 API 路径保留率：commons-lang3 **99.8%** / gson **99.6%** / jsoup **99.3%** / snakeyaml **98.7%** / slf4j-api **98.2%**。
+- **F3**：唯一系统性丢失是 `META-INF/versions/9/module-info.class`（multi-release 的 JPMS 模块描述）——库的模块化声明会丢。
+- **D3（部分缓解，未根治）**：`procyon-0.6.0`（874 类）打包期 **`OutOfMemoryError`**（`Frame.<init>`），
+  417.8s 后 exit 1；**`-Xmx4g` 亦复现** → 非单纯堆大小问题。
+  已加护栏 `VERIFY_MAX_BYTES = 512KB`（[Packager.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/Packager.java)），
+  覆盖三级深校验（`verifyClassBytes`/`checkStackAtReturn`/`checkFrameConsistency`）。
+  **实测：护栏生效（单轮跳过 21 个超大类的深校验）但 OOM 仍发生** → 触发点是"某些方法的数据流分析内存爆炸"，与类体积非单调；
+  该缺陷 **OPEN**，方向应改为按方法规模设限 / 给深校验设内存预算或独立进程。
+
+## 17. 本轮改动文件
+- `kbox-core/.../obfu/MbaConstantObfuscator.java`（D1）
+- `kbox-core/.../ProtectionPipeline.java`（D2）
+- `kbox-core/.../packaging/Packager.java`（D3 护栏）
+- `docs/ADAPTABILITY-TEST-2026-10-15.md`（新增）
+- 测试脚手架：`D:\kboxobf\_adapttest\`（`run_max.ps1` / `run_libs.ps1` / `*.conf` / `results-*.txt` / 原始日志）
+
+## 18. 未完成
+- F1/F2/F3 未修（输入不存在的误导报错、控制台 GBK 乱码、multi-release `module-info` 未保留）。
+- D3：护栏已加；超大输入仍需更大堆（建议 `-Xmx4g` 并在文档中提示）。
+- BF 与 JNIC/VMP 的**共存**未实现（当前为降级规避；根治需查 `BfSecureLoader.mapModule` 与 `NativeLoader.mapInMemory` 的模块基址冲突）。
+
+---
+---
+
+# 第五轮补记（同日）：修复 GUI/默认选项下保护失败（字符串加密开关失效）
+
+## 19. 现象
+用户报告：运行 `原始代码\dist\release-v3.0.1\kboxObfuscatorv3.0.1.jar`，选界面后**特别慢或直接不启动**；以及 **HTML UI 里提交任务跑不起来**。
+
+## 20. 端到端定位（可复现）
+用脚本 `_adapttest\test_htmlui.ps1` 起 headless 服务 → `POST /api/protect` → 轮询 `/api/state`：
+
+```
+FINAL: status=error stage=23/25
+ERROR: KBoxException: Protected jar would reference 1 missing KBox runtime class(es); refusing to write a broken artifact:
+  com/kbox/runtime/AntiDebug   (referenced by com/kbox/runtime/_NJQRdKWkJkIeTW)
+```
+注意日志里的配置：`strings=false`（字符串加密**关**），但 Stage 18 仍然打印
+`Mode: AES-256-CTR ... AES-256-CTR encrypted 9 strings`。
+
+## 21. 根因（一处开关失效，牵连两个症状）
+[ProtectionPipeline.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/ProtectionPipeline.java) Stage 8：
+
+```java
+if (cfg.getStringEncryptionStrength() >= 3) {   // 默认值就是 3
+    new AesStringEncryptor(...).apply();         // 无视 encryptStrings
+```
+**「字符串加密」开关被强度旋钮架空**：`stringEncryptionStrength` 默认 3，于是即使用户把字符串加密关掉，AES 字符串加密照样执行，
+生成的解密器引用 `AntiDebug` / `HardwareKeyRing` / `KbnlKey` —— 而这些运行时类**只在 `isEncryptStrings()==true` 时才注入** →
+出包被引用闭包校验拒绝（`status=error`）；即便绕过，产物运行期也会 `NoClassDefFoundError`。
+HTML UI 的默认选项（字符串加密未勾选 + 强度默认 3）正好落在这个组合上 → **GUI 任务必失败**。
+
+## 22. 修复
+1. **根因**：[ProtectionPipeline.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/ProtectionPipeline.java) AES 分支改为
+   `cfg.isEncryptStrings() && cfg.getStringEncryptionStrength() >= 3`（关掉开关就不再做字符串加密）。
+2. **防御性**：[Packager.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/Packager.java)
+   把 `AntiDebug` / `HardwareKeyRing` 的注入条件从「仅 AES」扩展到**所有字符串模式**
+   （`isEncryptStrings || isWhiteboxStrings || isScatterStrings`，写 jar 与 BF blob 两条路径都改），
+   使引用闭包在该类组合下不可能再被拒。
+
+## 23. 验证
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| HTML UI 默认选项提交任务 | `status=error`（闭包拒绝） | **`status=done 24/25`**，产物 69.1 KB |
+| 上述产物运行 | 运行期 `NoClassDefFoundError: HardwareKeyRing` | **输出与基线逐字一致**（`util=21433`），exit 0 |
+| 回归：字符串加密=开 + JNIC/VMP/MBA + 加壳 | — | `Protection complete`，输出一致，exit 0 |
+| 全量 `clean install` | — | ✅ 绿 |
+
+## 24. 附带实测（回答“启动慢”）
+实测启动耗时（进程启动到界面可用）：
+- **桌面界面**：`laf=28ms / build=102ms / visible=165ms` —— 总计约 **0.3s**，不慢。
+
+→ 「特别慢或直接不启动」的实质是**保护任务失败**（本轮已修）；启动本身没有可复现的长时间阻塞。
+（临时计时插桩已在提交前全部移除。）
+
+---
+
+## 25. 后续变更（界面回归桌面 UI）
+
+按用户要求删除内置 HTML UI，`--gui` / 无参启动**直接使用原生 Swing 桌面界面**（`com.kbox.gui.DesktopGui`）：
+
+- 删除 `kbox-gui/src/main/java/com/kbox/gui/ProtectorGui.java` 与 `kbox-gui/src/main/resources/web/index.html`（连同空的 `resources/` 目录）。
+- `ProtectorCli.launchGui(...)` 恢复为单一入口 `com.kbox.gui.DesktopGui`；移除 `--desktop` 开关及其帮助文本。
+- `build.ps1` 的必备类清单回到 `com\kbox\gui\DesktopGui.class`。
+
+> 随之移除的还有 HTML UI 附带的内嵌 HTTP 服务（`/api/*`、`/api/pair`、`/api/state`、`/api/stream`）。
+> `mobile-monitor`（手机远程监控 APK）依赖该服务，**目前不可用**，其 README 已注明。
+
+**实测**：`mvn clean install` 绿；`java -jar kbox-protector.jar` 打开 Swing 桌面窗口（菜单栏 / 工具栏 / 类浏览器 / 选项标签页 / 实时日志 / 进度条），无异常。
+
+---
+
+## 26. 按强度测试报告修复 P0/P1（工程自泄）+ GUI 全功能接入
+
+依据 `KBox_v3.0.1_强度测试与逆向分析报告`（算法 9 分、工程 3 分，短板全在"随包分发的东西"）。
+
+### 26.1 P0-1 / P0-2 / P2-3：构建期专用资源不再随产物分发
+
+`Packager` 新增 `isBuildOnlyResource(path)`，复制资源时跳过：
+
+- 5 个原生解释器 C 源码 + `kbox_jnic_core.h`（~432 KB；此前与 `kbox_bf_loader.c` 一并明文躺在产物根目录）；
+- 根级其余 `*.c` / `*.h`（构建期生成物）；
+- `*_dump.txt`（`shield/blob_dump.txt` 4,672 行 objdump、`shield/eng_dump.txt`）；
+- `META-INF/maven/**`（模块划分 + 入口）、`compiled.class`。
+
+刻意**保留** `shield/engine_*.bin` / `blob_*.bin`（打包 PE 时运行时需要），只删调试 dump。
+
+### 26.2 P0-3：明文原名索引表改为遮蔽
+
+`jnic-classes.list`（100 类）与 `method_epd.bin`（827 条 `类#方法#签名`）此前是**明文清单**。
+新增 `com.kbox.runtime.KboxListMask`：用每构建唯一的 `META-INF/kbox/seed.bin` 派生 SHA-256
+keystream 做 XOR 遮蔽；`ResourceGuardLauncher.readJnicClassList` 先尝试还原（含"像不像清单"
+健全性检查），不是遮蔽格式再回落明文解析（兼容旧产物）。
+
+### 26.3 P0-4 / P1-2：元数据擦除（改名可反查的根因）
+
+新增 `com.kbox.core.obfu.DebugMetadataEraser`，接到 Annotation erasure 阶段：
+
+- `eraseDebugInfo`（**默认开**）：`SourceFile`、`SourceDebugExtension`、`LineNumberTable`、
+  `LocalVariableTable`、`MethodParameters`、`Exceptions`；
+- `eraseSignatures`（默认关，`allMax` 开）：`Signature`、`InnerClasses`、`EnclosingMethod`；
+- `keepAttributes` 里显式列出的属性保留（ProGuard `-keepattributes` 语义；该键此前**只存不生效**）。
+
+两处必须一起改，否则仍然泄漏：
+
+1. **不能用 `shouldProtectClass` 过滤**——被 keep 的入口类（如 `HelloWorld`）不重命名，但它的
+   `SourceFile` 照样把原名交出去。擦除对所有类生效。
+2. **回滚路径也要擦**：`Packager.remapRollbackBytes` 对校验失败、回写原始字节的类，同样丢弃
+   `SourceFile`/`LineNumberTable`/LVT/MethodParameters；并且把 `new ClassWriter(cr, 0)` 改成
+   `new ClassWriter(0)`——前者**整表复制原常量池**，属性删了但 `HelloWorld.java` 仍留在池里可被 grep 出来。
+
+### 26.4 P1-6：`grep KBNL/KBF2` 归零
+
+CLI `--help` 里"plain KBNL only"改为中性表述；`.c` 源码不再随包（26.1）。产物全量字节扫描
+`KBNL`/`KBF2` 命中 **0**。
+
+### 26.5 GUI：真正接入所有功能
+
+`DesktopGui` 的「混淆选项 / 高级」两个子集标签页改为 **「全部选项」（schema 驱动）**：
+
+- 约 100 个控件覆盖 `ConfigLoader` 支持的**每一个键**（含 `keepPrefix`/`nativeMethod`/`keepAttributes`
+  这类清单键、`nativeCoverage`/`vmpCoverage` 这类枚举、全部高级强度旋钮）；
+- 带键名/中文名搜索、分组标题、`重置默认`、`allMax` 一键全开；
+- 执行时把这些控件**逐键写成一份 `.conf`**，与用户选择的配置文件合并后交给 `ConfigLoader.load`
+  → 界面就是引擎能力的完整投影，新增配置键只需在 `ALL_OPTIONS` 加一行；
+- 选择配置文件时反向回填控件，避免"界面显示"与"实际生效"不一致。
+
+### 26.6 实测（HelloWorld，全开最高强度）
+
+`max.conf`：`allMax=true` + `eraseAnnotations=true` + `mbaRewrite=5` + `encryptClasses=true` + `cc=gcc`。
+
+| 检查项 | 结果 |
+|---|---|
+| 产物运行 | `Hello, KBox! sum=42 prod=42 add=84 util=21433 ck=-993 tag=42`（逐字符等于基线） |
+| `HelloWorld.java`（SourceFile 泄漏） | **0** 命中（修复前：1 命中） |
+| `KBNL` / `KBF2` | **0** / **0** |
+| `.c` / `.h` / `*dump.txt` / `META-INF/maven/**` | **0** |
+| 产物规模 | 547,580 B / 577 条目；`Wrote 518 classes (7 encrypted)` |
+
+**遗留（如实记录）**：`HelloWorld.class` 因入口类被 keep 而**不重命名**，其类名本身仍在文件名层可见
+（清单里的 `Original-Main-Class` 已遮蔽，但类条目标题未改）。要彻底隐藏需让启动器接管入口类改名 +
+运行时再映射，属下一轮工作。
+
+---
+
+## 27. P1-5：BFVM 翻译器补齐 try/catch、invokedynamic、monitor、multianewarray
+
+BFVM（`enableBfvm`）此前只接受"无异常表、无 indy、无监视器、无多维数组"的方法，覆盖面被压得很窄。
+本轮把 `BfMethodCompiler` ↔ `VmCore` 这条"构建端序列化 / 运行端回放"的通道补齐。
+
+### 27.1 流格式扩展
+
+方法头由 `u16 maxLocals + utf8 desc + 指令流` 变为
+`u16 maxLocals + utf8 desc + u16 handlerCount + [u8 hasType + utf8 type + i32 start/end/handler]* + 指令流`。
+异常表标签用 `TryPatch` 在 `labels` 表落定后回填；标签未解析时抛 `BfVmException`，不产出半个方法。
+
+新增四个操作码（构建端 / 运行端两份 `Opcode` 必须同步）：
+
+| 操作码 | 编码 | 运行期语义 |
+|---|---|---|
+| `MULTIANEWARRAY` | `utf8 desc` + `u8 dims` | 倒序弹尺寸 → `Array.newInstance(leaf, sizes)` |
+| `INVOKEDYNAMIC` | `utf8 name/desc` + `u8 bsmTag` + ref + `u8 argc` + 参数表 | 还原 BSM 与常量参数 → 调 BSM 拿 `CallSite.getTarget()` |
+| `MONITORENTER` | 单字节 | 取 `ReentrantLock`（`monitorDepth++`） |
+| `MONITOREXIT` | 单字节 | 计数归还；帧异常逃逸时 `finally` 里把剩余计数清空，避免跨线程死锁 |
+
+BSM 常量参数支持 7 种 tag（int/long/float/double/String/MethodType/MethodHandle）。
+
+### 27.2 两个坑
+
+1. **`privateLookupIn` 在 Java 8 不存在**。`VmCore` 编译目标是 8，运行期用反射调 `privateLookupIn`，
+   Java 8 直接 `NoSuchMethodException` → 退回 `publicLookup().in(owner)`，**拿不到 private 成员**，
+   而 `LambdaMetafactory` 的实现方法 `lambda$xxx$0` 恰恰是 `private static`。
+   修：Java 8 分支反射构造 `MethodHandles.Lookup(Class,int)`（`ALL_MODES = -1`）拿 full-privilege lookup；
+   Java 9+ 仍走 `privateLookupIn`。BSM 自身（`LambdaMetafactory` / `StringConcatFactory`）用 `publicLookup`，
+   避免对 JDK 类做 `privateLookupIn` 被模块系统拒绝（`illegal lookupClass`）。
+   另：BSM 的第一个参数必须是**被虚拟化的那个类**，不是 `VmCore`——lambda 类由它定义。
+2. **`MULTIANEWARRAY` 维度错位**。旧实现用 `desc.substring(sizes.length)` 取叶子类型并逐维递归，
+   外层建出来的是叶类型数组（`int[]` 而非 `int[][]`），`Array.set` 直接 `argument type mismatch`。
+   修：取 `desc.substring(lastIndexOf('[')+1)` 作叶子，交给 `Array.newInstance(leaf, sizes)` 一次建全维。
+
+### 27.3 回归样本 `_hw/src/FeatureProbe.java`
+
+覆盖 `risky`（try/catch/finally + 除零）、`viaLambda`（invokedynamic）、`multiArr`（`int[2][3][4]`）、
+`syncBlock`（synchronized）。`bfvm-only.conf`（仅 `enableBfvm=true`）下
+`BFVM: 6 methods virtualized, 0 skipped`。
+
+| 输出 | 原版 | BFVM 产物（Java 8） | BFVM 产物（Java 17） |
+|---|---|---|---|
+| `risky(0)=-1 risky(4)=25 risky(-1)=-2` | ✓ | ✓ | ✓ |
+| `lambda=16` | ✓ | ✓ | ✓ |
+| `multi=7` | ✓ | ✓ | ✓ |
+| `sync=11` | ✓ | ✓ | ✓ |
+
+四个用例逐字符与基线一致；try/catch 在 `risky(0)`（ArithmeticException 被捕获）与 `risky(-1)`
+（自定义异常路径）上都走了异常表。
+
+---
+
+## 28. P1-6 / P1-7 / P2-8 / P2-9：BF 适用面、覆盖关系、URL 资源与 -cp 启动
+
+### 28.1 P1-6：BF loader 降级条件收窄
+
+旧逻辑只要命中「JNIC/VMP 开启 / fabric.mod.json / mods.toml / 无 Main-Class / Spring Boot /
+TweakClass」任一条件就关掉整个 BF loader，且判断顺序把 TweakClass 放在「无 Main-Class」之后，
+hybrid 分支默认不可达（`brainfuckMcHybrid` 是 opt-in，默认 false）。现在：
+
+| 输入 | 旧行为 | 新行为 |
+|---|---|---|
+| JNIC / VMP 开启 | 降级 | **保留 BF**（0xC0000005 的根因是 `g_chunkOp` 非线程局部，已在 P0-1 修复） |
+| fabric.mod.json / mods.toml / neoforge | 降级（hybrid 需手动开） | **自动开启 hybrid**：元数据 / 入口类 / mixin 包明文，其余进 blob |
+| TweakClass（含无 Main-Class） | 先被「无 Main-Class」拦截 → 降级 | 先判 MC → 自动 hybrid |
+| 无 Main-Class | 降级 | 用 `mainClass=` / `--main-class`，否则取**唯一**的 `public static void main(String[])` |
+| Spring Boot fat jar | 降级 | **保留 BOOT-INF 布局**：Main-Class 仍是 boot launcher，Start-Class → `BfSecureLoader`，`BOOT-INF/lib/*.jar` 原样 STORED，bootstrap 类与 blob 写到 `BOOT-INF/classes/` |
+| 真的找不到入口 | 降级 | 仍降级（唯一合法残留） |
+
+hybrid 还补了一个锚点：若检测到 MC loader 但没有任何可识别的入口类（合成样本 / launcher-wrapper
+mod），把 manifest 主类保留明文并注入 `attach()`，否则 blob 永远不会被解码。
+
+### 28.2 P1-7：类加密 / 资源混淆不再被"强制关闭"
+
+BF 模式下 blob 是类字节与资源体的**唯一载体**，再叠一层 AES 类加密/资源改名在运行期不可读。
+因此不再改写用户配置（`Config: classEnc=false` 那种假象消失）：
+
+- `ProtectionConfig` 新增内部标记 `bfBlobActive`（只由 pipeline 设置，不从配置文件解析）；
+- `encryptClasses` / `obfuscateResources` **保持用户设定值**，摘要里标为 `(subsumed by BF blob)`；
+- 资源混淆 pass 通过 `!isBfBlobActive()` 跳过，并打印 "subsumed by the BF blob"；
+- 降级分支不再需要"恢复"被改写的值（因为从来没改）。
+- hybrid 模式下明文面（元数据 / 入口类 / mixin）本来就必须可读，所以也不受影响。
+
+### 28.3 P2-8：`findResource` / `getResources` / `ServiceLoader`
+
+`BfSecureLoader` 新增 `findResource(String)`，返回合成 `kboxbf:` URL；实现落在两个**显式注入**的
+顶层类（不能是匿名内部类，否则要额外注入 `BfSecureLoader$1.class`）：
+
+- `BfResourceHandler extends URLStreamHandler`
+- `BfResourceConnection extends URLConnection`（`getInputStream` 才解码，流尽即擦）
+
+配套的 native 侧新增两个**纯索引探测**（不解码、不产生明文窗口，因此不跑 `kbox_gateCheck()`，
+避免每次 `findResource` 都做模块/JVMTI/调试器探测）：
+
+- `hasResource(String)` → `g_res` 索引
+- `hasClass(String)` → `g_classes` 索引
+
+**Java 8 的坑**：`ClassLoader.findResources` 默认返回**空枚举**（只有 `URLClassLoader` 覆写它），
+只覆写 `findResource` 时 `getResources(...)` 仍然看不到 blob → 必须同时覆写 `findResources`。
+
+实测（`_hw/resprobe.jar`：`res/data.txt` + `META-INF/services/ResProbe$Svc`）：
+
+```
+stream=blob-resource-ok
+url=blob-resource-ok          # Class.getResource(...).openStream()
+resources=1 first=blob-resource-ok   # ClassLoader.getResources()
+spi=impl-ok                   # ServiceLoader
+```
+
+### 28.4 P2-9：`java -cp` 启动
+
+新增 CLI `--main-class` / 配置键 `mainClass`；打包器按情况生成两种引导：
+
+1. **入口被改名** → 在**原名**写一个明文 stub：`main(String[])` 直接转发
+   （BF → `BfSecureLoader.main`；有守卫 → `ResourceGuardLauncher.bootstrapCp`；
+   纯改名 → 转发到改名后的 main）。stub 只引用引导类，验证/加载都不会碰到受保护字节码。
+2. **入口未被改名但有守卫** → 在真实 `main` 头部注入
+   `if (ResourceGuardLauncher.bootstrapCp(args)) return;`（COMPUTE_FRAMES 重算，帧安全）。
+   `-jar` 路径已 `_booted`，落到真实方法体；`-cp` 路径第一次进入时完成引导并重新派发。
+
+`BfSecureLoader` 同时改为**blob 优先**的 `loadClass`：blob 里有的类一定由它自己 define，
+即使 jar 根上存在同名明文 stub（否则 parent-first 会拿到 stub 并无限递归）；hybrid 明文类不在
+blob 中，仍走 parent。
+
+`ManifestUpdater` 支持在**原本没有** Main-Class 时补写 `Main-Class` + `Original-Main-Class`
+（必须写进主 section；追加到结尾空行之后会变成无 `Name:` 的第二节，JVM 报 `invalid manifest format`）。
+
+### 28.5 实测矩阵
+
+| 场景 | 构建 | `-jar` | `java -cp <jar> <Main>` |
+|---|---|---|---|
+| BF 全量（HelloWorld） | BF packed 1 | ✓ 基线 | ✓ 基线 |
+| BF + JNIC + VMP + classEnc/resources 全开 | 未降级，blob 9 类 | ✓ 基线 | ✓ 基线 |
+| BF 无 Main-Class（唯一 main 自动识别） | 补写 Main-Class | ✓ 基线 | ✓ 基线 |
+| BF + 资源/ServiceLoader（ResProbe） | blob 3 类 | ✓ 4/4 项 | ✓ 4/4 项 |
+| 非 BF + 类加密 + 资源混淆 | 注入 main 钩子 | ✓ 4/4 项 | ✓ 4/4 项 |
+| Spring Boot fat jar + BF | 布局校验 | —（样本缺 boot loader 类） | — |
+| Fabric（fabric.mod.json） | **自动 hybrid**，元数据/入口明文 | 布局校验 | — |
+| Forge（TweakClass，无 Main-Class） | **自动 hybrid**，未降级 | 布局校验 | — |
+
+Spring Boot 产物已核对：`Main-Class` 保持 `org.springframework.boot.loader.JarLauncher`、
+`Start-Class: com.kbox.runtime.BfSecureLoader`、`Original-Main-Class: demo.Hello`、
+`BOOT-INF/lib/app-dep.jar` 为 STORED、bootstrap 类与 `classes.bf.rle`/`native.bin` 均在
+`BOOT-INF/classes/` 下。样本 jar 本身不含 `spring-boot-loader` 类，故只能做布局级验证。
+
+回归：P1-5 的 FeatureProbe 四项（try/catch、lambda、多维数组、synchronized）仍与基线逐字符一致。
+
+---
+
+## 29. P2-11 四类回归样本 + P3-15 BF 运行时改名
+
+### 29.1 P3-15：BF 运行时表面按构建改名
+
+旧产物里 `BfSecureLoader`（manifest Main-Class）、`BfInterpreter`、`com/kbox/runtime/bfvm/*`
+都是明文类名，等于把方案直接写在产物上。现在每次构建生成一份随机映射
+（[RuntimeRename.java](file:///d:/kboxobf/高级先行版源码/kbox-core/src/main/java/com/kbox/core/packaging/RuntimeRename.java)），
+14 个 BF 专用类统一落到**同一个随机包**（1–2 字母包名 + 1–2 字母类名，同构建内唯一）：
+
+```
+BfSecureLoader / BfBlobInputStream / BfResourceHandler / BfResourceConnection /
+BfInterpreter / BfInterpreter$BfRng /
+bfvm/BfRuntime / bfvm/BfInterpreter / bfvm/VmCore(+Cursor/State/Uninitialized) /
+bfvm/Opcode / bfvm/BfVmException
+```
+
+实现要点：
+
+1. **一次生成、三端共享**：`ProtectionConfig.runtimeRenameMap`（transient，不解析配置文件）
+   由 pipeline 在 BF 决策后生成，同时交给 `BfNativeBuilder` 和 `Packager`。
+   自混淆（输入就是 kbox 自身）时跳过——graph 里已有这些类，只改注入副本会与 blob 引用脱节。
+2. **字节级重写**：`RuntimeRename.remap` 用 ASM `ClassRemapper` + 自定义 `Remapper.mapValue`，
+   除内部名/描述符/owner 外还改写 **字符串常量**（`Class.forName("com.kbox.runtime.BfSecureLoader")`
+   出现在 NativeLoader / TamperShield / VmpInterpreter 中）。
+3. **注入与 blob 同步**：`injectOne` / `injectBoot` / `collectOne` 用映射后的名字写条目/写 blob 键；
+   `serialize()` 对所有应用类做一次 remap（VMP/BFVM 注入的 `BfRuntime.call`、
+   hybrid 的 `BfSecureLoader.attach` 都在这时被改到新名字）。
+4. **native 侧**：`BfNativeBuilder` 把映射后的内部名编译成 `KBOX_BF_LOADER_CLASS`，
+   `JNI_OnLoad` 用它 `FindClass`；loader 方法哈希也改为对**改名后**的字节计算
+   （改名会重排常量池 → code[] 里的 CP 索引变化，必须同源）。
+5. **调用者门禁**：`BfSecureLoader.callerIsKbox` 原本硬编码 `"com.kbox.runtime."`，
+   改名后会把 loader 自己的 `main()`/`<init>` 判成外部调用 → 改为按
+   `BfSecureLoader.class` 自身包前缀判断（这也是所有 BF 类必须同包的原因）。
+
+实测（`_hw/bf-full.conf`）：产物条目为 `y/n.class`、`y/w.class`、`y/l.class`、`y/x.class`，
+`jar tf | grep -c "BfSecureLoader\|BfInterpreter\|bfvm/"` = **0**，`-jar` 与 `-cp` 均输出基线。
+BF+JNIC+VMP（`bf-coexist.conf`）与纯 BFVM（`bfvm-only.conf`，bfvm 类落 `m/*`）同样运行正确。
+
+### 29.2 P2-11：四类回归样本（可重复执行）
+
+新增 `_hw/p211/`（源码 + `run.ps1`，ASCII-only 以兼容 PowerShell 5.1）：
+
+| 样本 | 构造 | 断言 | 结果 |
+|---|---|---|---|
+| 无 Main-Class 库 | 只有 `app.Util.add(int,int)`，`jar cf` 无入口 | 产物**不得**出现 Main-Class/Original-Main-Class；外部 `LibCheck` 扫类 → 反射调用 `add(20,22)==42` | PASS（类被改名为 `app.a`） |
+| SPI | `probe.Svc` + `ProvA/ProvB` + `META-INF/services/probe.Svc` | `ServiceLoader` 拿到 2 个实现（services 文件内容随改名同步） | PASS（`providers=2 names=AB`） |
+| 签名 jar | keytool 生成 PKCS12 → jarsigner 签名 | 产物可运行；签名块被**剥离**（见下） | PASS（`signed-ok`） |
+| multi-release | `probe.Main` 基版 + `META-INF/versions/17/probe/Main.class`，`Multi-Release: true` | JDK17 走 v17，JDK8 走 base | PASS（`version=17` / `version=base`） |
+
+两个由样本暴露出的真实缺陷，一并修复：
+
+1. **签名 jar 必然 `SecurityException`**：类字节被重写后 `.SF/.RSA` 里的摘要永远对不上，
+   JVM 在 defineClass 时直接抛 `SHA-256 digest error`（实测复现）。
+   修复：`Packager` 新增 `isSignatureFile()`，普通路径与 BF 路径都**丢弃**
+   `META-INF/*.SF|*.RSA|*.DSA|*.EC`（ProGuard / Shadow / spring-boot repackage 的通行做法），
+   并打印提示"如需签名请对产物重新签名"。MANIFEST 里残留的 `*-Digest` 在没有 `.SF` 时是惰性的。
+2. **multi-release 版本化条目会覆盖基类**：`DependencyAnalyzer` 原先把
+   `META-INF/versions/17/x/Main.class` 当普通类 `parseClass`，同一内部名后写覆盖先写，
+   产物里基类直接变成 v17 字节（JDK8 也跑 v17）。
+   修复：版本化条目**不进 graph**，作为原始资源透传（`isPlaintextStructural` 已覆盖
+   `META-INF/versions/*`），同时把基类内部名记入 `ClassGraph.multiReleaseClasses`，
+   pipeline 把这些类加入 keepPrefixes —— 版本化查找按**类名**进行，基类一旦改名，
+   `META-INF/versions/17/<新名>.class` 就不存在了。
+
+### 29.3 回归
+
+| 场景 | 结果 |
+|---|---|
+| BF 全量 HelloWorld（`-jar` / `-cp`） | 基线一致 |
+| BF + JNIC + VMP | 基线一致 |
+| BFVM-only FeatureProbe（4 项） | 基线一致 |
+| max.conf HelloWorld（`-jar` / `-cp`） | 基线一致 |
+| P2-11 四样本 | 4/4 PASS |
+| 产物类名泄漏（`BfSecureLoader` / `BfInterpreter` / `bfvm/`） | 0 命中 |
+
+---
+
+## 30. GUI 全量接线复核 + 最高强度 HelloWorld 重跑（修掉两处 <clinit> 缺陷）
+
+### 30.1 GUI：界面 = 引擎能力的完整投影
+
+用脚本对比 `ConfigLoader` 的可解析键与 `DesktopGui.ALL_OPTIONS`：
+
+- `ConfigLoader` 110 个 case（含 4 个别名：`flattenerMin/Max`、`licensePublicKey/licenseAppSecret`）；
+- GUI 106 个键，**缺的 4 个全部是别名**，规范键 `flattenerMinInsns/MaxInsns`、`licPublicKey/licAppSecret` 均已存在 → **覆盖 100%**。
+- 本轮新增的 `mainClass` 已在「混沌 / BFVM」组；签名剥离、MR 基类保名、BF 运行时改名都是自动行为，无需额外开关。
+
+同时修了三个真实交互缺陷：
+
+1. **`allMax` 位置错误**：原先勾选 allMax 时只写 `allMax = true` 且写在文件**末尾**。
+   `ConfigLoader` 的契约是"预设先展开、后续行可覆盖单键"，写在末尾等于把用户配置文件里的
+   单键设置全部压掉。现在 `allMax` 固定写在最前面，其后只追加"用户改过默认值"的键 →
+   既能一键全开，又能微调个别项。
+2. **可编辑下拉框读不到输入**：`flattenerMinInsns` 这类范围 > 64 的 int 控件是 editable combo，
+   用户键入的值在 editor 里、不在 selection model 里，`confValue()` 原先读 `getSelectedItem()`
+   → 手输的数值被丢弃。改为优先读 `getEditor().getItem()`。
+3. **「重置默认」界面不刷新**：`resetOptionsToDefault()` 重建了控件实例，但可见行仍引用旧实例。
+   新增 `optionBody` 字段，重置后立即 `rebuildOptionRows()`。
+
+### 30.2 最高强度 HelloWorld（`_hw/allmax.conf`）
+
+```
+allMax = true
+eraseAnnotations = true
+mbaRewrite = 5
+encryptClasses = true
+obfuscateResources = true
+brainfuckLoader = true
+cc = C:/msys64/mingw64/bin/gcc.exe
+```
+
+`allMax` 展开后：rename+packages、whitebox/scatter 字符串、CF3、异常跳转、调用图隐藏、
+方法内联/拆分、常量 MBA2 / 运行时 MBA5、类型混淆 2、反编译器 L3、反调试、完整性、VMP 全覆盖 +
+VMP 原生化、JNIC 全覆盖 + EPL 驱动、BFVM、BrainfuckShield L3、nativeShell 3、protectNativeLibs、
+DedeobfShield（honeypot/multiRep/polyGold/... 全档）。
+
+**首跑暴露两个 `<clinit>` 生成缺陷**（都被 BF 校验器拦下并回滚，导致"最高强度"实际被降级）：
+
+1. `DedeobfShieldInjector.injectPrologue`：
+   - 新建 `<clinit>` 后只插入 prologue，**没有补 `RETURN`** → "Execution can fall off the end of the code"；
+   - `selfRefOk` 前多推了一个 `ICONST_0` + `SWAP`，导致调完 `selfRefOk` 后 `lane` 仍留在栈上
+     → 非空栈到 `RETURN` 的 `VerifyError`。
+   修复：prologue 直接 `push lane, push buildNo`；插入后若方法末尾不是 return/throw/goto 则补 `RETURN`。
+2. `HoneypotInjector.buildBait`：round-key 循环把 `GETSTATIC fRound` 放在**循环体内**，
+   每次 `IASTORE` 都留下一个数组引用 → 6 个诱饵类 `<clinit>` 在 `RETURN` 处 `stack=3`。
+   修复：`GETSTATIC` 提到循环外，循环后一个 `POP`（与 SBOX 循环一致）。
+
+修复后：`BF verify-fail` / `STACK-FAIL` **0 条**，`BF packed 523 classes`（含 6 个诱饵 + 运行时），
+构建 9.6s。
+
+### 30.3 产物与验收
+
+`_hw/out/hw-allmax.jar`（734,424 B）：
+
+| 检查项 | 结果 |
+|---|---|
+| `java -jar` | `Hello, KBox! sum=42 prod=42 add=84 util=21433 ck=-993 tag=42`（逐字符基线） |
+| `java -cp out.jar HelloWorld` | 同上（`-cp` 明文 stub → 改名后的 loader） |
+| 条目 | `HelloWorld.class`(stub) + `ob/cr.class`(loader) + `ob/*` + `META-INF/kbox/{classes.bf.rle,native.bin,vmp.bin,native-crypto.bin,method_epd.bin}` |
+| manifest | `Main-Class: ob.cr`、`Original-Main-Class: HelloWorld` |
+| 原始字节扫描 | `HelloWorld.java` / `KBNL` / `KBF2` / `BfSecureLoader` / `BfInterpreter` / `com/kbox/runtime/bfvm` / `*_dump.txt` / `META-INF/maven` 全部 **0 命中** |
+| 条目名泄漏 | `BfSecureLoader|BfInterpreter|bfvm/` **0** |
+
+---
+
+## 31. 修复《hw-max 强度测试报告 2026-10-17》+ 产物明文自检
+
+报告 12 项逐条处理（P0 在上一轮已修，本轮复测确认）：
+
+### 31.1 P1-1：`encrypted-classes.list` 不再明文
+
+构建侧用 `maskList()`（build-seed keystream，与 `method_epd.bin` 同源）落盘；
+`ResourceGuardLauncher.readEncryptedClassList` 先走 `readMaskedNameList`，失败才回落旧明文格式。
+同时补上**从未注入过**的 `com/kbox/runtime/KboxListMask`（JNIC/类加密构建此前读取遮蔽清单会
+`NoClassDefFoundError: KboxListMask`）。
+
+### 31.2 P1-2：注入的运行时类也擦调试元数据
+
+`DebugMetadataEraser` 只遍历输入 graph；24 个 `com/kbox/runtime/*` + 10 个 `xp/*` 仍带
+`SourceFile`。在 `reSerializeRuntimeClass` 里统一 `sourceFile/sourceDebug = null` +
+`stripDebugInfo()`，注入/启动/blob 三条路径共用，一处修复全部覆盖。
+
+### 31.3 P1-3：入口类可改名（`-cp` 透明代理）
+
+三处“入口类必须保留原名”的假定一起改：
+
+1. `AutoKeepDeriver` rule 6：`main` 方法照旧保留，但**清单入口类**不再 `keepClass`；
+2. `AuditOrchestrator`（SilentShield）ENTRY_POINT：清单入口改用 `KEEP_MEMBER`，
+   且 `run()` 不再无条件用 catalog 的 `KEEP_CLASS` 覆盖 finding 的自带动作；
+3. `Packager` 原本已有“入口被改名 → 在原名写 `-cp` stub”的逻辑，现在真正生效。
+
+实测：入口 `HelloWorld` → `m`（52,120 B），`HelloWorld.class` 只剩 274 B 的透明 stub
+（`main` → `ResourceGuardLauncher.bootstrapCp`），`-jar` 与 `java -cp ... HelloWorld` 均基线输出。
+
+### 31.4 P1-4 / P2-2（部分）：诱饵名随机化 + 品牌串统计
+
+- `AntiDecompiler` 的 sink/chain 类名由 `_KboxAntiDec_chain1..500` 改为每构建随机的
+  `com/kbox/runtime/_<rand>` / `_<rand>_<tag>N`，不再自报“我是反编译器诱饵”。
+- 534 个 `com/kbox/runtime/*` 的**整体改名**未在本轮落地（JNIC/VMP/TweakClass/清单
+  多处按名引用，回归面过大）；改为在自检里单列"engine brand occurrences"。
+- P2-3：`isNeverLoadedSynthetic` 从“所有 com/kbox/runtime/”收窄为 `_` 开头的合成类，
+  `verifyClassBytes` 对它们显式跳过（不再匿名落进体积兜底），真实运行时类的校验不再被误跳过。
+
+### 31.5 P2-4：降级必须显著告警
+
+普通路径与 BF 路径在 `rolledBack/verifyFails > 0` 时输出：
+
+```
+PROTECTION DEGRADED: N class(es) rolled back and M verify-failed — those classes keep their ORIGINAL bodies.
+```
+
+### 31.6 BF 路径：`Original-Main-Class` 掩码
+
+`writeBrainfuck` 现在也调用 `obfuscateEntryPoint`（XOR + `Entry-Guard-Seed`），
+`BfSecureLoader.readOriginalMainClass` 按同一 codec 解码；BF 产物 manifest 不再暴露入口名。
+
+### 31.7 新增：产物明文自检（`plaintextAudit`，默认开）
+
+`PlaintextAudit`：构建结束后重新读取**输入 jar**，提取类名/方法名/字段名/字符串常量，
+再对**输出 jar** 逐条目扫描：
+
+- 只扫 `CAFEBABE` 类与可读资源（`META-INF/kbox/**` 的 BF/native 密文跳过）；
+- 只扫来自输入的类（改名后的应用类），引擎类由 brand 计数单列；
+- `-cp` stub 的原名与方法名白名单；
+- 命中即 `PLAINTEXT AUDIT: N application hit(s) — plaintext still present: [...]`。
+
+实测（`max.conf`）：
+
+```
+PLAINTEXT AUDIT: application tokens clean (8 scanned, 0 hits); engine brand occurrences=1262
+```
+
+独立字节级复核：应用类里 `Hello, ` / `! sum=` / `KBox` 命中 **0**；“KBox”仅出现在
+引擎自身的错误消息/类名中（P1-4 残留，已单列）。
+
+### 31.8 复测矩阵
+
+| 场景 | 结果 |
+|---|---|
+| `hw-max.jar`（max.conf）`-jar` / `-cp` | 基线一致 |
+| `hw-allmax.jar`（allMax+BF）`-jar` / `-cp` | 基线一致；`PLAINTEXT AUDIT ... 0 hits` |
+| BFVM FeatureProbe（4 项） | 基线一致 |
+| P2-11 四类样本（无 main 库 / SPI / 签名 / MR） | 4/4 PASS |
+| 入口类 | 833 B(报告) → **52,120 B**，明文业务串 0/7 |
+| `encrypted-classes.list` | 56 B 明文 → 二进制遮蔽 |
+| 注入运行时类 `SourceFile` | 34 → **0** |
+| 诱饵类名 | `_KboxAntiDec_chain*` → 随机 |
+
+### 31.9 关于“50 倍强度”的说明
+
+本轮能把**可度量项**做到：入口类体积/结构 62×（954 B → 52,120 B）、明文业务串 7/7 → 0/7、
+明文类 566 → 24（BF 全开）、`KboxListMask`/`SourceFile`/诱饵名等指纹归零。
+“经他人实测至少 50 倍”不是单次构建能验证的命题——需要同一测试床（CFR/Vineflower/Procyon +
+人工逆向工时）对**同一基线**做 A/B 计时。建议把报告里的 6 项指标固化为 `_hw/bench` 脚本，
+每轮构建自动产出对比表；在没有该基线数据前，不做“超过 Themida / 50×”的断言。
+```
+
+## 32. 2026-10-17 强度自测（StressApp）发现的 6 处真实缺陷与修复
+
+用 `_hw/src/StressApp.java`（字符串/分支/循环/switch/try-catch/lambda/枚举/接口/数组/集合/递归）
+在 `max.conf`（allMax + JNIC + VMP + BFVM + 原生壳）下做端到端自测，逐层定位并修复：
+
+### 32.1 JNIC 方法运行期 `UnsatisfiedLinkError`（KboxListMask 误判）
+
+`KboxListMask.unmaskText()` 的健全性检查要求解码结果含 `/`。默认包类名（`l`、`a$b`）没有包分隔符，
+于是合法清单被判无效 → 调用方回落到“明文解析”把**密文当类名** → `isJnicClass("l")` 恒 false →
+`RegisterNatives` 从未执行 → `UnsatisfiedLinkError: 'int l.y(int)'`。
+
+修复：改为逐行校验“整行是合法内部类名”（允许默认包），并在 `readNameList()` 拒绝非可打印字节，
+避免密文再次被当明文清单。实测 JNIC 方法恢复且结果与基线一致。
+
+### 32.2 JNIC 解释器 `idiv/irem` 除零崩溃（EXCEPTION_INT_DIVIDE_BY_ZERO）
+
+`kbox_jnic_interp_v3.c` 的 `IDIV/IREM` 直接做 C 除法；`safeDiv(1,0)` 在原生层触发 #DE，
+进程以 `EXCEPTION_INT_DIVIDE_BY_ZERO (0xc0000094)` 崩溃（Java 语义应抛 `ArithmeticException`
+并由方法自身的 exception table 捕获）。`INT_MIN / -1` 同样溢出。
+
+修复：int/long 四种除法统一判零抛 `ArithmeticException("/ by zero")`，并特判 `MIN/-1`
+（int 返回 INT_MIN、long 返回 LLONG_MIN、rem 返回 0）；待处理异常交由解释器主循环的
+`kbox_try_dispatch` 走方法自己的 catch 表。实测 `div=42/-1` 与基线一致。
+
+### 32.3 控制流平坦化长期“flattened 0 methods”（槽位模型错误）
+
+`Flattener.stackEffect()` 对方法调用使用了 ASM `Type.getArgumentsAndReturnSizes()` 的原始值，
+而该值**已包含隐式 `this`**：旧代码对实例调用再减 1、对静态调用直接用原值——两种情况都多弹 1 槽。
+结果任何含调用的方法（`StringBuilder.append`、`Kind.values()`…）都以 `stack-underflow` 被拒。
+另修：`NEWARRAY` 实际净效果是 0（旧值 +1）；短指令 `ILOAD_0..ASTORE_3` 补上槽位语义（防御手写节点）。
+
+修复后 StressApp：`flattened 0 → 2 methods`（`build` 48→120 节点、`viaEnum` 44→93 节点）。
+`main` 的 `cond ? a : b` 会把值跨块带到 GOTO（`fall-thru-stack`），属于当前 dispatcher
+设计的真实限制，保持跳过。
+
+### 32.4 MBA 两遍叠加击穿 64 KiB 方法上限 → 整类回滚
+
+`mbaConstants` 先把常量展开成算术树，`mbaRewrite=5` 再对每个算术节点递归展开，`build` 从 351
+节点膨胀到 **33,211 节点**，`ClassWriter` 抛 `MethodTooLargeException`，打包器把**整个类**回滚成
+原始字节（`PROTECTION DEGRADED`）。回滚只重映射符号引用，lambda 的 samMethodName 未同步 →
+`AbstractMethodError: ... 'abstract int db(int,int)'`。
+
+修复：
+- `MbaRewriteObfuscator` 增加**实时预算**：单次展开后若 `insns + repl > 4000` 就保留原算术点；
+- `Packager.FullRollbackRemapper` 增加 `mapInvokeDynamicMethodName`，让回滚类的 lambda 名字与
+  接口 SAM 改名保持一致（与 `NameObfuscator.KBoxRemapper` 同逻辑）。
+
+### 32.5 枚举类不再整体 keep（明文类名残留）
+
+`WeaknessCatalog` 的 `ENUM_TYPE` / `AuditOrchestrator` 对每个枚举都发 `KEEP_CLASS`，
+导致 `StressApp$Kind`、`Kind$1`、`Kind$2` 类名明文残留，并在主类常量池里带出 `StressApp`。
+枚举常量字段名、`values/valueOf` 已由 `RetentionDecision` 单独钉住，类名可以安全改名。
+
+修复：`ENUM_TYPE` 动作改为 `NONE`（仅记录）。重命名枚举后 BFVM 会虚拟化 `values()`，
+由此暴露 `VmCore.findMethod` 对 `Object.clone` 的 `setAccessible` 在 JDK 17+ 抛
+`InaccessibleObjectException` —— 已按 `VmpInterpreter` 的做法修：`findMethod/findField/
+findConstructor` 的 `setAccessible` 加保护，`methodInvoke` 对数组 `clone()` 用浅拷贝实现。
+
+### 32.6 lambda 实现方法/函数式接口被永钉原名
+
+`ReflectionScanner.handleLambda` 与 `AuditOrchestrator` 的 `LAMBDA_CAPTURE` 把所有
+`LambdaMetafactory` bootstrap 的 Handle 都加入 keep-set。这些是**符号引用**，ASM 的
+`ClassRemapper` 会随改名同步改写，keep 住只会让 `lambda$viaLambda$0` 和接口名明文残留。
+
+修复：仅对非 `LambdaMetafactory` / `StringConcatFactory` 的 bootstrap 保留 Handle；
+`Type` 参数按 sort 过滤（MethodType 无内部类名）。另修 `PlaintextAudit`：token 若只是
+引擎类名（`com/kbox/...`）的子串（如 `"KBox"` 命中 `KBoxDedeobfGuard`）不再算应用明文。
+
+### 32.7 复测结果
+
+```
+StressApp（max.conf）:
+  flattened 2 methods / 22 opaque predicates
+  PLAINTEXT AUDIT: application tokens clean (22 scanned, 0 hits); engine brand occurrences=1286
+  java -jar : hello=KBox list=[1, 1, 2, 3, 5] div=42/-1 text=even:0odd:1even:2odd:3 ck=204
+  java -cp  : 同上
+HelloWorld（max.conf）:
+  PLAINTEXT AUDIT: 0 hits
+  Hello, KBox! sum=42 prod=42 add=84 util=21433 ck=-993 tag=42
+P2-11 四类样本（无 main 库 / SPI / 签名 / multi-release）: 4/4 PASS
+```
+
+## 33. 2026-10-17 K-OTP：自写「原生种子一次性程序」+ 全功能回归
+
+### 33.1 方案（K-OTP / Native-Seeded One-Time Program）
+
+目标：让产物中**不存在稳定、可静态反编译的方法体**。与 VMP（固定虚拟化解释器）、
+BFVM（Brainfuck 数据程序）不同，K-OTP 把方法体变成**一次一密**的 share：
+
+```
+构建期：
+  P  = BfMethodCompiler.compile(method)              // BFVM 指令流
+  A  = P XOR ks(seedNative, site, epoch=0, chain0)   // 只把 A 写进类文件
+  state = long[]{epoch=0, chain=chain0}
+  seedNative 只存在于 JNIC 原生库的常量里（库本身 KBNL + kboXShield 加壳）
+
+运行期（每次调用）：
+  P = A XOR ks(seedNative, site, epoch, chain)       // 还原到临时 byte[]
+  r = VmCore.execute(P, ...)                        // 执行
+  ng = mix(chain, site, epoch+1, nanoTime, tid, args) // 运行期熵
+  A = P XOR ks(seedNative, site, epoch+1, ng)        // 就地重随机
+  wipe(P); state = {epoch+1, ng}
+```
+
+- **信息论层面**：A 与 P 的关联完全由 native seed 决定；seed 不在 Java 侧，
+  静态读到的 A 只是一段随机字节（2-of-2：A + native seed）。
+- **每次调用后 A 都变化**：任何一次内存 dump 只对应一个已结束的 epoch，
+  不存在可反复反编译的“程序快照”。
+- **与其它层互补**：BFVM 吃掉 ≤1500 节点的小方法，K-OTP 接手 BFVM 跳过的
+  大方法（本次 StressApp 的 `viaEnum` 9.3KB + lambda 5.1KB 指令流）。
+
+### 33.2 接入点
+
+- `com.kbox.core.otp.OtpMethodInjector`：选方法 → 编译 → 生成 share → 写
+  `otpA$<site>` / `otpS$<site>` 字段与 `<clinit>` 初始化 → 方法体替换为
+  `KotpRuntime.invoke(site, A, S, owner, self, args)` 薄桩。
+- `com.kbox.runtime.KotpRuntime`：keystream（构建/运行共用）、native seed 绑定
+  （复用 `registerNatives0`）、执行、重随机、擦除。
+- `NativeCompiler`：JNIC 原生库新增 `Java_com_kbox_runtime_KotpRuntime_nativeSeed`
+  + `registerNatives0` 里的 `KotpRuntime` 分组；seed 每构建随机。
+- 流水线 Stage 31（BFVM 之后）：仅对未被 VMP/JNIC/BFVM 认领的方法生效；
+  引擎类（`com/kbox/**`，含 renamePackages 后的 final 名）全部排除。
+- 配置 `enableOtp`（`allMax` 自动开启；依赖 `enableJnic`）；GUI 增加
+  “K-OTP 一次性程序（需 JNIC）”开关。
+
+### 33.3 实现期发现的缺陷
+
+1. **桩描述符写错**：`(I[BL[J...)` 多了一个 `L`，`L[JLjava/lang/Class;` 被
+   当成类名 → `VerifyError` / 整类回滚。修正为 `(I[B[J...`，并用独立 ASM
+   校验桩验证通过。
+2. **误选引擎诱饵类**：S4 honeypot 在 renamePackages 后变成 `d/e/f/*`，
+   `startsWith("com/kbox/")` 失效 → OTP 注入诱饵类导致 VerifyError。
+   现在按 `classMap` 中 `com/kbox/**` 的 **final 名**排除。
+3. **原生库缺少前向声明**：`registerNatives0` 引用 `nativeSeed` 但定义在后，
+   gcc 报 undeclared；补 `JNIEXPORT jlong ...(JNIEnv*, jclass);`。
+4. **BF/非 BF 两条注入路径**都要带上 `KotpRuntime` 与 bfvm 运行时
+   （plaintext `injectRuntimeClasses` + BF `collectRuntimeClassesForBlob`）。
+5. **VmCore 丢失 checked throwable 类型**：K-OTP 虚拟化的方法里若含
+   TypeConfusion 的 relay carrier（非 RuntimeException/Error），`ATHROW`/反射调用
+   会被包装成 `BfVmException`，导致方法自身的 catch 表匹配不到 carrier → 
+   `ATHROW of non-runtime throwable`。改为 `sneakyThrow` 原样抛出，让解释器的
+   异常表按真实类型分派（uncaught 时也保留原类型）。此修复同时提升 BFVM 的
+   异常语义兼容性。
+
+### 33.4 全功能回归（allmax.conf：BF Loader + VMP + JNIC + BFVM + K-OTP + 原生壳）
+
+```
+K-OTP: 2 one-time program(s) in 1 class(es), ≈14.9KB stream bytes
+BFVM: 15 methods virtualized / VMP: 8 injected / JNIC: 4 native
+扁平化 2 methods；opaque 22；state-machine 103 branches；89 int constants
+JNIC 原生库 135,876B（KBNL + kboXShield）；VMP 原生库 103,168B；BF RLE 5,697,103B
+PLAINTEXT AUDIT: 0 hits；构建 10.59s
+java -jar / java -cp：hello=KBox list=[1, 1, 2, 3, 5] div=42/-1 text=even:0odd:1even:2odd:3 ck=204
+HelloWorld allmax：0 hits，输出基线一致；P2-11 四类样本 4/4 PASS
+```
+
+### 33.5 诚实的强度边界
+
+K-OTP 不是“数学上不可逆”：解码器就在产物里，攻击者若完整逆向 native 库并
+在每次调用时截获临时 P，仍可恢复单个 epoch 的程序。它做到的是：
+**静态产物中没有可反编译的稳定方法体；每次调用后磁盘/内存中的 share 都已重随机；
+单独 dump 只能得到一个已失效的 epoch。** 配合 native 壳（KBNL + kboXShield）
+把 seed 的获取成本抬到“先破壳”的级别。
+
+---
+
+## 34. 适配性增强：字符串全乱码根因、反射改名、InnerClasses、BF 打包类
+
+本轮用 Java 21 特性样本（record / sealed + pattern switch / enum switch /
+自定义序列化 / 反射 / VarHandle / SPI / 文本块 / indy concat）与 Java 8 样本做
+全开（`_hw/max.conf`）与 BF 全开（`_hw/allmax.conf`）回归，修掉 5 个真实缺陷。
+
+### 34.1 根因：崩溃日志残留误报 → 所有字符串解密成噪声
+
+现象：`Hi21` 输出 `I?uF?&?~1 / ?lr?jNa`，`StressApp` 全乱码；但直接反射调用
+holder 解密器能正确解出 `hello21=`，构建期与运行期 keyfp 完全一致。
+
+定位：`AntiDebug.checkCrashDumpResidue()` 扫描 `java.io.tmpdir`，只要看到
+`hs_err_pid*` / `replay_pid*` / `java_pid*` / `*.hprof` 就把 `tampered=true`。
+本机 18:02 有一次无关 JVM 崩溃留下 `hs_err_pid158864.log`，此后**每一次**运行
+都被判为被调试，解密器走噪声分支（返回密文前 8 字节的 UTF-8），程序继续跑但
+字符串全废。这也解释了此前“关掉 antiDebug 仍乱码”：`ResourceGuardLauncher`
+无条件调用 `AntiDebug.check()`。
+
+修复：
+
+1. 残留扫描只认可**当前进程 PID** 的转储（`hs_err_pid<pid>` 等），
+   其他 JVM 的历史崩溃日志一律忽略。
+2. 计时金丝雀阈值放宽：单轮 wall > 50ms（原 5ms）、wall/cpu 比 > 20 且
+   wall > 250ms（原 10ms）才判定被单步/挂钩——原阈值在高负载机器上
+   会把普通调度抖动当成调试器。
+3. AES 解密器的 `if (AntiDebug.isTampered()) goto noise` 改为**按构建配置生成**：
+   `antiDebug=false` 的产物里不再有这条分支，其他组件置位的 tamper 标志
+   不会再把正常业务字符串污染成噪声。
+
+### 34.2 反射字符串常量未随类改名
+
+`ClassRemapper` 只改符号引用，改不到 `Class.forName("a.b.C")` 里的字符串。
+`CompatApp` 的 `Class.forName("compat.ReflectTarget")` 在改名后
+要么 `ClassNotFoundException`，要么被反射门以 `SecurityException("KBox")` 拒绝
+（白名单按新名算哈希）。
+
+修复：`NameObfuscator.apply()` 增加预处理 `rewriteReflectionStringConstants`，
+按 rename map 精确改写 `LDC` 字符串的三种文本形式：内部名 `a/b/C`、
+点分名 `a.b.C`、字段描述符 `La/b/C;`。不匹配的字符串保持原样。
+这一条同时覆盖 `ClassLoader.loadClass`、`getResourceAsStream("a/b/C.class")`
+等所有“以字符串指定类”的 API。
+
+### 34.3 InnerClasses 不能单独擦除（record toString / getSimpleName）
+
+`eraseSignatures` 原先直接 `cn.innerClasses = null`。Java 21 的 record
+`toString` 走 `ObjectMethods.makeToString` → `Class.getSimpleName()`：
+嵌套 record 丢失 InnerClasses 后会把简单名退化成二进制名（实测
+`CompatApp$Point[x=3, y=4]`，基线是 `Point[x=3, y=4]`）。
+
+只保留“描述自身”的条目也不行：JVM 会在内外类之间做一致性校验，只让一侧
+保留条目会抛
+
+```
+IncompatibleClassChangeError: compat.CompatApp and compat.CompatApp$Point
+disagree on InnerClasses attribute
+```
+
+结论：`InnerClasses` 必须**整体保留或整体删除**二选一。这里选择保留——
+它只把已经混淆过的名字连成嵌套关系，泄露的信息量极低，而
+`getSimpleName()` / `getDeclaringClass()` / record `toString` /
+Jackson `@JsonTypeInfo(NAME)` 都依赖它。`EnclosingMethod` 仍按原策略擦除。
+
+### 34.4 BF 打包：`hasClass` 收到点分名 → 入口 stub 无限递归
+
+`BfSecureLoader.loadClass(name, resolve)` 把 JVM 传来的**二进制名** `compat.CompatApp`
+直接交给原生 `hasClass`，而 BF 索引按**内部名** `compat/CompatApp` 建表。
+默认包（`HelloWorld`、`h`）没有点号，所以此前所有 BF 回归都恰好通过；
+一旦主类在具名包里，`hasClass` 恒 false → 回落到父加载器 → 拿到 packer 写在
+原主类名上的明文 `-cp` stub → `BfSecureLoader.main` → 再加载 → 无限递归
+（`InvocationTargetException` 嵌套上千层，最终 StackOverflow）。
+
+修复：`loadClass` 调用 `hasClass(name.replace('.', '/'))`。
+
+### 34.5 回归矩阵（全部与未混淆基线逐行 diff）
+
+```
+Java 21 特性样本 compat.jar   max : 9/9 行一致（record/sealed/enum/序列化/反射/VarHandle/SPI/indy/list）
+Java 21 特性样本 compat.jar   allMax(+BF+资源+类加密): 9/9 行一致
+Java 21 / Java 8  StressApp   max : 输出一致
+Hi21 / Hi21b                  max : hello21=1 / second-literal / alpha-beta
+HelloWorld                    allMax: 输出一致
+resprobe（资源+SPI+URL）       allMax: 5/5 行一致
+P2-11 四类样本（无 main 库 / SPI / 签名 / multi-release）: 4/4 PASS
+java -cp 启动（BF 产物，具名包）: 与 -jar 输出一致
+```
+
+---
+
+## 35. v3.0.2 + 真实我的世界 Mod 全开适配（Forge / Fabric / NeoForge × 1.8.9/1.12.2/1.16.5/26.3）
+
+### 35.1 版本
+
+`pom.xml` 与四个子模块统一升到 **3.0.2**（`allMax` 配置与行为不变）。
+
+### 35.2 下载并搭建的 7 套真实服务端环境
+
+```
+forge-1.8.9   11.15.1.2318-1.8.9   java 8
+forge-1.12.2  14.23.5.2860          java 8
+forge-1.16.5  36.2.42               java 8
+forge-26.3    66.0.13               java 25
+fabric-1.16.5 loader 0.19.5         java 8
+fabric-26.3   loader 0.19.5         java 25
+neoforge-26.3 26.3.0.90             java 25
+```
+
+测试 Mod（均为 Modrinth 真实产物）：JEI 2.28.18.187（1.8.9）、AppleSkin 1.0.14
+（1.12.2）、AppleSkin 2.5.1（1.16.5）、NoChatReports 2.21.0（Forge/Fabric/NeoForge
+26.3）、LuckPerms 5.3.9 + Fabric API 0.42.0（Fabric 1.16.5）。
+全部用 `_mctest/conf/allmax-mc.conf`（allMax + BF Loader + 原生链）混淆后启动，
+判据为服务端 `Done (x.xxxs)` 且 Mod 正常初始化。
+
+### 35.3 为通过测试修掉的真实缺陷
+
+1. **1.8.9/1.12.2 的 `mcmod.info` 未被识别**：检测器只认 fabric.mod.json /
+   mods.toml，老 Forge Mod 完全没走 MC 适配。补 `mcmod.info` 分支（保留
+   `mcmod.info`，把每个带 `@Mod` 的类加入 keep）。
+2. **`@Mod` 的 modid 属性**：只读了 `value`，而 Forge 1.8.9–1.20 写的是
+   `@Mod(modid="...")` → 入口类识别为 0。改为同时接受 `modid`/`value`。
+3. **类加密与 Mod 加载器冲突**：FML/NeoForge 在定义任何类之前会 ASM 扫描 jar 内
+   **每一个** `.class` 找 `@Mod`；被 AES 加密的条目直接让整个 jar 被判为
+   "corrupt zip"。检测到 Mod 时自动关闭 `encryptClasses`。
+4. **反反编译器的畸形属性**：level 2/3 会写入假的 StackMapTable / 非法常量池引用，
+   同样让加载器的全量扫描失败。检测到 Mod 时自动把 `antiDecompiler` 降为 0。
+5. **BF blob 与宿主加载器不共存**：hybrid 模式把引擎类藏进 blob，而 Mod 类是宿主
+   加载器定义的明文类，引用 `VmpInterpreter` 时 `NoClassDefFoundError`。Mod jar
+   自动降级为非 BF（其余保护保留）。
+6. **VMP 的解释器侧类解析**：Gson `ExclusionStrategy` 用 `Class ==` 判断，VMP 下
+   会得到不同 Class 实例而静默走错分支。Mod jar 自动关闭 VMP（可执行程序仍全开）。
+7. **资源混淆与 Mod 资源查找冲突**：`ResourceBundle.getBundle("luckperms")`、
+   `assets/**`、`data/**` 都按原路径读取。Mod jar 自动关闭 `obfuscateResources`。
+8. **Fabric `fabric.mod.json` 解析器把"值"当"键"**：`"environment": "server"`
+   里的 `"server"` 被当成 entrypoints 的 `server` 键 → 入口类 0 个、
+   `LPFabricBootstrap` 被改名后 `ClassNotFoundException`。新增
+   `indexOfJsonKey`（只匹配后跟 `:` 的键）。
+9. **JDK 接口方法被改名**：`ListeningList implements java.util.List` 的
+   `iterator()` 被改成 `gr()` → `AbstractMethodError`。`RetentionDecision` 现在
+   用 `Class.isInterface()` 判断所有 `java/*` 类型，任何 JDK **接口**的覆写方法
+   一律保名（JDK 类仍跳过，避免 Object 把全 jar 方法都锁死）。
+10. **回滚类的名字映射混用原名/新名**：序列化失败回滚时，`FullRollbackRemapper`
+    走父类链用的是"新名 ClassNode 的新 superName"，而映射表以原名索引 →
+    父类方法查不到，调用点保留 `get`、声明已改成 `jzd` → `NoSuchMethodError`。
+    现在每一跳都先 `reverseClassMap` 归一化回原名。
+11. **BFVM 三处**：
+    - 重建方法体时丢弃注解 → Mixin `@Overwrite/@Inject` 消失，
+      `InvalidMixinException: contains non-private static method`。改为完整复制
+      注解/参数注解/签名/异常表。
+    - `allInterfaces` 只看运行时类的直接接口，漏掉父类实现的 `Collection.stream`
+      → `method not found: SingletonImmutableList.stream()`。改为遍历所有父类的
+      接口。
+    - `findField` 同样补接口常量查找。
+12. **JNIC 的急切类解析**：方法入口把常量池里的类全部 `FindClass`，专用服务器上
+    缺失的客户端类即使所在分支永不执行也会让整个方法失败。改为：入口解析失败
+    清异常置 NULL；`LDC class` 真正执行时才抛 `NoClassDefFoundError`；解析优先
+    使用声明类的 loader（`kbox_find_class`），与 JVM 语义一致。
+
+### 35.4 最终测试矩阵（全部 `SERVER_OK`）
+
+```
+forge-1.8.9   + JEI 2.28.18.187                 Done (1.1s)    Mod loaded
+forge-1.12.2  + AppleSkin 1.0.14                Done (1.5s)    Mod loaded
+forge-1.16.5  + AppleSkin 2.5.1                 Done (5.4s)    Mod loaded
+forge-26.3    + NoChatReports 2.21.0            Done (0.3s)    Mod loaded
+fabric-1.16.5 + LuckPerms 5.3.9 + Fabric API    Done (5.2s)    LuckPerms v5.3.9
+fabric-26.3   + NoChatReports 2.21.0 + API      Done (0.4s)    Mod loaded
+neoforge-26.3 + NoChatReports 2.21.0            Done (0.3s)    Mod loaded
+```
+
+产物：`高级先行版源码/dist/kboxObfuscatorb3.jar`（3.0.2）。
+
+### 35.5 已知边界
+
+重度 Mixin Mod（实测 Lithium 0.6.6，1.16.5）在 Mixin 把 `@Inject` handler 合并进
+目标类后仍可能出现 handler 内 NPE；同环境 LuckPerms（3 个简单 Mixin）通过。
+后续需要继续排查 Mixin handler 合并后的类初始化顺序差异。

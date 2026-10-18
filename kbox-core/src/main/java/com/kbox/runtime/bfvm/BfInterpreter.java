@@ -23,18 +23,50 @@ public final class BfInterpreter {
     private BfInterpreter() {
     }
 
-    /** Execute a BF program and return the decoded data region (cells 2..2+len-1). */
+    /**
+     * Execute a BF program and return the decoded data region.
+     *
+     * <p>约定（必须与 {@code BfProgramWriter} 同步）：{@code [0..1]} = payload 长度（大端），
+     * {@code [2]} = 编码标志（0 = raw，1 = DEFLATE），{@code [3..]} = payload。
+     * DEFLATE 让 BF 程序只物化压缩后的数据，从而突破"BF 源 ≈ 128× stream"的方法体上限。</p>
+     */
     public static byte[] executeToData(String src) {
         int[] tape = run(src, null, null);
         int len = ((tape[0] & 0xFF) << 8) | (tape[1] & 0xFF);
-        if (len < 0 || 2 + len > tape.length) {
+        if (len < 1 || 2 + len > tape.length) {
             throw new BfVmException("bad BF data header len=" + len);
         }
-        byte[] data = new byte[len];
-        for (int i = 0; i < len; i++) {
-            data[i] = (byte) tape[2 + i];
+        int enc = tape[2] & 0xFF;
+        byte[] payload = new byte[len - 1];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) tape[3 + i];
         }
-        return data;
+        if (enc == 1) {
+            return inflate(payload);
+        }
+        return payload;
+    }
+
+    /** zlib 解压（对应 {@code BfProgramWriter} 的 DEFLATE payload）。 */
+    private static byte[] inflate(byte[] packed) {
+        try {
+            java.util.zip.Inflater inf = new java.util.zip.Inflater();
+            inf.setInput(packed);
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(packed.length * 4);
+            byte[] buf = new byte[4096];
+            while (!inf.finished()) {
+                int n = inf.inflate(buf);
+                if (n <= 0) {
+                    if (inf.needsInput() || inf.needsDictionary()) break;
+                    continue;
+                }
+                out.write(buf, 0, n);
+            }
+            inf.end();
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new BfVmException("BF payload inflate failed", e);
+        }
     }
 
     /** Execute a BF program and capture its {@code .} output. */

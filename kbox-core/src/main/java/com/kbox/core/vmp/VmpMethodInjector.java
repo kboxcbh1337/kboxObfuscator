@@ -270,7 +270,10 @@ public final class VmpMethodInjector {
             byte[] rawEnc = encCode;
             encCode = com.kbox.core.brainfuckshield.BfMethodInjector.shield(
                     rawEnc, K, bfBuildSalt, bfLevel);
-            if (System.getProperty("kbox.bf.verify") != null) {
+            // P0-2：回环校验**默认开启**——它是 BfDialect ↔ BfInterpreter 双镜像一致性的
+            // 唯一护栏（两侧靠人肉同步，任一侧改动会静默破功）。需要跳过时显式
+            // -Dkbox.bf.verify=false。
+            if (!"false".equalsIgnoreCase(System.getProperty("kbox.bf.verify"))) {
                 if (!com.kbox.core.brainfuckshield.BfMethodInjector.verifyRoundTrip(
                         rawEnc, K, bfBuildSalt, bfLevel)) {
                     throw new KBoxException("BrainfuckShield round-trip verify failed");
@@ -408,6 +411,12 @@ public final class VmpMethodInjector {
         initBuf.visitMethodInsn(Opcodes.INVOKESPECIAL, INTERPRETER_METHOD, "<init>",
                 "([B[Ljava/lang/Object;[BIIII[[I)V", false);
         initBuf.visitFieldInsn(Opcodes.PUTSTATIC, cn.name, methodFieldName, "L" + INTERPRETER_METHOD + ";");
+        // Bind the defining class so the interpreter resolves referenced classes
+        // through this class' own loader (TCCL may be a different loader).
+        initBuf.visitFieldInsn(Opcodes.GETSTATIC, cn.name, methodFieldName, "L" + INTERPRETER_METHOD + ";");
+        initBuf.visitLdcInsn(Type.getObjectType(cn.name));
+        initBuf.visitMethodInsn(Opcodes.INVOKESTATIC, "com/kbox/runtime/VmpInterpreter", "bindOwner",
+                "(L" + INTERPRETER_METHOD + ";Ljava/lang/Class;)V", false);
         clinit.instructions.insert(initBuf.instructions);
         // maxStack must cover: 5 args (byte[], Object[], 3 ints) + exceptions-array
         // construction which peaks at ~6 deeper, so 16 is a safe lower bound.

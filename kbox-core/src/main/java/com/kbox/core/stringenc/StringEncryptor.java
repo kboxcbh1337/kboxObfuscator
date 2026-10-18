@@ -145,7 +145,7 @@ public final class StringEncryptor {
         // Encrypt static-final String ConstantValue fields: their value lives in
         // the field's ConstantValue attribute (not a method LDC), so the LDC pass
         // above never touches it and the plaintext leaks. Move the initialization
-        // into <clinit> via KBoxRuntime decryption, like ZKM/Allatori.
+        // into <clinit> via KBoxRuntime decryption.
         encryptConstantStringFields(cn);
     }
 

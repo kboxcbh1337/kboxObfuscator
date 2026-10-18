@@ -53,7 +53,7 @@ import java.util.Map;
  *
  * <p>The Kotlin-level names ({@code KmFunction.name}, {@code KmProperty.name})
  * are intentionally <b>not</b> renamed: Kotlin reflection resolves references
- * by those names, and commercial tools (ZKM) also preserve them. The metadata
+ * by those names, and established tools also preserve them. The metadata
  * version is preserved so the runtime accepts the rewritten bytes.
  *
  * <p>Failure to rewrite a single annotation is logged and non-fatal.

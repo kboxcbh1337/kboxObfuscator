@@ -297,7 +297,7 @@ public final class ControlFlowObfuscator {
                 // instruction count falls inside [flattenerMinInsns, flattenerMaxInsns].
                 // A huge method risks StackMapTable precision blow-up; a tiny method
                 // gains nothing from a dispatcher. This selects genuine business
-                // methods (the ZKM-style "EPL" bandwidth) and bounds the switch size.
+                // methods (the classic "EPL" bandwidth) and bounds the switch size.
                 if (!isCtor && !isVmpTarget && inFlattenWindow(mn)) {
                     snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
                     flattened = Flattener.flatten(mn, cfg.getControlFlowStrength());

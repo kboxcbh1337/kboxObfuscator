@@ -1563,11 +1563,9 @@ public final class Packager {
             // and downgrades to V1_5 so the JVM uses inference verification.
             byte[] raw = loadClasspathResource(internal + ".class");
             if (raw == null) {
-                System.err.println("[DEBUG guardInject] skip " + internal + " (class not found on cp)");
                 KBoxLog.warn(TAG, internal + ".class not found on classpath");
                 continue;
             }
-            System.err.println("[DEBUG guardInject] processing " + internal + " rawLen=" + raw.length);
             // Re-serialize to ensure correct StackMapTable frames.
             byte[] bytes = reSerializeRuntimeClass(raw, internal);
             if (bytes == null) {
@@ -1600,9 +1598,7 @@ public final class Packager {
                 while (en.hasMoreElements()) {
                     String n = en.nextElement().getName();
                     if (n.startsWith("com/kbox/runtime/ResourceGuard") && n.endsWith(".class")) {
-                        String internal = n.substring(0, n.length() - ".class".length());
-                        System.err.println("[DEBUG discoverGuard] found: " + internal);
-                        out.add(internal);
+                        out.add(n.substring(0, n.length() - ".class".length()));
                     }
                 }
                 zf.close();

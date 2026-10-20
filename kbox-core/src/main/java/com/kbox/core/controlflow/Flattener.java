@@ -89,7 +89,7 @@ final class Flattener {
     static boolean flatten(MethodNode mn, int strength) {
         int insnSize = mn.instructions.size();
         int branches = countBranches(mn);
-        String reason = checkEligibility(mn);
+        String reason = checkEligibility(mn, strength);
         if (reason != null) {
             cfLog("      skip " + mn.name + mn.desc
                     + " insn=" + insnSize + " branches=" + branches
@@ -155,20 +155,28 @@ final class Flattener {
         try {
             frames = new Analyzer<BasicValue>(new BasicInterpreter()).analyze(mn.name, mn);
         } catch (Throwable t) {
+            cfLog("      localInitPlan: analyzer failed (" + t.getMessage() + ")");
             return null; // unanalysable: leave the method alone
         }
-        if (frames == null) return null;
+        if (frames == null) {
+            cfLog("      localInitPlan: analyzer returned no frames");
+            return null;
+        }
         Map<AbstractInsnNode, Integer> idx = indexMap(mn);
         int n = mn.maxLocals;
         int[] plan = new int[Math.max(n, 0)];
         for (AbstractInsnNode leader : leaders) {
             Integer li = idx.get(leader);
-            if (li == null) return null;
+            if (li == null) {
+                cfLog("      localInitPlan: leader not in instruction list");
+                return null;
+            }
             Frame<BasicValue> f = frames[li];
             if (f == null) {
                 // Unreachable in the original code. The dispatcher would make it
                 // reachable, and unreachable bytecode carries no verifier contract
                 // we could satisfy — refuse rather than risk an invalid class.
+                cfLog("      localInitPlan: leader@" + li + " unreachable");
                 return null;
             }
             for (int s = firstFree; s < n; s++) {
@@ -182,6 +190,8 @@ final class Flattener {
                 else if (v == BasicValue.DOUBLE_VALUE) want = INIT_DOUBLE;
                 else want = INIT_NULL; // any reference (or return address): null merges with it
                 if (plan[s] != INIT_NONE && plan[s] != want) {
+                    cfLog("      localInitPlan: slot " + s + " category conflict "
+                            + plan[s] + " vs " + want + " at leader@" + li);
                     return null; // two different categories on one slot: cannot merge
                 }
                 plan[s] = want;
@@ -259,8 +269,23 @@ final class Flattener {
      * fall-through successor, precisely the property the old type-based
      * analyzer check enforced (it only ever looked at {@code getStackSize()}).
      */
-    private static String checkEligibility(MethodNode mn) {
-        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return "try-catch";
+    private static String checkEligibility(MethodNode mn, int strength) {
+        // 条目 31: methods WITH exception handlers become flattenable at
+        // strength >= 2. Every handler entry must be reachable ONLY through the
+        // JVM's exception-dispatch edge (never a jump target, never a
+        // conditional's fall-through), so the dispatcher never needs a case
+        // with the caught exception on the stack. Handler bodies are then
+        // ordinary blocks: the entry ASTORE restores an empty stack and the
+        // terminator becomes a state transition like any other block.
+        java.util.Set<LabelNode> handlerStarts = new java.util.HashSet<>();
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) {
+            if (strength < 2) return "try-catch";
+            if (mn.tryCatchBlocks.size() > 8) return "too-many-handlers";
+            for (org.objectweb.asm.tree.TryCatchBlockNode tcb : mn.tryCatchBlocks) {
+                if (tcb.handler != null) handlerStarts.add(tcb.handler);
+                else return "handler-null";
+            }
+        }
         int total = mn.instructions.size();
         if (total < 6) return "too-small";
         // Allow methods up to 1600 instructions (was 1000) for more aggressive flattening.
@@ -271,6 +296,7 @@ final class Flattener {
         for (AbstractInsnNode n : insns) {
             int op = n.getOpcode();
             if (op == Opcodes.TABLESWITCH || op == Opcodes.LOOKUPSWITCH) hasSwitch = true;
+            if (op == Opcodes.JSR || op == Opcodes.RET) return "jsr-ret";
             if (n instanceof JumpInsnNode) branches++;
         }
         if (hasSwitch) return "switch";
@@ -320,17 +346,55 @@ final class Flattener {
                     || op == Opcodes.IRETURN || op == Opcodes.LRETURN
                     || op == Opcodes.FRETURN || op == Opcodes.DRETURN
                     || op == Opcodes.ARETURN || op == Opcodes.ATHROW) {
+                // 条目 31: the boundary is the IMMEDIATE successor, which may
+                // itself be a LabelNode (in particular a handler entry whose
+                // frame starts with the caught Throwable on the stack). The old
+                // "skip labels first" version attributed the boundary to the
+                // first real instruction, where the height is already 1.
                 int next = i + 1;
-                while (next < total && insns[next].getOpcode() == -1) next++;
                 if (next < total) isBlockStart[next] = true;
+            }
+        }
+        // 条目 31: validate each handler entry is JVM-dispatch-only and that
+        // the first real instruction consumes the caught exception (so the
+        // operand-stack height the walk tracks stays correct).
+        if (!handlerStarts.isEmpty()) {
+            Map<AbstractInsnNode, Integer> hpos = new IdentityHashMap<>();
+            for (int i = 0; i < total; i++) hpos.put(insns[i], i);
+            for (LabelNode hs : handlerStarts) {
+                if (hs == insns[0]) return "handler-at-entry";
+                Integer hi = hpos.get(hs);
+                if (hi == null) return "handler-orphan";
+                if (isJumpTarget[hi]) return "handler-is-jump-target@" + hi;
+                int prev = hi - 1;
+                while (prev >= 0 && insns[prev].getOpcode() == -1) prev--;
+                if (prev < 0) return "handler-no-pred";
+                int pop = insns[prev].getOpcode();
+                if (pop != Opcodes.GOTO && !isReturn(pop) && pop != Opcodes.ATHROW) {
+                    return "handler-fall-in@" + hi;
+                }
+                int fst = hi + 1;
+                while (fst < total && insns[fst].getOpcode() == -1) fst++;
+                if (fst >= total) return "handler-empty";
+                int fop = insns[fst].getOpcode();
+                if (fop != Opcodes.ASTORE && fop != Opcodes.ATHROW && fop != Opcodes.POP) {
+                    return "handler-entry-op@" + hi + ":op" + fop;
+                }
             }
         }
         // Single O(n) height walk. h = operand-stack height in slots within the
         // current block (every block starts at height 0; any nonzero boundary
         // means a value would have to survive the dispatcher -> ineligible).
+        // 条目 31: handler-entry blocks start at height 1 — the JVM pushes the
+        // caught Throwable on the exception edge, and the handler's first real
+        // instruction (ASTORE/POP/ATHROW) consumes it.
         int h = 0;
         for (int i = 0; i < total; i++) {
-            if (isBlockStart[i] && h != 0) {
+            boolean handlerEntry = insns[i] instanceof LabelNode
+                    && handlerStarts.contains(insns[i]);
+            if (handlerEntry) {
+                h = 1;
+            } else if (isBlockStart[i] && h != 0) {
                 return (isJumpTarget[i] ? "non-empty-stack@" : "fall-thru-stack@") + i
                         + ":op" + insns[i].getOpcode() + ":h" + h;
             }
@@ -357,7 +421,7 @@ final class Flattener {
      * Net operand-stack height effect (pushes − pops, in slots) of one
      * instruction. Long/double count 2 slots. Type-independent.
      */
-    private static int stackEffect(AbstractInsnNode n) {
+    static int stackEffect(AbstractInsnNode n) {
         int op = n.getOpcode();
         if (op == -1) return 0; // labels / frames / line numbers
         switch (op) {
@@ -471,6 +535,13 @@ final class Flattener {
         }
         if (n instanceof LdcInsnNode) {
             Object cst = ((LdcInsnNode) n).cst;
+            // Java 11+ dynamic constants: the pushed size is the descriptor's
+            // size, which may be 2 for long/double (a plain "1" would corrupt
+            // the height walk on Java 11+ classes).
+            if (cst instanceof org.objectweb.asm.ConstantDynamic) {
+                return Type.getType(((org.objectweb.asm.ConstantDynamic) cst).getDescriptor())
+                        .getSize();
+            }
             return (cst instanceof Long || cst instanceof Double) ? 2 : 1;
         }
         if (n instanceof TypeInsnNode) {
@@ -513,6 +584,14 @@ final class Flattener {
     }
 
     private static int doFlatten(MethodNode mn, int strength) {
+        // 条目 31: handler entry labels are leaders reached only by the JVM's
+        // exception-dispatch edge — they must never become dispatcher cases.
+        java.util.Set<LabelNode> handlerStarts = new java.util.HashSet<>();
+        if (mn.tryCatchBlocks != null) {
+            for (org.objectweb.asm.tree.TryCatchBlockNode tcb : mn.tryCatchBlocks) {
+                if (tcb.handler != null) handlerStarts.add(tcb.handler);
+            }
+        }
         // 1. Compute basic-block leaders (entry + jump targets + post-jump/return points).
         //    Each leader is normalized to a LabelNode so LOOKUPSWITCH can target it.
         Map<AbstractInsnNode, LabelNode> labelFor = new HashMap<>();
@@ -525,16 +604,25 @@ final class Flattener {
                 JumpInsnNode j = (JumpInsnNode) n;
                 // jump target is already a LabelNode (j.label)
                 if (!leadersRaw.contains(j.label)) leadersRaw.add(j.label);
-                AbstractInsnNode after = skipLabels(j.getNext());
+                AbstractInsnNode after = skipToLeader(j.getNext(), handlerStarts);
                 if (after != null) {
                     AbstractInsnNode lab = ensureLeaderLabel(mn, after, labelFor);
                     if (!leadersRaw.contains(lab)) leadersRaw.add(lab);
                 }
             } else if (isReturn(op) || op == Opcodes.ATHROW) {
-                AbstractInsnNode after = skipLabels(n.getNext());
+                AbstractInsnNode after = skipToLeader(n.getNext(), handlerStarts);
                 if (after != null) {
                     AbstractInsnNode lab = ensureLeaderLabel(mn, after, labelFor);
                     if (!leadersRaw.contains(lab)) leadersRaw.add(lab);
+                }
+            }
+        }
+        // 条目 31: handler labels themselves are leaders (block boundaries) even
+        // when no jump/post-terminator scan landed on them.
+        if (mn.tryCatchBlocks != null) {
+            for (org.objectweb.asm.tree.TryCatchBlockNode tcb : mn.tryCatchBlocks) {
+                if (tcb.handler != null && !leadersRaw.contains(tcb.handler)) {
+                    leadersRaw.add(tcb.handler);
                 }
             }
         }
@@ -605,7 +693,11 @@ final class Flattener {
                 cur = cur.getNext();
             }
             if (term == null) {
-                if (end != null) {
+                // 条目 31: a block ending at a handler label keeps its original
+                // fall-through (defensive — eligibility already guarantees the
+                // predecessor is an unconditional terminator, so this is
+                // unreachable for valid code).
+                if (end != null && !(end instanceof LabelNode && handlerStarts.contains(end))) {
                     mn.instructions.insertBefore(end, exitStub(stateLocal, maskLocal, dispatch,
                             idOf.get(end), idMask.get(idOf.get(end))));
                 }
@@ -694,9 +786,13 @@ final class Flattener {
         LabelNode def = new LabelNode();
         java.util.TreeMap<Integer, LabelNode> byKey = new java.util.TreeMap<>();
         for (int i = 0; i < leadersRaw.size(); i++) {
-            int id = idOf.get(leadersRaw.get(i));
+            AbstractInsnNode leader = leadersRaw.get(i);
+            // 条目 31: handler entries are JVM-dispatch-only — no case value
+            // may target them (the frame there carries the caught exception).
+            if (leader instanceof LabelNode && handlerStarts.contains(leader)) continue;
+            int id = idOf.get(leader);
             Integer mask = idMask.get(id);
-            byKey.put(mask != null ? (id ^ mask) : id, (LabelNode) leadersRaw.get(i));
+            byKey.put(mask != null ? (id ^ mask) : id, (LabelNode) leader);
         }
         // Fake entries → default (defensive throw). They must not collide with a
         // real case value, or the real block would become unreachable.
@@ -767,6 +863,15 @@ final class Flattener {
         return n;
     }
 
+    /** Like {@link #skipLabels}, but stops AT a handler-entry label instead of
+     *  skipping past it (条目 31) — the handler label itself is the block
+     *  boundary the flattener must see. */
+    private static AbstractInsnNode skipToLeader(AbstractInsnNode n,
+                                                 java.util.Set<LabelNode> stopAt) {
+        while (n != null && n.getOpcode() == -1 && !stopAt.contains(n)) n = n.getNext();
+        return n;
+    }
+
     /** {@code s1 = id; s2 = mask; goto dispatch;} */
     private static InsnList exitStub(int stateLocal, int maskLocal,
                                      LabelNode dispatch, int id, int mask) {
@@ -789,7 +894,7 @@ final class Flattener {
         else l.add(new org.objectweb.asm.tree.LdcInsnNode(v));
     }
 
-    private static boolean isReturn(int op) {
+    static boolean isReturn(int op) {
         switch (op) {
             case Opcodes.RETURN: case Opcodes.IRETURN: case Opcodes.LRETURN:
             case Opcodes.FRETURN: case Opcodes.DRETURN: case Opcodes.ARETURN:

@@ -46,6 +46,13 @@ public final class TamperShield {
     /** IntegrityCheck is a hard reference only guarded at runtime (may not be injected). */
     private static boolean integrityTampered() {
         try {
+            // 条目 91: arm the verification lazily on first consult. Without
+            // this, a plain (non-guard) artifact with integrityCheck=true never
+            // ran the check at all: only ResourceGuardLauncher called check(),
+            // and plain jars have no launcher — a repacked jar stayed healthy.
+            // IntegrityChecker.check() is idempotent and starts the periodic
+            // re-verification daemon once.
+            IntegrityChecker.check();
             return IntegrityChecker.isTampered();
         } catch (Throwable t) {
             // Class not injected (integrityCheck off) — no integrity signal.

@@ -131,10 +131,9 @@ public final class BootstrapObfuscator {
     /** Obfuscates one bootstrap class. @return obfuscated bytes, or raw if unparseable. */
     public byte[] obfuscate(byte[] raw) {
         try {
-            org.objectweb.asm.ClassReader cr = new org.objectweb.asm.ClassReader(raw);
-            ClassNode cn = new ClassNode();
-            cr.accept(cn, org.objectweb.asm.ClassReader.EXPAND_FRAMES
-                    | org.objectweb.asm.ClassReader.SKIP_DEBUG);
+            ClassNode cn = com.kbox.core.compat.ClassFileCompat.read(raw,
+                    org.objectweb.asm.ClassReader.EXPAND_FRAMES
+                            | org.objectweb.asm.ClassReader.SKIP_DEBUG);
             encryptStrings(cn);
             // Strip ConstantValue from static final String fields: the LDC usages
             // have been replaced with decryptor calls, but the field's ConstantValue

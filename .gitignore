@@ -14,3 +14,6 @@ selfmapping.txt
 
 # Release artifacts are published as GitHub Release assets, not tracked in git.
 dist/
+
+# Local verification scratch (test jars / configs)
+_verify/

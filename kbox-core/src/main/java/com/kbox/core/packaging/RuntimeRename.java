@@ -88,7 +88,7 @@ public final class RuntimeRename {
         for (Map.Entry<String, String> e : map.entrySet()) {
             dotted.put(e.getKey().replace('/', '.'), e.getValue().replace('/', '.'));
         }
-        ClassReader cr = new ClassReader(bytes);
+        ClassReader cr = com.kbox.core.compat.ClassFileCompat.reader(bytes);
         ClassWriter cw = new ClassWriter(0);
         Remapper r = new Remapper() {
             @Override

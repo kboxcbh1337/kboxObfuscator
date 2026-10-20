@@ -113,9 +113,34 @@ public final class ConfigLoader {
             case "nativeAntiHook": cfg.setNativeAntiHook(bool(val)); break;
             case "nullGuard": cfg.setNullGuard(bool(val)); break;
             case "methodInlineExtract": cfg.setMethodInlineExtract(bool(val)); break;
+            case "signatureBind": cfg.setSignatureBindPath(val); break;
             case "eraseAnnotations": cfg.setEraseAnnotations(bool(val)); break;
             case "eraseDebugInfo": cfg.setEraseDebugInfo(bool(val)); break;
             case "eraseSignatures": cfg.setEraseSignatures(bool(val)); break;
+            case "keepSourceFile": cfg.setKeepSourceFile(bool(val)); break;
+            case "keepLineNumbers": cfg.setKeepLineNumbers(bool(val)); break;
+            case "keepLocalVariables": cfg.setKeepLocalVariables(bool(val)); break;
+            case "keepMethodParameters": cfg.setKeepMethodParameters(bool(val)); break;
+            case "shrink": cfg.setShrink(bool(val)); break;
+            case "shrinkMembers": cfg.setShrinkMembers(bool(val)); break;
+            case "shrinkResources": cfg.setShrinkResources(bool(val)); break;
+            case "optimize": cfg.setOptimize(bool(val)); break;
+            case "stripCalls": addAll(cfg.getStripCalls(), val); break;
+            case "stripLogs": cfg.setStripLogs(bool(val)); break;
+            case "stripKotlinIntrinsics": cfg.setStripKotlinIntrinsics(bool(val)); break;
+            case "nameHash": cfg.setNameHash(bool(val)); break;
+            case "nameSalt": cfg.setNameSalt(val); break;
+            case "nameDictionary": addAll(cfg.getNameDictionary(), val); break;
+            case "overloadInduction": cfg.setOverloadInduction(bool(val)); break;
+            case "nameMode": cfg.setNameMode(val); break;
+            case "flattenPackages": cfg.setFlattenPackages(intVal(val, 0)); break;
+            case "onlyRenamePrivate": cfg.setOnlyRenamePrivate(bool(val)); break;
+            case "separateFieldNamespace": cfg.setSeparateFieldNamespace(bool(val)); break;
+            case "adaptResourceFileNames": cfg.setAdaptResourceFileNames(bool(val)); break;
+            case "adaptResourceFileContents": cfg.setAdaptResourceFileContents(bool(val)); break;
+            case "keep": case "keepclassmembers": case "keepnames":
+            case "keepclasseswithmembers": case "keepclassmembernames":
+                cfg.getKeepClassSpecifications().add(key + " " + val); break;
             case "hideCallGraph": cfg.setHideCallGraph(bool(val)); break;
             case "fakeDebugInfo": cfg.setFakeDebugInfo(bool(val)); break;
             case "whiteboxStrings": cfg.setWhiteboxStrings(bool(val)); break;
@@ -160,6 +185,9 @@ public final class ConfigLoader {
             case "nativeShell": cfg.setNativeShell(intVal(val, 0)); break;
             case "protectNativeLibs": cfg.setProtectNativeLibs(bool(val)); break;
             case "shieldNativeOutput": cfg.setShieldNativeOutput(bool(val)); break;
+            case "nativeSrox": cfg.setNativeSrox(bool(val)); break;
+            case "nativeSroxLevel": cfg.setNativeSroxLevel(intVal(val, 3)); break;
+            case "nativeSroxReport": cfg.setNativeSroxReport(val); break;
             // BF-MC 混合模式：此前仅有字段与管线逻辑，**没有任何配置键可开启**（不可达）。
             case "brainfuckMcHybrid": cfg.setBrainfuckMcHybrid(bool(val)); break;
             case "licPublicKey": case "licensePublicKey":

@@ -115,8 +115,8 @@ public final class Packager {
         if (isNeverLoadedSynthetic(className)) return null;
 
         try {
-            ClassReader cr = new ClassReader(classBytes);
-            // Guard: CheckClassAdapter.verify() runs a full data-flow analysis whose
+            // Java 8..27 (major 52..71) + forward-compatible header masking.
+            ClassReader cr = com.kbox.core.compat.ClassFileCompat.reader(classBytes);
             // memory use explodes on classes carrying very large methods (e.g. an
             // inflated <clinit> produced by the anti-decompiler chain passes). On a
             // real 874-class jar this OOM'd the ENTIRE protection run — reproduced
@@ -193,9 +193,7 @@ public final class Packager {
             return null;
         }
         try {
-            ClassReader cr = new ClassReader(classBytes);
-            ClassNode cn = new ClassNode();
-            cr.accept(cn, 0);
+            ClassNode cn = com.kbox.core.compat.ClassFileCompat.read(classBytes, 0);
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if (mn.instructions == null || mn.instructions.size() == 0) continue;
                 if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) continue;
@@ -271,9 +269,8 @@ public final class Packager {
             return null;
         }
         try {
-            ClassReader cr = new ClassReader(classBytes);
-            ClassNode cn = new ClassNode();
-            cr.accept(cn, ClassReader.EXPAND_FRAMES);
+            ClassNode cn = com.kbox.core.compat.ClassFileCompat.read(
+                    classBytes, ClassReader.EXPAND_FRAMES);
             for (MethodNode mn : (List<MethodNode>) cn.methods) {
                 if (mn.instructions == null || mn.instructions.size() == 0) continue;
                 if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) continue;
@@ -398,6 +395,10 @@ public final class Packager {
             ResourceReferenceUpdater ru = new ResourceReferenceUpdater(classMap);
             ManifestUpdater mu = new ManifestUpdater(classMap);
             mu.setSpringBootFatJar(springBoot);
+            // Java 24+ (JEP 472): opt the unnamed module into native access when
+            // any injected runtime/library may call System.load.
+            mu.setEnableNativeAccess(cfg.isEncryptStrings() || cfg.isEnableJnic()
+                    || cfg.isEnableVmpNative() || natLibsActive);
 
             // P2-9: `java -cp out.jar <MainClass>` support.
             //  - entry renamed  → a plaintext stub at the ORIGINAL name forwards
@@ -1677,7 +1678,71 @@ public final class Packager {
             }
             putEntry(out, clsRoot + "META-INF/kbox/integrity.hash",
                     sb.toString().getBytes(StandardCharsets.UTF_8));
-            KBoxLog.info(TAG, "Wrote integrity hash (" + hashed + " classes)");
+
+            // 条目 85: Merkle root over the per-entry leaf hashes. The runtime
+            // verifies both digests; the Merkle form additionally allows a
+            // future incremental check (which entry changed) and is the basis
+            // for the periodic re-verification introduced in 条目 91.
+            java.util.List<byte[]> leaves = new java.util.ArrayList<>();
+            for (String internal : sorted) {
+                if (internal.startsWith("com/kbox/runtime/")) continue;
+                String entryName = clsRoot + internal + ".class";
+                java.security.MessageDigest leaf =
+                        java.security.MessageDigest.getInstance("SHA-256");
+                leaf.update(entryName.getBytes(StandardCharsets.UTF_8));
+                leaf.update(written.get(internal));
+                leaves.add(leaf.digest());
+            }
+            java.util.List<byte[]> cur = leaves;
+            while (cur.size() > 1) {
+                java.util.List<byte[]> next = new java.util.ArrayList<>();
+                for (int i = 0; i < cur.size(); i += 2) {
+                    java.security.MessageDigest m =
+                            java.security.MessageDigest.getInstance("SHA-256");
+                    m.update(cur.get(i));
+                    m.update(i + 1 < cur.size() ? cur.get(i + 1) : cur.get(i));
+                    next.add(m.digest());
+                }
+                cur = next;
+            }
+            byte[] root = cur.isEmpty() ? new byte[32] : cur.get(0);
+            StringBuilder mb = new StringBuilder();
+            for (byte b : root) {
+                mb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                mb.append(Character.forDigit(b & 0xF, 16));
+            }
+            putEntry(out, clsRoot + "META-INF/kbox/integrity.merkle",
+                    mb.toString().getBytes(StandardCharsets.UTF_8));
+            // 条目 90: signature linkage. When a certificate is configured, the
+            // artifact must be signed with it after packaging; the runtime
+            // compares the jar signers' DER SHA-256 against this fingerprint.
+            String bind = activeCfg == null ? "" : activeCfg.getSignatureBindPath();
+            if (bind != null && !bind.isEmpty()) {
+                try {
+                    byte[] certBytes = java.nio.file.Files.readAllBytes(
+                            java.nio.file.Paths.get(bind));
+                    java.security.cert.CertificateFactory cf =
+                            java.security.cert.CertificateFactory.getInstance("X.509");
+                    java.security.cert.Certificate cert = cf.generateCertificate(
+                            new java.io.ByteArrayInputStream(certBytes));
+                    java.security.MessageDigest md2 =
+                            java.security.MessageDigest.getInstance("SHA-256");
+                    byte[] fp = md2.digest(cert.getEncoded());
+                    StringBuilder h = new StringBuilder();
+                    for (byte b : fp) {
+                        h.append(Character.forDigit((b >> 4) & 0xF, 16));
+                        h.append(Character.forDigit(b & 0xF, 16));
+                    }
+                    putEntry(out, clsRoot + "META-INF/kbox/sig.bind",
+                            h.toString().getBytes(StandardCharsets.UTF_8));
+                    KBoxLog.info(TAG, "Wrote signature binding (cert SHA-256 " + h + ")");
+                } catch (Exception e) {
+                    KBoxLog.warn(TAG, "Signature binding failed for " + bind + ": "
+                            + e.getMessage());
+                }
+            }
+            KBoxLog.info(TAG, "Wrote integrity hash + Merkle root (" + hashed + " classes, "
+                    + leaves.size() + " leaves)");
         } catch (Exception e) {
             KBoxLog.warn(TAG, "Integrity hash computation failed: " + e.getMessage());
         }
@@ -2170,6 +2235,11 @@ public final class Packager {
             // debugger canary. AntiDebug is a hard dep and must ship with it.
             count += injectOne(out, clsRoot, "com/kbox/runtime/TamperShield", injected, graph);
             count += injectOne(out, clsRoot, "com/kbox/runtime/AntiDebug", injected, graph);
+            // 条目 59/61/62: invokedynamic call-site rewriting links through
+            // KboxIndy. Only reference-hiding builds (strength >= 2) emit it.
+            if (cfg.getStringEncryptionStrength() >= 2) {
+                count += injectOne(out, clsRoot, "com/kbox/runtime/KboxIndy", injected, graph);
+            }
         }
         if (cfg.isEnableVmp()) {
             count += injectOne(out, clsRoot, "com/kbox/runtime/VmpInterpreter", injected, graph);
@@ -2702,7 +2772,7 @@ public final class Packager {
      * </ol>
      */
     private static byte[] patchDecryptTweaker(byte[] classBytes) {
-        ClassReader cr = new ClassReader(classBytes);
+        ClassReader cr = com.kbox.core.compat.ClassFileCompat.reader(classBytes);
         ClassWriter cw = new ClassWriter(0);
         cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
             @Override
@@ -3452,9 +3522,7 @@ public final class Packager {
     private static byte[] recomputeFrames(byte[] bytes, ClassGraph graph) {
         if (bytes == null) return null;
         try {
-            ClassReader cr = new ClassReader(bytes);
-            ClassNode cn = new ClassNode();
-            cr.accept(cn, 0);
+            ClassNode cn = com.kbox.core.compat.ClassFileCompat.read(bytes, 0);
             stripFrameNodes(cn);
             ClassWriter cw = graphAwareWriter(graph, ClassWriter.COMPUTE_FRAMES);
             cn.accept(cw);
@@ -3496,7 +3564,7 @@ public final class Packager {
     private static byte[] remapRollbackBytes(byte[] current, Mapping mapping, ClassGraph graph, java.util.Map<String, String> reverseClassMap) {
         // 不再因"无改名映射"直接返回：即使没有重命名，回滚类也必须擦掉调试元数据。
         try {
-            ClassReader cr = new ClassReader(current);
+            ClassReader cr = com.kbox.core.compat.ClassFileCompat.reader(current);
             // 必须用 new ClassWriter(0)（而不是 new ClassWriter(cr, 0)）：后者会**整表复制**
             // 原常量池，即使属性被丢弃，`HelloWorld.java` 这类字符串仍留在池里可被 grep 出来。
             // 新建 writer 会按实际引用重建常量池；frames 仍按 visitFrame 原样写出，不受影响。

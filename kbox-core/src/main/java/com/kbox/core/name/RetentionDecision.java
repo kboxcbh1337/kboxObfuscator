@@ -39,6 +39,13 @@ public final class RetentionDecision {
         // 4. Native methods declared by the user reference the class by name
         //    in the JNI symbol table -> the class loader needs the original name.
         //    We detect "is any method natively owned by user code" cheaply.
+        // 条目 22/23：ProGuard class specification（keep = class X { ... }）。
+        if (!cfg.getKeepClassSpecifications().isEmpty()) {
+            org.objectweb.asm.tree.ClassNode specCn = graph.getClasses().get(internal);
+            if (specCn != null && com.kbox.core.config.KeepSpecs.keepClass(cfg, specCn)) {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -103,6 +110,17 @@ public final class RetentionDecision {
         // 12. "any-kept" wildcard from reflection scanner (getDeclaredMethod("x")).
         if (graph.getKeepSet().contains(new MemberRef("__anykept__", name, ""))) {
             return true;
+        }
+        // 条目 22/23：keepclassmembers / keep { 成员块 } 成员级保留。
+        if (!cfg.getKeepClassSpecifications().isEmpty()) {
+            int access = 0;
+            if (cn.methods != null) {
+                for (Object m : cn.methods) {
+                    org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) m;
+                    if (mn.name.equals(name) && mn.desc.equals(desc)) { access = mn.access; break; }
+                }
+            }
+            if (com.kbox.core.config.KeepSpecs.keepMethod(cfg, cn, access, name, desc)) return true;
         }
         return false;
     }
@@ -297,6 +315,17 @@ public final class RetentionDecision {
         if (name.equals("serialVersionUID") && desc.equals("J")) return true;
         // enum constant names are exposed via Enum.name() / values().
         if ((cn.access & 0x4000) != 0 && (cn.fields != null) && isEnumConstant(cn, name)) return true;
+        // 条目 22/23：keepclassmembers 字段级保留。
+        if (!cfg.getKeepClassSpecifications().isEmpty()) {
+            int access = 0;
+            if (cn.fields != null) {
+                for (Object f : cn.fields) {
+                    org.objectweb.asm.tree.FieldNode fn = (org.objectweb.asm.tree.FieldNode) f;
+                    if (fn.name.equals(name) && fn.desc.equals(desc)) { access = fn.access; break; }
+                }
+            }
+            if (com.kbox.core.config.KeepSpecs.keepField(cfg, cn, access, name, desc)) return true;
+        }
         return false;
     }
 

@@ -52,10 +52,17 @@ public final class DebugMetadataEraser {
         if (!cfg.isEraseDebugInfo() && !cfg.isEraseSignatures()) return;
 
         final Set<String> keep = cfg.getKeepAttributes();
-        final boolean dropSource = cfg.isEraseDebugInfo() && !keep.contains("SourceFile");
-        final boolean dropLines = cfg.isEraseDebugInfo() && !keep.contains("LineNumberTable");
-        final boolean dropLocals = cfg.isEraseDebugInfo() && !keep.contains("LocalVariableTable");
-        final boolean dropParams = cfg.isEraseDebugInfo() && !keep.contains("MethodParameters");
+        // Granular policy: each attribute can be retained independently, so a
+        // release build can keep line numbers for mapping/retrace while still
+        // stripping SourceFile (ZKM/ProGuard-style attribute-level control).
+        final boolean dropSource = cfg.isEraseDebugInfo() && !cfg.isKeepSourceFile()
+                && !keep.contains("SourceFile");
+        final boolean dropLines = cfg.isEraseDebugInfo() && !cfg.isKeepLineNumbers()
+                && !keep.contains("LineNumberTable");
+        final boolean dropLocals = cfg.isEraseDebugInfo() && !cfg.isKeepLocalVariables()
+                && !keep.contains("LocalVariableTable");
+        final boolean dropParams = cfg.isEraseDebugInfo() && !cfg.isKeepMethodParameters()
+                && !keep.contains("MethodParameters");
         final boolean dropExs = cfg.isEraseDebugInfo() && !keep.contains("Exceptions");
         final boolean dropSig = cfg.isEraseSignatures() && !keep.contains("Signature");
         // InnerClasses is NOT erased: the JVM cross-checks it between a class and

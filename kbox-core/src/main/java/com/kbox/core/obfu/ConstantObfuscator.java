@@ -119,6 +119,11 @@ public final class ConstantObfuscator {
 
     @SuppressWarnings("unchecked")
     private void obfClass(ClassNode cn) {
+        // Loader infrastructure (class transformers / coremod plugins) must stay
+        // verbatim: it runs while the loader defines EVERY class, including the
+        // synthetic constant holder. If it referenced that holder, defining the
+        // holder itself would throw ClassCircularityError.
+        if (cfg.isBodyProtectExcluded(cn.name)) return;
         for (MethodNode mn : (List<MethodNode>) cn.methods) {
             if (mn.instructions == null) continue;
             List<AbstractInsnNode> targets = new ArrayList<>();

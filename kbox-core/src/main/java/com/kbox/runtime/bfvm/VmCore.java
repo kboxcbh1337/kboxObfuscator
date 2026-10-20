@@ -682,7 +682,12 @@ public final class VmCore {
                     String[] r = c.ref();
                     Class<?> cls = resolveClass(r[0], eff);
                     Field f = findField(cls, r[1]);
-                    Object v = s.pop();
+                    // NEW pushes an Uninitialized placeholder; <init> materializes it
+                    // by setting its `instance`. Every consumer must deref — for a
+                    // static field the value is often a freshly constructed singleton
+                    // (`new MixinService()` → PUTSTATIC), and passing the placeholder
+                    // to Field.set throws "Can not set static ... to <placeholder>".
+                    Object v = deref(s.pop());
                     fieldSet(f, null, coerceTo(f.getType(), v));
                     break;
                 }
@@ -1198,7 +1203,9 @@ public final class VmCore {
 
     private static void fieldSet(Field f, Object o, Object v) {
         try {
-            f.set(o, v);
+            // Central safety net: an Uninitialized placeholder must never reach
+            // reflection (see PUTSTATIC). deref() is a no-op for ordinary values.
+            f.set(deref(o), deref(v));
         } catch (IllegalAccessException e) {
             throw new BfVmException("field write failed: " + f, e);
         }

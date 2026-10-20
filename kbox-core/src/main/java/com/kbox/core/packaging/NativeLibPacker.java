@@ -111,6 +111,16 @@ public final class NativeLibPacker {
      * @param workDir 工作目录（存放临时加壳中间文件）
      */
     public static Result pack(ClassGraph graph, Path workDir) {
+        return pack(graph, workDir, null);
+    }
+
+    /**
+     * 扫描并打包 jar 内全部原生库（带保护配置）。
+     *
+     * @param cfg 保护配置（SROX 开关/等级/报告路径）；{@code null} 使用默认值
+     */
+    public static Result pack(ClassGraph graph, Path workDir,
+                              com.kbox.core.config.ProtectionConfig cfg) {
         Result r = new Result();
         if (graph == null || graph.getResources().isEmpty()) {
             return r;
@@ -151,7 +161,7 @@ public final class NativeLibPacker {
             String hardenNote = "";
             if (isDll) {
                 try {
-                    lib = shieldPack(raw, workDir, idx);
+                    lib = shieldPack(raw, workDir, idx, cfg);
                     virtualized = true;
                 } catch (Throwable t) {
                     KBoxLog.warn(TAG, "ShieldPacker failed for " + path + ": " + t.getMessage()
@@ -328,7 +338,8 @@ public final class NativeLibPacker {
      * 对一个 .dll 做 ShieldPacker 完整加壳（含函数级虚拟化/变异/平坦化）。
      * 失败抛异常，由调用方降级为加密存储。
      */
-    private static byte[] shieldPack(byte[] raw, Path workDir, int idx) throws Exception {
+    private static byte[] shieldPack(byte[] raw, Path workDir, int idx,
+                                     com.kbox.core.config.ProtectionConfig cfg) throws Exception {
         Path in = workDir.resolve("natlib-in-" + idx + ".dll");
         Path out = workDir.resolve("natlib-out-" + idx + ".dll");
         Files.write(in, raw);
@@ -341,6 +352,10 @@ public final class NativeLibPacker {
             opts.virtualizeFunctions = true;
             opts.irMutation = 2;
             opts.cfgFlatten = true;
+            // SROX：构建期自研究（语义差分验证 + 可恢复性评估）。
+            opts.srox = cfg == null || cfg.isNativeSrox();
+            opts.sroxLevel = cfg == null ? 3 : cfg.getNativeSroxLevel();
+            opts.sroxReport = cfg == null ? "" : cfg.getNativeSroxReport();
             StringBuilder log = new StringBuilder();
             boolean ok = ShieldPacker.pack(in.toString(), out.toString(), opts, log);
             if (!ok || !Files.exists(out) || Files.size(out) == 0) {

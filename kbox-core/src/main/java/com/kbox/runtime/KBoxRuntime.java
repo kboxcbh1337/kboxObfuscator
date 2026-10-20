@@ -107,6 +107,50 @@ public final class KBoxRuntime {
         return new String(data, StandardCharsets.UTF_8).intern();
     }
 
+    /**
+     * Byte-array decryptor (条目 45). Same rolling-XOR schedule as {@link #d},
+     * but returns the raw bytes without UTF-8 decoding or interning, so
+     * constant byte[] literals (keys, lookup tables, embedded resources)
+     * disappear from the class file. Layout: 4-byte key + payload.
+     */
+    public static byte[] b(byte[] b) {
+        if (TamperShield.isTampered()) return new byte[0];
+        int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
+                | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+        byte[] data = new byte[b.length - 4];
+        for (int i = 0; i < data.length; i++) {
+            int shift = (i * 7) % 32;
+            int k = (key >>> shift) ^ (key << (32 - shift) >>> 0);
+            data[i] = (byte) (b[i + 4] ^ (k & 0xFF));
+        }
+        return data;
+    }
+
+    /**
+     * Class-literal decryptor (条目 58). Decrypts an XOR-obfuscated binary
+     * class name and resolves it through the context class loader, so
+     * {@code Foo.class} no longer leaves a CONSTANT_Class entry pointing at
+     * {@code Foo} in the constant pool.
+     */
+    public static Class<?> c(byte[] b) {
+        int key = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16)
+                | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+        byte[] data = new byte[b.length - 4];
+        for (int i = 0; i < data.length; i++) {
+            int shift = (i * 7) % 32;
+            int k = (key >>> shift) ^ (key << (32 - shift) >>> 0);
+            data[i] = (byte) (b[i + 4] ^ (k & 0xFF));
+        }
+        String name = new String(data, StandardCharsets.UTF_8);
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) cl = KBoxRuntime.class.getClassLoader();
+            return Class.forName(name, false, cl);
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("KBox class resolve failed", e);
+        }
+    }
+
     /** Strength-2 (AES/CBC) decryptor. Layout: 4-byte key + 16-byte IV + ciphertext. */
     public static String a(byte[] b) {
         if (TamperShield.isTampered()) return corrypt(b);

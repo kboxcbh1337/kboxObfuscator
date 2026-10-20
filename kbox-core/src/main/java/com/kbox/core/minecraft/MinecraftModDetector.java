@@ -51,6 +51,8 @@ public final class MinecraftModDetector {
         public final Set<String> keepPrefixes = new HashSet<>();
         /** Resource paths that must never be renamed (loader metadata). */
         public final Set<String> protectedResources = new HashSet<>();
+        /** Classes whose method bodies must stay verbatim (loader bootstrap). */
+        public final Set<String> bodyExcludeClasses = new HashSet<>();
 
         Result(MinecraftModPresets.ModLoader loader) { this.loader = loader; }
 
@@ -128,6 +130,7 @@ public final class MinecraftModDetector {
         for (String config : extractJsonStringArray(json, "mixins")) {
             r.protectedResources.add(config);
         }
+        addManifestKeepers(r);
         log(r, "Fabric");
         return r;
     }
@@ -165,6 +168,7 @@ public final class MinecraftModDetector {
                 }
             }
         }
+        addManifestKeepers(r);
         log(r, loader == MinecraftModPresets.ModLoader.NEOFORGE ? "NeoForge" : "Forge");
         return r;
     }
@@ -183,8 +187,44 @@ public final class MinecraftModDetector {
         for (ClassNode cn : graph.getClasses().values()) {
             if (findModId(cn) != null) r.entryClasses.add(cn.name);
         }
+        // The mcmod.info branch returns before the LaunchWrapper branch, so the
+        // manifest-declared bootstrap classes (FMLCorePlugin / TweakClass /
+        // LaunchTarget) must be kept here too. Missing this renames the coremod
+        // class while FML still resolves it by the manifest name:
+        //   ClassNotFoundException: net.ccbluex.liquidbounce...MixinLoader
+        addManifestKeepers(r);
         log(r, "Forge (legacy mcmod.info)");
         return r;
+    }
+
+    /**
+     * Keeps classes/resources named by LaunchWrapper/FML manifest attributes.
+     * These are resolved by the loader <b>before</b> any mod class is defined,
+     * so they can never be renamed away from the manifest value.
+     */
+    private void addManifestKeepers(Result r) {
+        byte[] raw = graph.getManifest();
+        if (raw == null) return;
+        String m = new String(raw, StandardCharsets.UTF_8);
+        for (String key : new String[] {"TweakClass", "FMLCorePlugin", "LaunchTarget"}) {
+            String v = extractManifestValue(m, key);
+            if (v == null) continue;
+            for (String part : v.trim().split("[,\\s]+")) {
+                if (!part.isEmpty()) {
+                    addDotted(r.entryClasses, part);
+                    // Bootstrap classes are resolved before any mod code runs;
+                    // keep their bodies verbatim too (no VMP/JNIC/BFVM/CF).
+                    r.bodyExcludeClasses.add(part.trim().replace('.', '/'));
+                }
+            }
+        }
+        for (String key : new String[] {"FMLAT", "MixinConfigs"}) {
+            String v = extractManifestValue(m, key);
+            if (v == null) continue;
+            for (String part : v.trim().split("[,\\s]+")) {
+                if (!part.isEmpty()) r.protectedResources.add(part);
+            }
+        }
     }
 
     /** Return the modId declared in an {@code @Mod(...)} annotation, or null. */
@@ -330,6 +370,33 @@ public final class MinecraftModDetector {
         for (String res : r.protectedResources) {
             cfg.getExcludeResourcePatterns().add(res);
         }
+        for (String cls : r.bodyExcludeClasses) {
+            cfg.getBodyProtectExcludePrefixes().add(cls);
+            // Keep the original name too, so the exclusion stays valid after the
+            // renaming stage (body-exclusion lists are matched by class name).
+            cfg.getKeepPrefixes().add(cls.replace('/', '.'));
+        }
+        // Host class transformers run for EVERY class the loader defines, including
+        // KBox's own synthetic holders. If a transformer's own body is virtualized /
+        // constant-obfuscated, its `transform` method references those holders; when
+        // the loader then defines the holder itself, the JVM reports
+        //   ClassCircularityError: com/kbox/runtime/_<holder>
+        // because the transformer asks for a class that is still being defined.
+        // Keep transformer implementations verbatim: they are loader infrastructure,
+        // not business logic.
+        for (ClassNode cn : graph.getClasses().values()) {
+            if (cn.interfaces == null) continue;
+            for (Object itf : cn.interfaces) {
+                String s = String.valueOf(itf);
+                if ("net/minecraft/launchwrapper/IClassTransformer".equals(s)
+                        || "net/minecraftforge/fml/relauncher/IFMLLoadingPlugin".equals(s)
+                        || "net/minecraftforge/fml/relauncher/IClassTransformer".equals(s)) {
+                    cfg.getBodyProtectExcludePrefixes().add(cn.name);
+                    cfg.getKeepPrefixes().add(cn.name.replace('/', '.'));
+                    break;
+                }
+            }
+        }
         // Loader metadata that must survive byte-for-byte regardless of which loader
         // was detected (mods may mix several): accessWidener / accesstransformer carry
         // member signatures matched against RAW class bytes by the runtime loader, so
@@ -348,6 +415,18 @@ public final class MinecraftModDetector {
             cfg.setEncryptClasses(false);
             KBoxLog.info(TAG, "Class encryption disabled: the mod loader ASM-scans raw "
                     + "class bytes for @Mod/@Mixin metadata before loading");
+        }
+        // K-OTP needs the JNIC native lib's build seed at run time. Mod loaders run
+        // coremod transformers long before the mod's own bootstrap, and those
+        // transformer classes are loaded by the host loader without the KBox native
+        // registration path -> KotpRuntime.seed() throws "native seed unavailable"
+        // and the whole game fails to start. Keep the Java-side protections
+        // (rename/VMP/BFVM/strings/CF) but do not make method execution depend on
+        // a native seed that cannot exist at transformer time.
+        if (cfg.isEnableOtp()) {
+            cfg.setEnableOtp(false);
+            KBoxLog.warn(TAG, "K-OTP disabled for a mod jar: the native one-time-program "
+                    + "seed is unavailable while the loader's transformers run");
         }
         // The BF blob loader cannot coexist with a host mod loader: FML/Fabric
         // define mod classes themselves, while the blob lives only inside

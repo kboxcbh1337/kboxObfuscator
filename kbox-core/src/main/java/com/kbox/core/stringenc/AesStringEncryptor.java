@@ -147,7 +147,9 @@ public final class AesStringEncryptor {
         this.graph = graph;
         this.cfg = cfg;
         this.nativeCrypto = nativeCrypto;
-        this.tamperGate = cfg.isAntiDebug();
+        // 条目 91: the gate also has to fire when integrity checking (or VMP
+        // self-hash) is the enabled signal — not only anti-debug.
+        this.tamperGate = cfg.isAntiDebug() || cfg.isIntegrityCheck();
     }
 
     /**
@@ -728,13 +730,14 @@ public final class AesStringEncryptor {
 
         d.add(notCached);
 
-        // === anti-tamper: if (AntiDebug.isTampered()) goto noise ===
-        // Only emitted when the anti-debug layer is enabled for this build; a
-        // disabled layer must not corrupt the application's strings because some
-        // unrelated component flipped the shared tamper flag.
+        // === anti-tamper: if (TamperShield.isTampered()) goto noise ===
+        // TamperShield unions AntiDebug + IntegrityChecker + VMP self-hash, so
+        // repackaging is caught even with no debugger attached. Only emitted
+        // when one of those layers is enabled for this build.
         LabelNode noise = new LabelNode();
         if (tamperGate) {
-            d.add(new MethodInsnNode(Opcodes.INVOKESTATIC, ANTIDEBUG_OWNER, "isTampered", "()Z", false));
+            d.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "com/kbox/runtime/TamperShield", "isTampered", "()Z", false));
             d.add(new JumpInsnNode(Opcodes.IFNE, noise));
         }
 

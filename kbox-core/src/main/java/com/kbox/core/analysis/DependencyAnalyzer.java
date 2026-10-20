@@ -235,8 +235,10 @@ public final class DependencyAnalyzer {
         @Override
         public void run() {
             try {
-                ClassReader cr = new ClassReader(bytes);
-                ClassNode n = new ClassNode();
+                // Java 8..27 + forward-compatible parsing; the original class
+                // version is preserved on the node (see ClassFileCompat).
+                ClassNode n = com.kbox.core.compat.ClassFileCompat.read(
+                        bytes, ClassReader.EXPAND_FRAMES);
                 // NOT SKIP_DEBUG: that flag also suppresses visitParameter, which
                 // drops the MethodParameters attribute from every class we
                 // re-serialize. Spring Framework 6.1+ reads constructor parameter
@@ -246,7 +248,6 @@ public final class DependencyAnalyzer {
                 // to missing parameter name information" (the LocalVariableTable is
                 // stripped later anyway; MethodParameters is runtime-significant and
                 // must survive).
-                cr.accept(n, ClassReader.EXPAND_FRAMES);
                 node = n;
             } catch (Exception ex) {
                 error = ex;

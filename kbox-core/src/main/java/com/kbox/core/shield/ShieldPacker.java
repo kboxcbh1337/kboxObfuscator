@@ -86,12 +86,42 @@ public final class ShieldPacker {
             usage(System.out);
             return 0;
         }
-        if (args == null || args.length != 2) {
+        ShieldOptions opts = new ShieldOptions();
+        List<String> pos = new ArrayList<String>();
+        if (args != null) {
+            for (String a : args) {
+                if (a == null) continue;
+                if (a.startsWith("--srox=")) {
+                    opts.sroxLevel = parseInt(a.substring("--srox=".length()), opts.sroxLevel);
+                    opts.srox = opts.sroxLevel > 0;
+                } else if ("--no-srox".equals(a)) {
+                    opts.srox = false;
+                    opts.sroxLevel = 0;
+                } else if (a.startsWith("--srox-report=")) {
+                    opts.sroxReport = a.substring("--srox-report=".length());
+                } else if (a.startsWith("--srox-rounds=")) {
+                    opts.sroxRounds = parseInt(a.substring("--srox-rounds=".length()), opts.sroxRounds);
+                } else if (a.startsWith("--srox-runs=")) {
+                    opts.sroxVerifyRuns = parseInt(a.substring("--srox-runs=".length()), opts.sroxVerifyRuns);
+                } else {
+                    pos.add(a);
+                }
+            }
+        }
+        if (pos.size() != 2) {
             usage(System.err);
             return 2;
         }
         StringBuilder log = new StringBuilder();
-        return packCore(args[0], args[1], new ShieldOptions(), log);
+        return packCore(pos.get(0), pos.get(1), opts, log);
+    }
+
+    private static int parseInt(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     /**
@@ -124,6 +154,8 @@ public final class ShieldPacker {
     /** 对应 C++ {@code fprintf(stderr, "usage: kbox_packer <input.exe> <output.exe>\n")}。 */
     private static void usage(java.io.PrintStream out) {
         out.println("usage: kbox_packer <input.exe> <output.exe>");
+        out.println("       [--srox=0..3] [--srox-rounds=N] [--srox-runs=N]");
+        out.println("       [--srox-report=PATH] [--no-srox]");
     }
 
     private static void info(StringBuilder log, String msg) {
@@ -149,57 +181,23 @@ public final class ShieldPacker {
     }
 
     /**
-     * 变异 → 平坦化 → 编译（双族）→ 构建 VM 镜像。
+     * 为一个提升后的函数选择最终 VM 表示。
      *
-     * <p>每次调用独立生成随机种子（指令变异与镜像构建共用），保证每个构建的
-     * 产物指纹不同。失败返回 null（由调用方记录日志并跳过该函数）。</p>
+     * <p>SROX 开启时由 {@link SroxEngine} 执行「候选生成 → 语义差分验证 →
+     * 可恢复性评估 → 选择/回滚」闭环；关闭时走 {@link SroxEngine#legacy}
+     * （与历史固定行为一致）。</p>
      */
-    private static VmFunc buildVmImage(Ir.IrFunc fn, ShieldOptions opts, StringBuilder log) {
-        byte[] seedBuf = new byte[4];
-        randomBytes(seedBuf, 0, 4);
-        int seed = Bin.i32(seedBuf, 0);
-        seed |= 1;                          // 避免全 0 种子
-
-        // 指令变异（代数恒等式重写，每构建随机选型）
-        if (opts.irMutation > 0) {
-            IrMutate.mutate(fn, seed, opts.irMutation);
-        }
-        // 控制流平坦化（块号帧槽 + switch 派发器；不适用时原样保留）
-        boolean flattened = opts.cfgFlatten && IrFlatten.flatten(fn);
-
-        // 双族编译：Family B（寄存器式）不支持时回退 Family A（栈式）
-        IrCompile.CompileResult cr = IrCompile.irCompile(fn);
-        if (!cr.ok) {
-            return null;
-        }
-        IrCompile.CompileResultB cb = IrCompile.irCompileB(fn);
-
-        VmBuilder.VmBuildOpt opt = new VmBuilder.VmBuildOpt();
-        opt.seed = seed;
-        byte[] coin = new byte[1];
-        randomBytes(coin, 0, 1);
-        opt.dispatch = ((coin[0] & 1) != 0) ? VmIsa.DISPATCH_SWITCH : VmIsa.DISPATCH_TABLE;
-        opt.variantCap = VmIsa.VM_VARIANTS;     // handler 多变体（汇编引擎已全部实现）
-        // 多族：每函数随机分配 VM 家族。Family B 无 handler 变体，且仅 x86-64 引擎实现。
-        byte[] famCoin = new byte[1];
-        randomBytes(famCoin, 0, 1);
-        final boolean useB = ((famCoin[0] & 1) != 0) && cb.ok;
-        VmBuilder.VmBuildResult b = useB
-                ? VmBuilder.vmBuildB(cb.program, opt)
-                : VmBuilder.vmBuild(cr.program, opt);
-        if (!b.ok) {
+    private static VmFunc buildVmImage(Ir.IrFunc fn, ShieldOptions opts,
+                                       StringBuilder log, SroxReport rep, int funcRva) {
+        SroxEngine.Chosen ch = (opts.srox && opts.sroxLevel > 0 && rep != null)
+                ? SroxEngine.select(fn, opts, rep, funcRva, log)
+                : SroxEngine.legacy(fn, opts, opts.sroxSeed);
+        if (ch == null) {
             return null;
         }
         VmFunc vf = new VmFunc();
-        vf.image = b.image;
-        StringBuilder d = new StringBuilder();
-        d.append("family=").append(useB ? "B/reg" : "A/stack");
-        d.append(" dispatch=").append(opt.dispatch == VmIsa.DISPATCH_SWITCH ? "switch" : "table");
-        d.append(" mut=").append(opts.irMutation);
-        if (flattened) {
-            d.append(" flat");
-        }
-        vf.desc = d.toString();
+        vf.image = ch.image;
+        vf.desc = ch.desc;
         return vf;
     }
 
@@ -622,6 +620,25 @@ public final class ShieldPacker {
         // 已知后统一回填（见「确定新节 RVA/文件偏移」之后）。
         List<int[]> entryPatches = new ArrayList<int[]>();
 
+        // ---- SROX：构建期自研究（每构建独立种子；报告可复现）----
+        // 种子无条件生成：即使 SROX 关闭，legacy 路径也依赖它做每构建多样性。
+        if (opts.sroxSeed == 0L) {
+            byte[] sb = new byte[8];
+            randomBytes(sb, 0, 8);
+            opts.sroxSeed = Bin.i64(sb, 0);
+            if (opts.sroxSeed == 0L) {
+                opts.sroxSeed = 0x9E3779B97F4A7C15L;
+            }
+        }
+        SroxReport sroxRep = null;
+        if (opts.srox && opts.sroxLevel > 0) {
+            sroxRep = new SroxReport(opts.sroxLevel, opts.sroxSeed);
+            info(log, "  srox: level=" + opts.sroxLevel
+                    + " rounds=" + opts.sroxRounds
+                    + " verify_runs=" + opts.sroxVerifyRuns
+                    + " seed=" + String.format("%016x", opts.sroxSeed));
+        }
+
         if (!is64) {
             info(log, "  vm: x86 输入仅做加壳（虚拟化管线为 x64）");
         } else if (!opts.virtualizeMarkedSections && !opts.virtualizeFunctions) {
@@ -651,45 +668,65 @@ public final class ShieldPacker {
                 int lastEnd = 0;
                 int vmFuncCount = 0;
                 int skipCount = 0;
+                int skipShort = 0;
+                int skipOverlap = 0;
+                int skipSection = 0;
+                int skipEntry = 0;
+                int skipOffset = 0;
+                int skipLift = 0;
+                int skipImage = 0;
                 for (PeImage.RfEntry rf : rfs) {
                     // 非法/过短（入口改写需 5 字节 jmp）跳过
                     final int len = PeImage.rfLength(rf);
                     if (len < 5 || Integer.compareUnsigned(rf.begin, rf.end) >= 0) {
+                        ++skipShort;
                         continue;
                     }
                     if (Integer.compareUnsigned(rf.begin, lastEnd) < 0) {
+                        ++skipOverlap;
                         continue;               // 与前一函数重叠（异常表防御）
                     }
                     lastEnd = rf.end;
                     // 所在节：函数级虚拟化只作用于可执行节；.textvm 标记节也允许
                     PeImage.SectionInfo s = img.sectionByRva(rf.begin);
                     if (s == null || !s.hasRaw()) {
+                        ++skipSection;
                         continue;
                     }
                     final boolean inMarked = s.name.startsWith(".textvm");
                     final boolean inExec = (s.characteristics & PeImage.SCN_MEM_EXECUTE) != 0;
                     if (!(opts.virtualizeFunctions && inExec)
                             && !(opts.virtualizeMarkedSections && inMarked)) {
+                        ++skipSection;
                         continue;
                     }
                     // 入口点函数不虚拟化（进程启动时 stub 尚未运行，VM 引擎未就绪）
                     if (img.rfContains(rf, epRva)) {
+                        ++skipEntry;
                         continue;
                     }
                     int[] off = new int[1];
                     if (!img.rvaToOffset(rf.begin, off)
                             || Integer.compareUnsigned(off[0] + len, file.size()) > 0) {
+                        ++skipOffset;
                         continue;
                     }
                     Ir.IrDiag diag = new Ir.IrDiag();
                     Ir.IrFunc fn = LiftX64.liftX64Func(file.array(), off[0], len, diag);
                     if (!diag.ok) {
                         ++skipCount;
+                        ++skipLift;
+                        if (skipLift <= 6) {
+                            info(log, "  vm: lift-skip rva=" + hx(rf.begin)
+                                    + " len=" + len + " bad_off=" + diag.badOff
+                                    + " native_insns=" + diag.nativeInsns);
+                        }
                         continue;
                     }
-                    VmFunc vf = buildVmImage(fn, opts, log);
+                    VmFunc vf = buildVmImage(fn, opts, log, sroxRep, rf.begin);
                     if (vf == null) {
                         ++skipCount;
+                        ++skipImage;
                         continue;
                     }
                     vf.targetRva = rf.begin;
@@ -706,10 +743,12 @@ public final class ShieldPacker {
                             + " frame=" + fn.frameSlots
                             + " " + vf.desc);
                 }
-                if (vmFuncCount != 0) {
-                    info(log, "  vm: 函数级虚拟化 " + vmFuncCount
-                            + " 个函数，跳过 " + skipCount + "（不可提升/重叠）");
-                }
+                info(log, "  vm: 函数级虚拟化 " + vmFuncCount + "/" + rfs.size()
+                        + " 个函数，跳过 " + skipCount
+                        + "（不可提升=" + skipLift + ", 构建失败=" + skipImage
+                        + ", 过短=" + skipShort + ", 重叠=" + skipOverlap
+                        + ", 非执行节=" + skipSection + ", 入口函数=" + skipEntry
+                        + ", 偏移越界=" + skipOffset + "）");
             }
 
             // ---- .textvm* 标记节整节回退（节内无任何函数被虚拟化时） ----
@@ -742,7 +781,7 @@ public final class ShieldPacker {
                     error(log, "  vm: " + s.name + " 提升失败（bad_off=" + diag.badOff + "）→ 跳过");
                     continue;
                 }
-                VmFunc vf = buildVmImage(fn, opts, log);
+                VmFunc vf = buildVmImage(fn, opts, log, sroxRep, s.virtualAddress);
                 if (vf == null) {
                     error(log, "  vm: " + s.name + " 编译/镜像构建失败 → 跳过");
                     continue;
@@ -1525,6 +1564,27 @@ public final class ShieldPacker {
             }
         } catch (Throwable t) {
             error(log, "  [verify] 自检异常（不影响产物）: " + t);
+        }
+        // ---- SROX 报告（构建期研究记录；可复现、可审计）----
+        if (sroxRep != null) {
+            java.nio.file.Path rp = SroxReport.pathOrNull(opts.sroxReport);
+            java.nio.file.Path outAbs = Paths.get(outPath).toAbsolutePath();
+            java.nio.file.Path dir = outAbs.getParent();
+            String base = outAbs.getFileName() == null
+                    ? "kbox-shield" : outAbs.getFileName().toString();
+            int dot = base.lastIndexOf('.');
+            if (dot > 0) {
+                base = base.substring(0, dot);
+            }
+            final java.nio.file.Path written =
+                    rp != null ? rp : (dir == null ? null : dir.resolve(base + ".srox.txt"));
+            if (sroxRep.write(rp, dir, base) && written != null) {
+                info(log, "  srox report: " + written);
+            }
+            info(log, "  srox summary: accepted=" + sroxRep.acceptedCount()
+                    + " candidates=" + sroxRep.builtCount()
+                    + " rolled_back=" + sroxRep.rolledBackCount()
+                    + " verify_failures=" + sroxRep.verifyFailureCount());
         }
         return 0;
     }

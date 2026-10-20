@@ -57,12 +57,22 @@ public final class NameObfuscator {
         this.graph = graph;
         this.cfg = cfg;
         this.decision = new RetentionDecision(graph, cfg);
+        // keep-spec extends/implements 条件需要沿父链解析 ClassNode。
+        com.kbox.core.config.KeepSpecs.GRAPH_SUPPLIER = graph.getClasses()::get;
     }
 
     public Mapping compute() {
         // Z9 incremental: pre-load class renames from a previous build's
         // mapping file (if configured) so they're reused below.
         MappingLoader.loadInto(mapping, cfg.getUseMapping());
+        // 商业级命名策略：词典 / 关键字 / hash / 重载诱导（条目 16-19）。
+        String mode = cfg.getNameMode() == null ? "ascii" : cfg.getNameMode().toLowerCase(java.util.Locale.ROOT);
+        if (!cfg.getNameDictionary().isEmpty()) {
+            mapping.setDictionary(cfg.getNameDictionary());
+            mapping.setNameStyle(Mapping.NameStyle.DICTIONARY);
+        } else if ("keywords".equals(mode)) {
+            mapping.setNameStyle(Mapping.NameStyle.KEYWORDS);
+        }
         buildUnionFind();
         renameClasses();
         renameMethods();
@@ -90,6 +100,9 @@ public final class NameObfuscator {
      */
     private void renameClasses() {
         if (!cfg.isRenameIdentifiers()) return;   // rename=false: 类/方法/字段均不重命名
+        // flattenPackages>0 隐式启用包重命名（条目 20：包扁平化策略矩阵）。
+        boolean pkgRename = cfg.isRenamePackages() || cfg.getFlattenPackages() > 0;
+        int flatDepth = cfg.getFlattenPackages();
         // Deterministic package map when renamePackages is on: every class of
         // an ORIGINAL package (including nested '$' classes, which share the
         // enclosing class's package) must land in the SAME new package, and a
@@ -98,7 +111,7 @@ public final class NameObfuscator {
         // enum used by its enclosing class ends up in a different package ->
         // IllegalAccessError at runtime).
         Map<String, String> newPkgs = null;
-        if (cfg.isRenamePackages()) {
+        if (pkgRename) {
             newPkgs = new HashMap<>();
             Map<String, Boolean> pkgSpecial = new HashMap<>();
             for (String internal : graph.getClasses().keySet()) {
@@ -109,12 +122,18 @@ public final class NameObfuscator {
                         || !cfg.shouldTransformClass(internal);
                 pkgSpecial.merge(pkg, special, Boolean::logicalOr);
             }
+            // flattenPackages=1: 所有可改包压进同一个新包；=N：固定 N 层随机包树。
+            String flatPkg = flatDepth == 1 ? mapping.newName() : null;
             for (String internal : graph.getClasses().keySet()) {
                 int slash = internal.lastIndexOf('/');
                 if (slash < 0) continue;
                 String pkg = internal.substring(0, slash);
                 if (Boolean.TRUE.equals(pkgSpecial.get(pkg))) {
                     newPkgs.put(pkg, pkg);
+                } else if (flatDepth == 1) {
+                    newPkgs.put(pkg, flatPkg);
+                } else if (flatDepth > 1) {
+                    newPkgs.computeIfAbsent(pkg, k -> randomPackageOfDepth(flatDepth));
                 } else {
                     newPkgs.computeIfAbsent(pkg, k -> randomPackageName(k));
                 }
@@ -147,20 +166,39 @@ public final class NameObfuscator {
             if (oldMapped != null && !oldMapped.equals(internal)
                     && !graph.getClasses().containsKey(oldMapped)) {
                 newName = oldMapped;
-            } else if (cfg.isRenamePackages()) {
+            } else if (pkgRename) {
                 // Folder/package randomization: replace the whole package path
-                // with a freshly generated one of the same depth. This makes
-                // the decompiled directory structure meaningless while keeping
-                // the same nesting depth (preserves tooling assumptions).
+                // with a freshly generated one (same depth by default, fixed
+                // depth when flattenPackages>0, single shared package when =1).
                 String pkg = slash >= 0 ? internal.substring(0, slash) : "";
                 String newPkg = pkg.isEmpty() ? "" : newPkgs.get(pkg);
-                newName = newPkg.isEmpty() ? mapping.newName() : newPkg + "/" + mapping.newName();
+                String simple = cfg.isNameHash()
+                        ? uniqueHashClassName(pkg, internal.substring(slash + 1))
+                        : mapping.newName();
+                newName = newPkg.isEmpty() ? simple : newPkg + "/" + simple;
             } else {
                 String pkg = slash >= 0 ? internal.substring(0, slash + 1) : "";
-                newName = pkg + mapping.newName();
+                String simple = cfg.isNameHash()
+                        ? uniqueHashClassName(pkg, internal.substring(slash + 1))
+                        : mapping.newName();
+                newName = pkg + simple;
             }
             mapping.mapClass(internal, newName);
         }
+    }
+
+    /** 确定性 hash 类名（nameHash=true）：同一输入+盐 → 稳定短名，便于 CI 差分。 */
+    private String uniqueHashClassName(String pkg, String simple) {
+        String salt = cfg.getNameSalt() == null || cfg.getNameSalt().isEmpty()
+                ? "kbox" : cfg.getNameSalt();
+        String cand = mapping.hashName(salt, pkg + simple, 8);
+        int n = 1;
+        Set<String> existing = new HashSet<>(graph.getClasses().keySet());
+        for (String v : mapping.getClassMap().values()) existing.add(v);
+        while (existing.contains(pkg + cand)) {
+            cand = mapping.hashName(salt, pkg + simple + "$" + (n++), 8);
+        }
+        return cand;
     }
 
     /**
@@ -176,6 +214,16 @@ public final class NameObfuscator {
             // Each obfuscated segment is a fresh short name. We reuse the
             // mapping's name generator so the names are consistent with the
             // class-name generator's pool.
+            sb.append(mapping.newName());
+        }
+        return sb.toString();
+    }
+
+    /** Generate a random package of EXACTLY {@code depth} segments (flattenPackages=N). */
+    private String randomPackageOfDepth(int depth) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < depth; i++) {
+            if (i > 0) sb.append('/');
             sb.append(mapping.newName());
         }
         return sb.toString();
@@ -228,11 +276,90 @@ public final class NameObfuscator {
                 return; // keep original name for everyone
             }
         }
+        // 条目 26：SDK 分层 —— 组内任一声明为 public/protected 则整体保留原名。
+        if (cfg.isOnlyRenamePrivate()) {
+            for (String o : owners) {
+                ClassNode cn = graph.getClasses().get(o);
+                if (cn == null) return;
+                for (MethodNode mn : (List<MethodNode>) cn.methods) {
+                    if (mn.name.equals(name) && mn.desc.equals(desc)
+                            && (mn.access & (org.objectweb.asm.Opcodes.ACC_PUBLIC
+                            | org.objectweb.asm.Opcodes.ACC_PROTECTED)) != 0) {
+                        return;
+                    }
+                }
+            }
+        }
         // Otherwise assign one shared new name to all members of the group.
-        String newName = mapping.newName();
+        String newName;
+        if (cfg.isNameHash()) {
+            newName = uniqueHashMember(owners.get(0) + "#" + name + "#" + desc, owners, desc, true);
+        } else if (cfg.isOverloadInduction()) {
+            newName = nextOverloadName(owners, desc);
+        } else {
+            newName = mapping.newName();
+        }
         for (String o : owners) {
             mapping.mapMethod(o, name, desc, newName);
+            assignedMethods.add(o + "#" + newName + "#" + desc);
         }
+    }
+
+    /** 已分配的 (owner, newName, desc)，供重载诱导 / hash 命名查重。 */
+    private final Set<String> assignedMethods = new HashSet<>();
+    private final Set<String> assignedFields = new HashSet<>();
+    /** 重载诱导的名字池游标：每 4 个方法组共享一个名字（JVM 按描述符区分）。 */
+    private int overloadIdx = 0;
+
+    /**
+     * 条目 16：重载诱导。不同 (name,desc) 的方法组从同一池取名，显著提高
+     * 同名不同描述符密度。取名前校验候选名在组内所有 owner 上未与
+     * 「已声明方法」或「已分配新名」冲突（同 owner 同名同 desc 会触发
+     * ClassFormatError，必须跳过）。
+     */
+    private String nextOverloadName(List<String> owners, String desc) {
+        while (true) {
+            String cand = mapping.nameFor(overloadIdx / 4);
+            overloadIdx++;
+            if (isFreeMethodName(owners, cand, desc)) return cand;
+        }
+    }
+
+    /** 确定性 hash 成员名（nameHash=true）：组身份做 key，同盐同输入同输出。 */
+    private String uniqueHashMember(String key, List<String> owners, String desc, boolean method) {
+        String salt = cfg.getNameSalt() == null || cfg.getNameSalt().isEmpty()
+                ? "kbox" : cfg.getNameSalt();
+        String cand = mapping.hashName(salt, key, 8);
+        int n = 1;
+        while (method ? !isFreeMethodName(owners, cand, desc)
+                      : !isFreeFieldName(owners.get(0), cand, desc)) {
+            cand = mapping.hashName(salt, key + "$" + (n++), 8);
+        }
+        return cand;
+    }
+
+    /** 候选方法名在 owners 及其类节点中是否可用（无同名同描述符声明/分配）。 */
+    private boolean isFreeMethodName(List<String> owners, String cand, String desc) {
+        for (String o : owners) {
+            ClassNode cn = graph.getClasses().get(o);
+            if (cn != null && cn.methods != null) {
+                for (MethodNode mn : (List<MethodNode>) cn.methods) {
+                    if (mn.name.equals(cand) && mn.desc.equals(desc)) return false;
+                }
+            }
+            if (assignedMethods.contains(o + "#" + cand + "#" + desc)) return false;
+        }
+        return true;
+    }
+
+    private boolean isFreeFieldName(String owner, String cand, String desc) {
+        ClassNode cn = graph.getClasses().get(owner);
+        if (cn != null && cn.fields != null) {
+            for (FieldNode fn : (List<FieldNode>) cn.fields) {
+                if (fn.name.equals(cand) && fn.desc.equals(desc)) return false;
+            }
+        }
+        return !assignedFields.contains(owner + "#" + cand + "#" + desc);
     }
 
     // ---------- field renaming ----------
@@ -250,7 +377,24 @@ public final class NameObfuscator {
             if (cn.fields == null) continue;
             for (FieldNode fn : (List<FieldNode>) cn.fields) {
                 if (decision.keepField(cn, fn.name, fn.desc)) continue;
-                mapping.mapField(cn.name, fn.name, fn.desc, mapping.newName());
+                // 条目 26：public/protected 字段保留（SDK 模式）。
+                if (cfg.isOnlyRenamePrivate()
+                        && (fn.access & (org.objectweb.asm.Opcodes.ACC_PUBLIC
+                        | org.objectweb.asm.Opcodes.ACC_PROTECTED)) != 0) {
+                    continue;
+                }
+                String newName;
+                if (cfg.isNameHash()) {
+                    newName = uniqueHashMember(cn.name + "#" + fn.name + "#" + fn.desc,
+                            java.util.Collections.singletonList(cn.name), fn.desc, false);
+                } else if (cfg.isSeparateFieldNamespace()) {
+                    // 条目 27：字段独立命名空间（单独字母表计数器）。
+                    newName = mapping.newFieldName();
+                } else {
+                    newName = mapping.newName();
+                }
+                mapping.mapField(cn.name, fn.name, fn.desc, newName);
+                assignedFields.add(cn.name + "#" + newName + "#" + fn.desc);
             }
         }
     }

@@ -146,7 +146,10 @@ public final class VmpRuntimeProtector {
         ClassLoader cl = VmpRuntimeProtector.class.getClassLoader();
         try (InputStream in = cl.getResourceAsStream(res)) {
             if (in == null) return null;
-            ClassReader cr = new ClassReader(in);
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = in.read(buf)) > 0) bo.write(buf, 0, r);
             ClassNode cn = new ClassNode();
             // IMPORTANT: do NOT use SKIP_FRAMES here. These runtime classes are
             // serialized later by Packager.serialize(). If frames are dropped now
@@ -155,7 +158,8 @@ public final class VmpRuntimeProtector {
             // a frame-less class that fails JVM verification (VerifyError:
             // "Expecting a stackmap frame at branch target"). Preserve frames so
             // Packager can recompute or carry them correctly.
-            cr.accept(cn, ClassReader.SKIP_DEBUG | ClassReader.EXPAND_FRAMES);
+            com.kbox.core.compat.ClassFileCompat.accept(bo.toByteArray(), cn,
+                    ClassReader.SKIP_DEBUG | ClassReader.EXPAND_FRAMES);
             return cn;
         } catch (IOException e) {
             return null;

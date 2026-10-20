@@ -95,6 +95,23 @@ public final class NativePacker {
             opts.virtualizeFunctions = true;
             opts.irMutation = 2;
             opts.cfgFlatten = true;
+            // SROX：构建期自研究（默认开启；可用系统属性关闭用于对照实验）。
+            opts.srox = !"false".equalsIgnoreCase(System.getProperty("kbox.srox", "true"));
+            String sroxLevel = System.getProperty("kbox.sroxLevel");
+            if (sroxLevel != null) {
+                try {
+                    opts.sroxLevel = Integer.parseInt(sroxLevel.trim());
+                } catch (NumberFormatException ignored) {
+                    // 保持默认等级
+                }
+            }
+            String sroxReport = System.getProperty("kbox.sroxReport", "");
+            if (!sroxReport.isEmpty()) {
+                int dot = sroxReport.lastIndexOf('.');
+                opts.sroxReport = dot > 0
+                        ? sroxReport.substring(0, dot) + "-" + tag + sroxReport.substring(dot)
+                        : sroxReport + "-" + tag;
+            }
             StringBuilder log = new StringBuilder();
             if (!com.kbox.core.shield.ShieldPacker.pack(in.toString(), out.toString(), opts, log)) {
                 KBoxLog.info(TAG, "shield(" + tag + ") skipped (not a shieldable PE): " + oneLine(log));

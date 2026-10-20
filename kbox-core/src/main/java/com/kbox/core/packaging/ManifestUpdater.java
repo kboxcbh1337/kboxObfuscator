@@ -24,6 +24,10 @@ public final class ManifestUpdater {
 
     /** True when the input is a Spring Boot executable (fat) jar. */
     private boolean springBootFatJar;
+    /** Java 24+ (JEP 472) restricted-native-access opt-in for the unnamed
+     *  module. Harmless on Java 8-23 (unknown manifest attributes are ignored);
+     *  required from the release where restricted methods are blocked. */
+    private boolean enableNativeAccess;
 
     public ManifestUpdater(Map<String, String> classMap) {
         this.classMap = classMap;
@@ -39,6 +43,13 @@ public final class ManifestUpdater {
      */
     public void setSpringBootFatJar(boolean v) {
         this.springBootFatJar = v;
+    }
+
+    /** 条目 Java 24-27: emit {@code Enable-Native-Access: ALL-UNNAMED} so the
+     *  injected runtime may call {@code System.load} from Java 24 onward
+     *  without warnings (and keeps working when JEP 472 blocks by default). */
+    public void setEnableNativeAccess(boolean v) {
+        this.enableNativeAccess = v;
     }
 
     public byte[] update(byte[] manifest, String oldMainClass) {
@@ -140,6 +151,30 @@ public final class ManifestUpdater {
             }
         }
 
+        // ---- FMLCorePlugin remap (Forge 1.8.9..1.12.2 coremod) ----
+        // FML instantiates this class directly from the manifest before any mod
+        // class is defined. It is normally kept (MinecraftModDetector adds it to
+        // the keep set); if a mapping does rename it, the manifest must follow,
+        // otherwise startup dies with ClassNotFoundException.
+        if (classMap != null && !classMap.isEmpty()) {
+            s = remapClassList(s, "FMLCorePlugin");
+        }
+
+        // ---- Java 24+ restricted native access (JEP 472) ----
+        // The injected runtime may load a native crypto/VMP library through
+        // System.load. Java 24 warns, later releases block by default; the
+        // manifest attribute is the supported opt-in and is ignored by 8-23.
+        if (enableNativeAccess && findAttributeLine(s, "Enable-Native-Access") < 0) {
+            int cut = s.length();
+            while (cut > 0) {
+                char c = s.charAt(cut - 1);
+                if (c == '\n' || c == '\r') cut--;
+                else break;
+            }
+            s = s.substring(0, cut) + "\r\n"
+                    + "Enable-Native-Access: ALL-UNNAMED\r\n\r\n";
+        }
+
         // Ensure the manifest ends with a blank line (per spec) and use CRLF.
         if (!s.endsWith("\r\n")) s = s + "\r\n";
         if (!s.endsWith("\r\n\r\n")) s = s + "\r\n";
@@ -147,8 +182,38 @@ public final class ManifestUpdater {
     }
 
     private String mapClass(String dotted) {
-        String mapped = classMap.get(dotted);
-        return mapped != null ? mapped : dotted;
+        // classMap keys are internal (slash) names; manifest values are dotted.
+        String internal = dotted.replace('.', '/');
+        String mapped = classMap.get(internal);
+        if (mapped == null) mapped = classMap.get(dotted);
+        if (mapped == null) return dotted;
+        return mapped.replace('/', '.');
+    }
+
+    /** Remaps a comma-separated class list attribute (e.g. FMLCorePlugin). */
+    private String remapClassList(String s, String attr) {
+        int i = findAttributeLine(s, attr);
+        if (i < 0) return s;
+        int end = s.indexOf('\n', i);
+        int lineEnd = end < 0 ? s.length() : end;
+        int colon = s.indexOf(':', i);
+        if (colon < 0 || colon > lineEnd) return s;
+        String val = s.substring(colon + 1, lineEnd).trim();
+        if (val.isEmpty()) return s;
+        String[] parts = val.split(",");
+        StringBuilder nb = new StringBuilder();
+        boolean changed = false;
+        for (String p : parts) {
+            String t = p.trim();
+            String mapped = mapClass(t);
+            if (!mapped.equals(t)) changed = true;
+            if (nb.length() > 0) nb.append(", ");
+            nb.append(mapped);
+        }
+        if (!changed) return s;
+        String eol = (end > i && s.charAt(end - 1) == '\r') ? "\r\n" : "\n";
+        int next = (end < s.length()) ? end + 1 : end;
+        return s.substring(0, i) + attr + ": " + nb + eol + s.substring(next);
     }
 
     /**

@@ -154,6 +154,53 @@ public final class ProtectionConfig {
      * 默认关（会牺牲泛型反射与部分框架能力），{@code allMax} 会打开。
      */
     private boolean eraseSignatures = false;
+    /** 保留 SourceFile（调试属性粒度控制；默认擦除）。 */
+    private boolean keepSourceFile = false;
+    /** 保留 LineNumberTable（可配合 mapping 还原堆栈）。 */
+    private boolean keepLineNumbers = false;
+    /** 保留 LocalVariableTable。 */
+    private boolean keepLocalVariables = false;
+    /** 保留 MethodParameters。 */
+    private boolean keepMethodParameters = false;
+    /**
+     * 可达性收缩（unused class/member/resource）。默认关：删除反射加载的类会改变
+     * 运行期行为；开启后按入口点 + keep 规则从根遍历。
+     */
+    private boolean shrink = false;
+    /** shrink 时同时删除未被引用的成员（仅 private/synthetic，保守）。 */
+    private boolean shrinkMembers = true;
+    /** shrink 时删除未被任何字符串常量引用的资源（高风险，默认关）。 */
+    private boolean shrinkResources = false;
+    /** 混淆前跑 peephole / 代数恒等式 / 死代码消除。 */
+    private boolean optimize = false;
+    /** {@code -assumenosideeffects}：删除匹配 owner#name 或 owner#name#desc 的 void 调用。 */
+    private final Set<String> stripCalls = new HashSet<>();
+    /** 删除常见日志调用（System.out/err、PrintStream、android.util.Log）。 */
+    private boolean stripLogs = false;
+    /** 删除 Kotlin Intrinsics 空值检查助手调用。 */
+    private boolean stripKotlinIntrinsics = false;
+    /** 确定性 hash 命名（同一输入 + salt → 稳定短名，便于 CI 差分）。 */
+    private boolean nameHash = false;
+    /** hash 命名的盐（为空时使用固定内置盐）。 */
+    private String nameSalt = "";
+    /** 客户词典重命名（逗号分隔；按序用于类/成员名）。 */
+    private final Set<String> nameDictionary = new java.util.LinkedHashSet<>();
+    /** 重载诱导：不同 (name,desc) 的方法组共享同一新名池，强制同名不同描述符。 */
+    private boolean overloadInduction = false;
+    /** 名字风格：ascii（默认 a,b,..z,aa..）| keywords（Java 关键字，砸反编译器）。 */
+    private String nameMode = "ascii";
+    /** 包扁平化：0=不处理；1=全部类压进单一包；N=固定 N 层深度的随机包树。 */
+    private int flattenPackages = 0;
+    /** 只混淆 private/package-private 成员名（public/protected 保留 —— SDK 模式）。 */
+    private boolean onlyRenamePrivate = false;
+    /** 字段与方法使用独立命名空间（字段单独一套字母表计数器）。 */
+    private boolean separateFieldNamespace = false;
+    /** 资源文件名跟随类重命名（ProGuard -adaptresourcefilenames）。 */
+    private boolean adaptResourceFileNames = false;
+    /** 资源文本内容中的类名常量跟随重命名（ProGuard -adaptresourcefilecontents）。 */
+    private boolean adaptResourceFileContents = false;
+    /** ProGuard 风格 class specification（-keep/-keepclassmembers/-keepnames）逐行。 */
+    private final java.util.List<String> keepClassSpecifications = new java.util.ArrayList<>();
     /** Hide the call graph by rerouting direct calls through synthetic indirection. */
     private boolean hideCallGraph = false;
     /** Inject fake (bogus) local-variable / line-number debug info to mislead decompilers. */
@@ -484,6 +531,19 @@ public final class ProtectionConfig {
      */
     private boolean shieldNativeOutput = true;
 
+    /**
+     * kboXShield 的 SROX 构建期自研究闭环：对每个被虚拟化函数生成多个语义保持
+     * 候选表示，经有界差分语义验证与可恢复性代理指标选择；全部失败时回滚到原有
+     * 固定变换路径。仅影响构建期，不引入运行期自修改。
+     */
+    private boolean nativeSrox = true;
+
+    /** SROX 研究等级：0=关闭；1=轻度；2=+平坦化；3=+不可达区域/双族。 */
+    private int nativeSroxLevel = 3;
+
+    /** SROX 报告输出路径；空 = 写到产物同目录 {@code <name>.srox.txt}。 */
+    private String nativeSroxReport = "";
+
     /** Publisher Ed25519 public key (SPKI hex). When set, the packager embeds it
      *  (masked) into the jar and gates class/VM decryption on a valid license. */
     private String licPublicKey = null;
@@ -559,6 +619,8 @@ public final class ProtectionConfig {
      * <p>Equivalent to ProGuard's implicit graceful-degradation behaviour.
      */
     private boolean neverFail = true;
+    /** 条目 90: X.509 certificate path the artifact must be signed with. */
+    private String signatureBindPath = "";
 
     /**
      * When {@code true} (default), keep the original bytes of any class that
@@ -726,6 +788,47 @@ public final class ProtectionConfig {
     public void setEraseDebugInfo(boolean v) { eraseDebugInfo = v; }
     public boolean isEraseSignatures() { return eraseSignatures; }
     public void setEraseSignatures(boolean v) { eraseSignatures = v; }
+    public boolean isKeepSourceFile() { return keepSourceFile; }
+    public void setKeepSourceFile(boolean v) { keepSourceFile = v; }
+    public boolean isKeepLineNumbers() { return keepLineNumbers; }
+    public void setKeepLineNumbers(boolean v) { keepLineNumbers = v; }
+    public boolean isKeepLocalVariables() { return keepLocalVariables; }
+    public void setKeepLocalVariables(boolean v) { keepLocalVariables = v; }
+    public boolean isKeepMethodParameters() { return keepMethodParameters; }
+    public void setKeepMethodParameters(boolean v) { keepMethodParameters = v; }
+    public boolean isShrink() { return shrink; }
+    public void setShrink(boolean v) { shrink = v; }
+    public boolean isShrinkMembers() { return shrinkMembers; }
+    public void setShrinkMembers(boolean v) { shrinkMembers = v; }
+    public boolean isShrinkResources() { return shrinkResources; }
+    public void setShrinkResources(boolean v) { shrinkResources = v; }
+    public boolean isOptimize() { return optimize; }
+    public void setOptimize(boolean v) { optimize = v; }
+    public Set<String> getStripCalls() { return stripCalls; }
+    public boolean isStripLogs() { return stripLogs; }
+    public void setStripLogs(boolean v) { stripLogs = v; }
+    public boolean isStripKotlinIntrinsics() { return stripKotlinIntrinsics; }
+    public void setStripKotlinIntrinsics(boolean v) { stripKotlinIntrinsics = v; }
+    public boolean isNameHash() { return nameHash; }
+    public void setNameHash(boolean v) { nameHash = v; }
+    public String getNameSalt() { return nameSalt; }
+    public void setNameSalt(String v) { nameSalt = v == null ? "" : v; }
+    public Set<String> getNameDictionary() { return nameDictionary; }
+    public boolean isOverloadInduction() { return overloadInduction; }
+    public void setOverloadInduction(boolean v) { overloadInduction = v; }
+    public String getNameMode() { return nameMode; }
+    public void setNameMode(String v) { nameMode = (v == null || v.isEmpty()) ? "ascii" : v; }
+    public int getFlattenPackages() { return flattenPackages; }
+    public void setFlattenPackages(int v) { flattenPackages = Math.max(0, v); }
+    public boolean isOnlyRenamePrivate() { return onlyRenamePrivate; }
+    public void setOnlyRenamePrivate(boolean v) { onlyRenamePrivate = v; }
+    public boolean isSeparateFieldNamespace() { return separateFieldNamespace; }
+    public void setSeparateFieldNamespace(boolean v) { separateFieldNamespace = v; }
+    public boolean isAdaptResourceFileNames() { return adaptResourceFileNames; }
+    public void setAdaptResourceFileNames(boolean v) { adaptResourceFileNames = v; }
+    public boolean isAdaptResourceFileContents() { return adaptResourceFileContents; }
+    public void setAdaptResourceFileContents(boolean v) { adaptResourceFileContents = v; }
+    public java.util.List<String> getKeepClassSpecifications() { return keepClassSpecifications; }
     public boolean isHideCallGraph() { return hideCallGraph; }
     public void setHideCallGraph(boolean v) { hideCallGraph = v; }
     public boolean isFakeDebugInfo() { return fakeDebugInfo; }
@@ -945,6 +1048,12 @@ public final class ProtectionConfig {
     /** @see #shieldNativeOutput */
     public boolean isShieldNativeOutput() { return shieldNativeOutput; }
     public void setShieldNativeOutput(boolean v) { shieldNativeOutput = v; }
+    public boolean isNativeSrox() { return nativeSrox; }
+    public void setNativeSrox(boolean v) { nativeSrox = v; }
+    public int getNativeSroxLevel() { return nativeSroxLevel; }
+    public void setNativeSroxLevel(int v) { nativeSroxLevel = v; }
+    public String getNativeSroxReport() { return nativeSroxReport; }
+    public void setNativeSroxReport(String v) { nativeSroxReport = v == null ? "" : v; }
 
     public String getLicPublicKey() { return licPublicKey; }
     public void setLicPublicKey(String v) { licPublicKey = (v == null || v.isEmpty()) ? null : v; }
@@ -988,6 +1097,13 @@ public final class ProtectionConfig {
     public boolean isNeverFail() { return neverFail; }
     public void setNeverFail(boolean v) { neverFail = v; }
 
+    /** 条目 90: path to the X.509 certificate the shipped jar must be signed
+     *  with (PEM or DER). When set, the packager embeds its SHA-256 in
+     *  {@code META-INF/kbox/sig.bind} and the runtime refuses to run unless the
+     *  jar's signers contain that certificate. Empty = signature linkage off. */
+    public String getSignatureBindPath() { return signatureBindPath; }
+    public void setSignatureBindPath(String v) { signatureBindPath = v; }
+
     public boolean isRenamePackages() { return renamePackages; }
     public void setRenamePackages(boolean v) { renamePackages = v; }
 
@@ -1010,6 +1126,11 @@ public final class ProtectionConfig {
             if (dotted.startsWith(p) || internalName.startsWith(p)) return true;
         }
         return false;
+    }
+
+    /** Convenience: is this exact member (method/field) pinned by keep rules? */
+    public boolean isKeptMember(String owner, String name, String desc) {
+        return keepMembers.contains(memberKey(owner, name, desc));
     }
 
     public ProtectionConfig copy() {
@@ -1059,6 +1180,9 @@ public final class ProtectionConfig {
         c.jnicExcludePrefixes.addAll(jnicExcludePrefixes);
         c.cc = cc;
         c.protectNativeLibs = protectNativeLibs;
+        c.nativeSrox = nativeSrox;
+        c.nativeSroxLevel = nativeSroxLevel;
+        c.nativeSroxReport = nativeSroxReport;
         c.licPublicKey = licPublicKey;
         c.licAppSecret = licAppSecret;
         c.failOnNativeError = failOnNativeError;
@@ -1088,6 +1212,28 @@ public final class ProtectionConfig {
         c.eraseAnnotations = eraseAnnotations;
         c.eraseDebugInfo = eraseDebugInfo;
         c.eraseSignatures = eraseSignatures;
+        c.keepSourceFile = keepSourceFile;
+        c.keepLineNumbers = keepLineNumbers;
+        c.keepLocalVariables = keepLocalVariables;
+        c.keepMethodParameters = keepMethodParameters;
+        c.shrink = shrink;
+        c.shrinkMembers = shrinkMembers;
+        c.shrinkResources = shrinkResources;
+        c.optimize = optimize;
+        c.stripCalls.addAll(stripCalls);
+        c.stripLogs = stripLogs;
+        c.stripKotlinIntrinsics = stripKotlinIntrinsics;
+        c.nameHash = nameHash;
+        c.nameSalt = nameSalt;
+        c.nameDictionary.addAll(nameDictionary);
+        c.overloadInduction = overloadInduction;
+        c.nameMode = nameMode;
+        c.flattenPackages = flattenPackages;
+        c.onlyRenamePrivate = onlyRenamePrivate;
+        c.separateFieldNamespace = separateFieldNamespace;
+        c.adaptResourceFileNames = adaptResourceFileNames;
+        c.adaptResourceFileContents = adaptResourceFileContents;
+        c.keepClassSpecifications.addAll(keepClassSpecifications);
         c.hideCallGraph = hideCallGraph;
         c.fakeDebugInfo = fakeDebugInfo;
         c.whiteboxStrings = whiteboxStrings;
@@ -1138,6 +1284,7 @@ public final class ProtectionConfig {
                 + ", keepPrefix=" + keepPrefixes + ", cc=" + cc
                 + ", nativeLibs=" + protectNativeLibs
                 + ", shieldNativeOutput=" + shieldNativeOutput
+                + ", srox=" + nativeSrox + "(" + nativeSroxLevel + ")"
                 + ", vmpExc=" + vmpExcludePrefixes + ", jnicExc=" + jnicExcludePrefixes
                 + ", lic=" + isLicensed()
                 + ", scope=" + obfuscationScope
@@ -1243,6 +1390,9 @@ public final class ProtectionConfig {
         enableOtp = true;
         // ---- native shell ----
         nativeShell = 3;
+        // SROX：构建期自研究（PE 壳）
+        nativeSrox = true;
+        nativeSroxLevel = 3;
         // ---- jar 自带原生库完整加壳（.dll 走 kboXShield PE 壳 + 虚拟化；.so/.dylib 加密） ----
         protectNativeLibs = true;
         // ---- JNIC/VMP/native-crypto 原生产物加壳（KBNL 外层 + kboXShield 内层 PE 壳/VM） ----

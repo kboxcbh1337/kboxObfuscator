@@ -505,7 +505,7 @@ public final class StringEncryptor {
     }
 
     /** Push an int constant using the smallest opcode form. */
-    static void pushInt(InsnList l, int v) {
+    public static void pushInt(InsnList l, int v) {
         if (v >= -1 && v <= 5) {
             l.add(new InsnNode(Opcodes.ICONST_0 + v));
         } else if (v >= Byte.MIN_VALUE && v <= Byte.MAX_VALUE) {
@@ -518,7 +518,7 @@ public final class StringEncryptor {
     }
 
     /** Push an unsigned byte (0..255) as an int suitable for BASTORE. */
-    static void pushByte(InsnList l, byte b) {
+    public static void pushByte(InsnList l, byte b) {
         int v = b & 0xFF;
         if (v >= 0 && v <= 5) {
             l.add(new InsnNode(Opcodes.ICONST_0 + v));

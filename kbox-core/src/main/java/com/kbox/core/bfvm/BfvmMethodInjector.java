@@ -61,7 +61,7 @@ public final class BfvmMethodInjector {
             scannedClasses++;
             // 注意：不能用 shouldProtectClass——被 keep 的入口类（如 HelloWorld）会被判为 false，
             // 而它们的<b>方法体</b>完全可以虚拟化（只是方法名/类名要保留）。
-            if (isFrameworkOrOwn(cn.name)) continue;
+            if (isFrameworkOrOwn(cn.name, cfg)) continue;
             // Mixin classes / mixin targets are excluded from body-level
             // obfuscation (their handlers are matched positionally by Mixin).
             if (cfg.isBodyProtectExcluded(cn.name)) continue;
@@ -87,7 +87,15 @@ public final class BfvmMethodInjector {
     }
 
     /** 明显的框架/库/自身类：BFVM 运行期开销大，只值得用在高价值业务方法上。 */
-    private static boolean isFrameworkOrOwn(String internalName) {
+    private static boolean isFrameworkOrOwn(String internalName,
+                                            com.kbox.core.config.ProtectionConfig cfg) {
+        // 库分类器（含 org/spongepowered/asm/、Forge/Fabric、ASM/Kotlin/第三方前缀）。
+        // 关键：Mixin/Forge 引导代码绝不能被 BFVM 改写——MixinService 的静态单例
+        // 初始化走 NEW + PUTSTATIC，解释器任何语义偏差都会在 tweaker 装载期直接崩溃。
+        if (cfg != null && cfg.getLibraryClassifier() != null
+                && cfg.getLibraryClassifier().isLibraryClass(internalName)) {
+            return true;
+        }
         return internalName.startsWith("java/")
                 || internalName.startsWith("javax/")
                 || internalName.startsWith("jdk/")
@@ -97,6 +105,11 @@ public final class BfvmMethodInjector {
                 || internalName.startsWith("org/objectweb/asm")
                 || internalName.startsWith("org/jetbrains/")
                 || internalName.startsWith("org/intellij/")
+                || internalName.startsWith("org/spongepowered/")
+                || internalName.startsWith("net/minecraftforge/")
+                || internalName.startsWith("net/neoforged/")
+                || internalName.startsWith("cpw/mods/")
+                || internalName.startsWith("net/fabricmc/")
                 || internalName.startsWith("com/kbox/");
     }
 

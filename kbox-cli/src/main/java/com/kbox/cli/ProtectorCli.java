@@ -32,6 +32,8 @@ import java.nio.file.Paths;
 public final class ProtectorCli {
 
     public static void main(String[] args) {
+        // Java 8..27 startup compatibility line + advisory (never aborts).
+        com.kbox.core.compat.JavaRuntime.logStartup("KBox Obfuscator");
         // 双击 / 无参数启动：默认打开桌面界面（命令行带参数才是指令操控）。
         if (args.length == 0) {
             launchGui(null, null, null, false);
@@ -118,6 +120,20 @@ public final class ProtectorCli {
                 case "-useDefaultLibraryPrefixes": case "--useDefaultLibraryPrefixes":
                     useDefaultLibPrefixes = bool(next(args, i++)); break;
                 case "--list-presets": listPresets(); return;
+                case "--retrace": case "-retrace": {
+                    // 条目 29：ProGuard 兼容堆栈还原。
+                    String mapPath = next(args, i++);
+                    String stackPath = i + 1 < args.length && !args[i + 1].startsWith("-")
+                            ? next(args, i++) : null;
+                    try {
+                        com.kbox.core.name.Rettracer.run(java.nio.file.Paths.get(mapPath),
+                                stackPath == null ? null : java.nio.file.Paths.get(stackPath));
+                    } catch (Exception e) {
+                        System.err.println("retrace failed: " + e.getMessage());
+                        System.exit(1);
+                    }
+                    return;
+                }
                 case "--help": case "-h": printHelp(); return;
                 default:
                     System.err.println("Unknown argument: " + args[i]);
@@ -194,13 +210,29 @@ public final class ProtectorCli {
             for (String p : excludePatterns) cfg.getExcludePatterns().add(p);
 
             // ---- Apply ProGuard-style adaptive flags ----
-            // -keep: treat as keep prefix (class or package).
+            // -keep: class specification (with {} members / extends / access
+            // modifiers) goes through the KeepSpecs engine; a plain package
+            // prefix still maps to keepPrefixes (backward compatible).
             for (String spec : keepSpecs) {
-                cfg.getKeepPrefixes().add(spec.replace('/', '.'));
+                if (spec.contains("{") || spec.contains("extends") || spec.contains("implements")
+                        || spec.startsWith("class") || spec.startsWith("interface")
+                        || spec.startsWith("enum") || spec.startsWith("@")
+                        || spec.contains(" public ") || spec.startsWith("public ")
+                        || spec.contains(" private ") || spec.contains(" protected ")) {
+                    cfg.getKeepClassSpecifications().add("keep " + spec);
+                } else {
+                    cfg.getKeepPrefixes().add(spec.replace('/', '.'));
+                }
             }
-            // -keepclassmembers: "owner#name#desc" spec -> keepMembers.
+            // -keepclassmembers: class-spec form -> KeepSpecs; "owner#name#desc"
+            // form -> keepMembers (legacy).
             for (String spec : keepMemberSpecs) {
-                cfg.getKeepMembers().add(spec);
+                if (spec.contains("{") || spec.startsWith("class") || spec.startsWith("*")
+                        || spec.contains("extends") || spec.contains("implements")) {
+                    cfg.getKeepClassSpecifications().add("keepclassmembers " + spec);
+                } else {
+                    cfg.getKeepMembers().add(spec);
+                }
             }
             // -keepattributes: comma-separated attribute names.
             for (String a : keepAttrs) {
@@ -348,6 +380,19 @@ public final class ProtectorCli {
     /** 启动 KBox 桌面界面（{@code com.kbox.gui.DesktopGui}，反射调用）。 */
     private static void launchGui(String in, String out, String cfgPath, boolean verbose) {
         String cls = "com.kbox.gui.DesktopGui";
+        // The GUI module is compiled for Java 17+; on Java 8-16 the JVM would
+        // throw UnsupportedClassVersionError while loading it. Fail with an
+        // actionable message instead (CLI still works on Java 8).
+        if (!com.kbox.core.compat.JavaRuntime.guiSupported()) {
+            System.err.println("[KBox] 桌面界面需要 Java "
+                    + com.kbox.core.compat.JavaRuntime.GUI_FEATURE + "+（当前 Java "
+                    + com.kbox.core.compat.JavaRuntime.feature() + "）。");
+            System.err.println("[KBox] 当前 JDK 仍可运行 CLI 模式: --input <jar> --output <jar> [--config <conf>]");
+            System.err.println();
+            printHelp();
+            System.exit(2);
+            return;
+        }
         try {
             Class<?> guiCls = Class.forName(cls);
             guiCls.getMethod("launch", String.class, String.class, String.class, boolean.class)

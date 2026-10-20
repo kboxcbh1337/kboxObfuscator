@@ -54,12 +54,56 @@ public final class NativeCompiler {
         this.javaHome = Paths.get(System.getProperty("java.home")).getParent();
     }
 
+    /**
+     * 条目 74/75: build matrix. Compiles with the first working compiler from
+     * {@link #compilerCandidates()} and falls back to the next one when a
+     * toolchain rejects the source (different GCC/Clang/MSVC dialects), so a
+     * build never dies just because the highest-priority compiler is broken.
+     */
     public Result compile(Path cSource, Path outputDir, String libName) {
-        List<String> cmd = new ArrayList<>();
-        String cc = pickCompiler();
-        if (cc == null) {
-            return new Result(false, null, "No C compiler found (set cc= in config or install gcc/clang/MSVC).");
+        List<String> candidates = compilerCandidates();
+        if (candidates.isEmpty()) {
+            return new Result(false, null,
+                    "No C compiler found (set cc= in config or install gcc/clang/MSVC).");
         }
+        Result last = null;
+        for (String cc : candidates) {
+            Result r = compileWith(cc, cSource, outputDir, libName);
+            if (r.success) return r;
+            last = r;
+            KBoxLog.warn(TAG, "Compiler " + cc + " failed; trying next candidate");
+        }
+        return last != null ? last : new Result(false, null, "all compilers failed");
+    }
+
+    /** All usable compilers in priority order (user > env > auto-discovery). */
+    private List<String> compilerCandidates() {
+        List<String> out = new ArrayList<>();
+        if (userCc != null && !userCc.isEmpty()) {
+            out.add(userCc);
+            return out;
+        }
+        String envCc = System.getenv("CC");
+        if (envCc != null && !envCc.isEmpty()) {
+            out.add(envCc);
+            return out;
+        }
+        String[] cands = isWindows()
+                ? new String[]{"cl.exe", "C:\\msys64\\mingw64\\bin\\gcc.exe",
+                    "C:\\msys64\\mingw32\\bin\\gcc.exe",
+                    "C:\\msys64\\clang64\\bin\\clang.exe",
+                    "C:\\Program Files\\LLVM\\bin\\clang.exe",
+                    "gcc.exe", "clang.exe", "clang-cl.exe"}
+                : new String[]{"gcc", "clang", "cc"};
+        for (String c : cands) {
+            String resolved = findOnPath(c);
+            if (resolved != null && !out.contains(c)) out.add(c);
+        }
+        return out;
+    }
+
+    private Result compileWith(String cc, Path cSource, Path outputDir, String libName) {
+        List<String> cmd = new ArrayList<>();
         Path libOut = outputDir.resolve(libFileName(libName));
         cmd.add(cc);
         cmd.add("-shared");
@@ -67,6 +111,16 @@ public final class NativeCompiler {
         cmd.add("-fvisibility=hidden"); // hide non-JNIEXPORT symbols (only JNI_OnLoad exported)
         cmd.add("-s");                 // strip .symtab: no static identifier names (leaks KBOX_* table names)
         cmd.add("-O1");                // -O1 vs -O2: ~2-3x faster gcc, ~same interpreter throughput
+        // 条目 73: LLVM/GCC-level hardening. Stack protector keeps the
+        // interpreter's dispatch frames intact under smash attempts, FORTIFY
+        // turns unchecked libc calls into checked ones, and -fno-plt removes
+        // the PLT indirection that hooking tools patch first.
+        if (!cc.toLowerCase(Locale.ROOT).endsWith("cl.exe")
+                && !cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
+            cmd.add("-fstack-protector-strong");
+            cmd.add("-D_FORTIFY_SOURCE=2");
+            cmd.add("-fno-plt");
+        }
         cmd.add("-I"); cmd.add(normalizeJdkInclude());
         String plat = platformInclude();
         if (plat != null) {
@@ -79,11 +133,18 @@ public final class NativeCompiler {
             cmd.add(cc);
             cmd.add("/LD");                 // build DLL
             cmd.add("/O1");                 // /O2 was the JNIC gcc bottleneck; /O1 keeps interp throughput
+            cmd.add("/GS");                 // stack cookie (MSVC equivalent of stack-protector)
+            cmd.add("/guard:cf");           // control-flow guard on indirect calls
             cmd.add("/I"); cmd.add(normalizeJdkInclude());
             if (plat != null) cmd.add("/I:" + normalizeJdkInclude() + "/" + plat);
             cmd.add(cSource.toString());
             cmd.add("/Fe:" + libOut.toString());
         } else {
+            // ELF-only link hardening: RELRO + immediate binding removes the
+            // writable GOT window used by PLT/GOT hijack hooks.
+            if (!isWindows()) {
+                cmd.add("-Wl,-z,relro,-z,now");
+            }
             cmd.add("-o"); cmd.add(libOut.toString());
             cmd.add(cSource.toString());
         }
@@ -116,22 +177,8 @@ public final class NativeCompiler {
 
     /** Selects a compiler: user config > env > auto-discover. */
     private String pickCompiler() {
-        if (userCc != null && !userCc.isEmpty()) return userCc;
-        String envCc = System.getenv("CC");
-        if (envCc != null && !envCc.isEmpty()) return envCc;
-        // Auto-discover.
-        if (isWindows()) {
-            String[] cands = {"cl.exe", "C:\\msys64\\mingw64\\bin\\gcc.exe",
-                    "C:\\msys64\\mingw32\\bin\\gcc.exe", "gcc.exe", "clang.exe"};
-            for (String c : cands) {
-                if (findOnPath(c) != null) return c;
-            }
-        } else {
-            for (String c : new String[]{"gcc", "clang", "cc"}) {
-                if (findOnPath(c) != null) return c;
-            }
-        }
-        return null;
+        List<String> c = compilerCandidates();
+        return c.isEmpty() ? null : c.get(0);
     }
 
     private String findOnPath(String exe) {

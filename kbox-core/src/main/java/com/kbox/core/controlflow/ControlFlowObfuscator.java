@@ -10,14 +10,17 @@ import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.LookupSwitchInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
@@ -65,6 +68,18 @@ public final class ControlFlowObfuscator {
     private int methodsSkipped;
     private int substitutedThisClass;
 
+    /** 条目 36: synthetic seed-derivation runtime class. All opaque predicates
+     *  and CFG-junk conditions source their entropy through these statics so
+     *  no direct System.nanoTime/currentTimeMillis/identityHashCode pattern
+     *  survives in protected bodies. Injected into the graph and renamed/
+     *  re-encrypted with everything else.
+     *
+     *  <p>Deliberately NOT named {@code com/kbox/runtime/_*}: that prefix is
+     *  classified as "never loaded by the JVM" by the packager's COMPUTE_MAXS
+     *  fallback, and this helper IS loaded at runtime — a frame-computation
+     *  failure must stay visible instead of being silently serialized. */
+    static final String SEED = "com/kbox/runtime/KboxCfSeedRt";
+
     public ControlFlowObfuscator(ClassGraph graph, ProtectionConfig cfg) {
         this.graph = graph;
         this.cfg = cfg;
@@ -87,6 +102,14 @@ public final class ControlFlowObfuscator {
             KBoxLog.info(TAG, "Control flow obfuscation disabled");
             return;
         }
+        // 条目 36: inject the seed-derivation helper BEFORE any class is
+        // transformed. Opaque predicates then source their randomness through
+        // _KboxCfSeed.now()/idh() instead of calling System.nanoTime /
+        // currentTimeMillis / identityHashCode directly, so the classic
+        // "INVOKESTATIC nanoTime; L2I; IREM" opaque-predicate signature no
+        // longer exists in any protected method (and the helper itself gets
+        // renamed + re-encrypted like every other graph class).
+        ensureSeedClass();
         int total = graph.getClasses().size();
         int processed = 0;
         int skippedLibrary = 0;
@@ -206,8 +229,88 @@ public final class ControlFlowObfuscator {
                 + " at strength " + cfg.getControlFlowStrength());
     }
 
+    /**
+     * 条目 36: builds (once) the {@code _KboxCfSeed} runtime helper:
+     * <ul>
+     *   <li>{@code mix(I)I} — xorshift32 whitener,</li>
+     *   <li>{@code now()I} — {@code mix((int) System.nanoTime())},</li>
+     *   <li>{@code milli()I} — {@code mix((int) System.currentTimeMillis())},</li>
+     *   <li>{@code idh()I} — {@code mix(System.identityHashCode(new Object()))}.</li>
+     * </ul>
+     * Pure Java, no native dependency, safe under JNIC/VMP selection (which
+     * ran earlier in the pipeline so this class is never translated).
+     */
+    private void ensureSeedClass() {
+        if (graph.getClasses().containsKey(SEED)) return;
+        ClassNode cn = new ClassNode();
+        cn.version = Opcodes.V1_8;
+        cn.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
+        cn.name = SEED;
+        cn.superName = "java/lang/Object";
+
+        // static int mix(int x): xorshift32 — real deterministic arithmetic.
+        MethodNode mix = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "mix", "(I)I", null, null);
+        InsnList ml = mix.instructions;
+        ml.add(new VarInsnNode(Opcodes.ILOAD, 0));
+        ml.add(new InsnNode(Opcodes.DUP));
+        ml.add(new IntInsnNode(Opcodes.BIPUSH, 13));
+        ml.add(new InsnNode(Opcodes.ISHL));
+        ml.add(new InsnNode(Opcodes.IXOR));
+        ml.add(new InsnNode(Opcodes.DUP));
+        ml.add(new IntInsnNode(Opcodes.SIPUSH, 17));
+        ml.add(new InsnNode(Opcodes.IUSHR));
+        ml.add(new InsnNode(Opcodes.IXOR));
+        ml.add(new InsnNode(Opcodes.DUP));
+        ml.add(new InsnNode(Opcodes.ICONST_5));
+        ml.add(new InsnNode(Opcodes.ISHL));
+        ml.add(new InsnNode(Opcodes.IXOR));
+        ml.add(new InsnNode(Opcodes.IRETURN));
+        cn.methods.add(mix);
+
+        // static int now(): mix((int) System.nanoTime())
+        cn.methods.add(seedMethod("now", "nanoTime"));
+        // static int milli(): mix((int) System.currentTimeMillis())
+        cn.methods.add(seedMethod("milli", "currentTimeMillis"));
+
+        // static int idh(): mix(System.identityHashCode(new Object()))
+        MethodNode idh = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "idh", "()I", null, null);
+        InsnList il = idh.instructions;
+        il.add(new TypeInsnNode(Opcodes.NEW, "java/lang/Object"));
+        il.add(new InsnNode(Opcodes.DUP));
+        il.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/lang/Object", "<init>", "()V", false));
+        il.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I", false));
+        il.add(callSeedMix());
+        il.add(new InsnNode(Opcodes.IRETURN));
+        cn.methods.add(idh);
+
+        graph.getClasses().put(SEED, cn);
+    }
+
+    /** Builds {@code static int <name>(): mix((int) System.<jdk>())}. */
+    private static MethodNode seedMethod(String name, String jdkMethod) {
+        MethodNode m = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                name, "()I", null, null);
+        m.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "java/lang/System", jdkMethod, jdkMethod.endsWith("Millis") ? "()J" : "()J", false));
+        m.instructions.add(new InsnNode(Opcodes.L2I));
+        m.instructions.add(callSeedMix());
+        m.instructions.add(new InsnNode(Opcodes.IRETURN));
+        return m;
+    }
+
+    private static MethodInsnNode callSeedMix() {
+        return new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "mix", "(I)I", false);
+    }
+
     @SuppressWarnings("unchecked")
     private void obfuscateClass(ClassNode cn) {
+        // The seed helper must stay predicate-free: a predicate inside mix()
+        // that calls idh() would recurse (idh -> mix -> predicate -> idh ...).
+        if (SEED.equals(cn.name)) return;
         // Count methods that actually have code bodies.
         int methodCount = 0;
         List<MethodNode> methods = (List<MethodNode>) cn.methods;
@@ -309,6 +412,65 @@ public final class ControlFlowObfuscator {
                     }
                 }
                 int predBefore = predicatesInserted;
+                // 条目 32/33/43: structural CFG deformation. All four run only
+                // on NON-flattened bodies: a flattened body is already a
+                // dispatcher state machine whose block layout is load-bearing
+                // (relocating one of its blocks would interleave with the
+                // dispatch table and the default thrower). VMP targets are
+                // excluded as well — the native translator assumes the
+                // original reducible body shape.
+                if (!isCtor && !isVmpTarget && !flattened && !isJnicTarget) {
+                    int st = cfg.getControlFlowStrength();
+                    if (st >= 3) {
+                        snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                        int n = injectIrreducibleEdges(mn);
+                        substitutedThisClass += n;
+                        if (n > 0) mutated = true;
+                    }
+                    if (st >= 2) {
+                        snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                        int n = injectCrossJumps(mn);
+                        substitutedThisClass += n;
+                        if (n > 0) mutated = true;
+                        // Pseudo exception edges need handler-free methods and
+                        // would make ExceptionJumpObfuscator skip the method.
+                        if (!cfg.isExceptionJumpObf()) {
+                            snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                            n = injectFakeExceptionEdges(mn);
+                            substitutedThisClass += n;
+                            if (n > 0) mutated = true;
+                        }
+                    }
+                    if (st >= 3) {
+                        snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                        int n = deformFrames(mn);
+                        substitutedThisClass += n;
+                        if (n > 0) mutated = true;
+                    }
+                }
+                // 条目 39: switch-key encryption (strength >= 2) — remap every
+                // switch key through an injective runtime transform so the
+                // decompiled switch shows unrelated constants.
+                // 条目 40: loop-counter nonlinearization (strength >= 3) —
+                // IINC becomes an equivalent non-linear arithmetic sequence.
+                // Both are pure stack-neutral/local rewrites, safe under
+                // COMPUTE_FRAMES, and must run BEFORE opaque predicates are
+                // injected so the predicates' balanced IADD sequences are not
+                // substituted/rewritten by anything downstream.
+                if (!isJnicTarget) {
+                    if (cfg.getControlFlowStrength() >= 2) {
+                        snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                        int n = encryptSwitches(mn);
+                        substitutedThisClass += n;
+                        if (n > 0) mutated = true;
+                    }
+                    if (cfg.getControlFlowStrength() >= 3) {
+                        snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                        int n = encryptLoopCounters(mn);
+                        substitutedThisClass += n;
+                        if (n > 0) mutated = true;
+                    }
+                }
                 snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
                 injectOpaquePredicates(mn, isCtor ? 1 : cfg.getControlFlowStrength(), cn.name, cfg.getControlFlowStrength());
                 if (predicatesInserted > predBefore) mutated = true;
@@ -449,7 +611,34 @@ public final class ControlFlowObfuscator {
 
         ThreadLocalRandom r = ThreadLocalRandom.current();
         int tmp = mn.maxLocals;
-        mn.maxLocals = tmp + 3;  // extra locals for runtime-bound predicates (POLY uses tmp..tmp+2)
+        // tmp..tmp+2: predicate temps (POLY uses all three); tmp+3: poison
+        // chain local (条目 35 interweaving — dead branches store into it and
+        // the next predicate's always-true identity consumes it).
+        mn.maxLocals = tmp + 4;
+        boolean runtimePredicates = !hasAllocation && strength >= 3;
+        // Predicate bodies peak at 5 operand slots (MBA: left operand held while
+        // the right side needs 4). Section 42's simple predicate peaks at 2.
+        // COMPUTE_MAXS recomputes the real value at packaging, but the tree-time
+        // maxStack must stay sound for any analyzer that runs before it.
+        if (runtimePredicates) {
+            if (mn.maxStack < 6) mn.maxStack = 6;
+        } else if (mn.maxStack < 2) {
+            mn.maxStack = 2;
+        }
+        if (runtimePredicates) {
+            // Zero-init the poison local at method entry. MBA/POLY conditions
+            // READ it before any of their own stores execute (predicate
+            // injection order is random), and ASM's Analyzer treats a
+            // never-written local as UNINITIALIZED — CheckClassAdapter /
+            // BasicVerifier would reject the method ("Expected I, but found
+            // ."). A definite entry-store makes every read provably int.
+            // Method entry always has an empty (or self-consistent) stack and
+            // ICONST_0/ISTORE is stack-neutral, so this is verifier-safe.
+            InsnList init = new InsnList();
+            init.add(new InsnNode(Opcodes.ICONST_0));
+            init.add(new VarInsnNode(Opcodes.ISTORE, tmp + 3));
+            mn.instructions.insert(mn.instructions.getFirst(), init);
+        }
 
         PredType[] types = PredType.values();
         int typeIdx = r.nextInt(types.length);
@@ -467,10 +656,536 @@ public final class ControlFlowObfuscator {
                 // Runtime-bound predicate, cycling through strategies
                 PredType type = types[typeIdx % types.length];
                 typeIdx++;
-                block = buildOpaquePredicate(type, tmp);
+                block = buildOpaquePredicate(type, tmp, tmp + 3);
             }
             mn.instructions.insertBefore(at, block);
             predicatesInserted++;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 条目 39: switch-key encryption
+    // ------------------------------------------------------------------
+
+    /**
+     * Remaps every switch key through a per-site injective transform
+     * {@code T(k) = ((k ^ m1) * a) + b} (m1/a/b random per switch, a odd), so
+     * the key constants a decompiler shows are unrelated to the original
+     * values. The transform is expanded inline before the switch:
+     *
+     * <pre>ISTORE s; ILOAD s; LDC m1; IXOR; LDC a; IMUL; LDC b; IADD; SWITCH(...)</pre>
+     *
+     * Each factor is bijective on ints (XOR: bijection; multiply by odd a:
+     * bijection mod 2^32; add: bijection), so distinct keys stay distinct.
+     *
+     * <p>Small TABLESWITCHes (range &lt;= 64) are converted to sorted
+     * LOOKUPSWITCHes because XOR breaks key contiguity. Large TABLESWITCHes
+     * keep their table form under an affine-only transform {@code a*k+b}
+     * (a &gt; 0, monotone) which preserves the contiguous range
+     * {@code [a*min+b, a*max+b]}.
+     */
+    private int encryptSwitches(MethodNode mn) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        int n = 0;
+        for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; ) {
+            AbstractInsnNode next = insn.getNext();
+            if (insn instanceof LookupSwitchInsnNode) {
+                LookupSwitchInsnNode ls = (LookupSwitchInsnNode) insn;
+                try {
+                    int m1 = r.nextInt(1, Integer.MAX_VALUE);
+                    int a = r.nextInt(1, 1 << 20) * 2 + 1; // odd → bijective
+                    int b = r.nextInt(-1048576, 1048576);
+                    java.util.TreeMap<Integer, LabelNode> map = new java.util.TreeMap<>();
+                    boolean ok = ls.keys.size() == ls.labels.size();
+                    for (int i = 0; ok && i < ls.keys.size(); i++) {
+                        // injective transform → no collisions, but guard anyway
+                        if (map.put(tKey(ls.keys.get(i), m1, a, b), ls.labels.get(i)) != null) ok = false;
+                    }
+                    if (ok) {
+                        mn.instructions.insertBefore(insn, keyTransformSeq(m1, a, b, mn));
+                        mn.instructions.insert(insn, toLookupSwitch(ls.dflt, map));
+                        mn.instructions.remove(insn);
+                        n++;
+                    }
+                } catch (Throwable ignore) { /* keep original switch */ }
+            } else if (insn instanceof TableSwitchInsnNode) {
+                TableSwitchInsnNode ts = (TableSwitchInsnNode) insn;
+                try {
+                    int range = ts.max - ts.min + 1;
+                    if (range > 0 && range <= 64) {
+                        int m1 = r.nextInt(1, Integer.MAX_VALUE);
+                        int a = r.nextInt(1, 1 << 20) * 2 + 1;
+                        int b = r.nextInt(-1048576, 1048576);
+                        java.util.TreeMap<Integer, LabelNode> map = new java.util.TreeMap<>();
+                        for (int k = ts.min; k <= ts.max; k++) {
+                            map.put(tKey(k, m1, a, b), ts.labels.get(k - ts.min));
+                        }
+                        mn.instructions.insertBefore(insn, keyTransformSeq(m1, a, b, mn));
+                        mn.instructions.insert(insn, toLookupSwitch(ts.dflt, map));
+                        mn.instructions.remove(insn);
+                        n++;
+                    } else if (range > 0) {
+                        // Large table: affine-only (a odd & > 0), no XOR — the
+                        // key range stays contiguous: [a*min+b, a*max+b].
+                        int a = r.nextInt(1, 255) * 2 + 1;
+                        int b = r.nextInt(-1048576, 1048576);
+                        long minP = (long) a * ts.min + b;
+                        long maxP = (long) a * ts.max + b;
+                        if (minP >= Integer.MIN_VALUE && maxP <= Integer.MAX_VALUE) {
+                            mn.instructions.insertBefore(insn, keyTransformSeq(0, a, b, mn));
+                            TableSwitchInsnNode repl = new TableSwitchInsnNode(
+                                    (int) minP, (int) maxP, ts.dflt,
+                                    ts.labels.toArray(new LabelNode[0]));
+                            mn.instructions.insert(insn, repl);
+                            mn.instructions.remove(insn);
+                            n++;
+                        }
+                    }
+                } catch (Throwable ignore) { /* keep original switch */ }
+            }
+            insn = next;
+        }
+        if (n > 0 && mn.maxStack < 2) mn.maxStack = 2;
+        return n;
+    }
+
+    /** T(k) = ((k ^ m1) * a) + b — bijective on ints when a is odd. */
+    private static int tKey(int k, int m1, int a, int b) {
+        return ((k ^ m1) * a) + b;
+    }
+
+    /** Builds a sorted LOOKUPSWITCH node from the transformed key→label map. */
+    private static LookupSwitchInsnNode toLookupSwitch(LabelNode dflt,
+                                                       java.util.TreeMap<Integer, LabelNode> map) {
+        int[] keys = new int[map.size()];
+        LabelNode[] labels = new LabelNode[map.size()];
+        int i = 0;
+        for (java.util.Map.Entry<Integer, LabelNode> e : map.entrySet()) {
+            keys[i] = e.getKey();
+            labels[i] = e.getValue();
+            i++;
+        }
+        return new LookupSwitchInsnNode(dflt, keys, labels);
+    }
+
+    /** Emits the inline key-transform sequence (skips XOR when m1 == 0). */
+    private static InsnList keyTransformSeq(int m1, int a, int b, MethodNode mn) {
+        int slot = mn.maxLocals++;
+        InsnList l = new InsnList();
+        l.add(new VarInsnNode(Opcodes.ISTORE, slot));
+        l.add(new VarInsnNode(Opcodes.ILOAD, slot));
+        if (m1 != 0) {
+            l.add(new LdcInsnNode(m1));
+            l.add(new InsnNode(Opcodes.IXOR));
+        }
+        l.add(new LdcInsnNode(a));
+        l.add(new InsnNode(Opcodes.IMUL));
+        l.add(new LdcInsnNode(b));
+        l.add(new InsnNode(Opcodes.IADD));
+        return l;
+    }
+
+    // ------------------------------------------------------------------
+    // 条目 40: loop-counter nonlinearization
+    // ------------------------------------------------------------------
+
+    /**
+     * Rewrites every {@code IINC var, c} into an equivalent arithmetic
+     * sequence with a random odd multiplier K:
+     *
+     * <pre>i = i + c + (i * K) - (i * K)</pre>
+     *
+     * The two {@code i*K} terms are separate instruction sequences, so naive
+     * CSE / pattern matchers read a non-linear counter update. Semantics are
+     * bit-exact int arithmetic (no overflow hazard: the f-terms cancel).
+     */
+    private int encryptLoopCounters(MethodNode mn) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        int n = 0;
+        for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; ) {
+            AbstractInsnNode next = insn.getNext();
+            if (insn instanceof IincInsnNode) {
+                IincInsnNode inc = (IincInsnNode) insn;
+                if (inc.incr != 0) {
+                    int k = r.nextInt(3, 512) * 2 + 1; // odd
+                    InsnList l = new InsnList();
+                    l.add(new VarInsnNode(Opcodes.ILOAD, inc.var));
+                    pushInt(l, inc.incr);
+                    l.add(new InsnNode(Opcodes.IADD));
+                    l.add(new VarInsnNode(Opcodes.ILOAD, inc.var));
+                    pushInt(l, k);
+                    l.add(new InsnNode(Opcodes.IMUL));
+                    l.add(new InsnNode(Opcodes.IADD));
+                    l.add(new VarInsnNode(Opcodes.ILOAD, inc.var));
+                    pushInt(l, k);
+                    l.add(new InsnNode(Opcodes.IMUL));
+                    l.add(new InsnNode(Opcodes.ISUB));
+                    l.add(new VarInsnNode(Opcodes.ISTORE, inc.var));
+                    mn.instructions.insert(insn, l);
+                    mn.instructions.remove(insn);
+                    n++;
+                }
+            }
+            insn = next;
+        }
+        if (n > 0) {
+            // i + c + (i*K) - (i*K): peak depth 2 while IINC needed none.
+            if (mn.maxStack < 2) mn.maxStack = 2;
+        }
+        return n;
+    }
+
+    // ------------------------------------------------------------------
+    // 条目 32/33/43: cross jumps, fake exception edges, irreducible CFG,
+    //               aggressive frame deformation
+    // ------------------------------------------------------------------
+
+    /**
+     * 条目 33 (first half): block crossing. A whole basic block that ends in an
+     * unconditional GOTO is lifted out of its original position and spliced
+     * into the middle of an unrelated block, with the original position left
+     * as a {@code GOTO moved} stub and the host block jumping over the
+     * intruder:
+     *
+     * <pre>
+     *   A: [A body] GOTO T          B: [B prefix] ...
+     *   becomes
+     *   A: GOTO A'                  B: [B prefix] GOTO B'
+     *   ...                            A': [A body] GOTO T
+     *                                  B': ...
+     * </pre>
+     *
+     * Both stacks are empty at the split points (verified by a full height
+     * walk), every label travels with its instructions, and no try/catch may
+     * be present (a moved range would silently change the protected region).
+     */
+    private int injectCrossJumps(MethodNode mn) {
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return 0;
+        int total = mn.instructions.size();
+        if (total < 12 || total > 900) return 0;
+        int[] hgt = stackHeights(mn);
+        if (hgt == null) return 0;
+        AbstractInsnNode[] insns = mn.instructions.toArray();
+        List<int[]> blocks = basicBlocks(mn, insns);
+        if (blocks.size() < 3) return 0;
+        // Deterministic candidate lists (random choice inside them) so the
+        // transform actually fires on big if-chains instead of depending on
+        // hitting the right block in a fixed number of random draws.
+        List<int[]> sources = new ArrayList<>();   // [firstReal,lastReal] of GOTO-terminated blocks
+        List<Integer> hosts = new ArrayList<>();   // first real instruction of each empty-stack block
+        List<int[]> sourceRanges = new ArrayList<>();
+        for (int[] blk : blocks) {
+            int f = firstRealIndex(insns, blk[0], blk[1]);
+            int l = lastRealIndex(insns, blk[0], blk[1]);
+            if (f < 0 || l < 0) continue;
+            if (hgt[f] == 0) hosts.add(f);
+            if (insns[l].getOpcode() == Opcodes.GOTO && l - f >= 2) {
+                sources.add(new int[]{f, l});
+                sourceRanges.add(new int[]{f, l});
+            }
+        }
+        if (sources.isEmpty() || hosts.isEmpty()) return 0;
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        for (int attempt = 0; attempt < 12; attempt++) {
+            int[] src = sources.get(r.nextInt(sources.size()));
+            int firstReal = src[0], lastReal = src[1];
+            int aStart = firstReal;
+            int bFirst = hosts.get(r.nextInt(hosts.size()));
+            boolean insideSource = false;
+            for (int[] rng : sourceRanges) {
+                if (bFirst >= rng[0] && bFirst <= rng[1]) { insideSource = true; break; }
+            }
+            if (insideSource) continue;
+            if (bFirst == aStart) continue;
+            // Lift [firstReal, lastReal] out of block A.
+            InsnList moved = new InsnList();
+            AbstractInsnNode n = insns[firstReal];
+            AbstractInsnNode stop = insns[lastReal].getNext();
+            while (n != null && n != stop) {
+                AbstractInsnNode nx = n.getNext();
+                mn.instructions.remove(n);
+                moved.add(n);
+                n = nx;
+            }
+            LabelNode movedLab = new LabelNode();
+            moved.insert(movedLab);
+            LabelNode cont = new LabelNode();
+            InsnList seq = new InsnList();
+            seq.add(new JumpInsnNode(Opcodes.GOTO, cont));
+            seq.add(moved);
+            seq.add(cont);
+            mn.instructions.insertBefore(insns[bFirst], seq);
+            // Original position: unconditional transfer to the relocated body.
+            if (stop != null) {
+                mn.instructions.insertBefore(stop, new JumpInsnNode(Opcodes.GOTO, movedLab));
+            } else {
+                mn.instructions.add(new JumpInsnNode(Opcodes.GOTO, movedLab));
+            }
+            cfLog("      cross-jump: block@" + aStart + " -> host@" + bFirst);
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
+     * 条目 33 (second half): pseudo exception edge. Wraps the whole body in a
+     * catch-all handler that simply rethrows the caught throwable. The
+     * exception table gains an extra edge to a synthetic handler block, so
+     * decompilers render a try/catch that exists only to obscure the CFG,
+     * while runtime behaviour is bit-identical (same exception object, same
+     * stack trace, same propagation).
+     *
+     * <p>Skipped for methods that already have handlers (range bookkeeping),
+     * for methods containing {@code NEW} (uninitialized locals would degrade
+     * to {@code top} on the handler edge), and for exception-jump targets
+     * (that pass needs handler-free methods).
+     */
+    private int injectFakeExceptionEdges(MethodNode mn) {
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return 0;
+        if (mn.instructions.size() < 8) return 0;
+        for (AbstractInsnNode n = mn.instructions.getFirst(); n != null; n = n.getNext()) {
+            if (n.getOpcode() == Opcodes.NEW) return 0;
+        }
+        int slot = mn.maxLocals++;
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        mn.instructions.insert(start);
+        mn.instructions.add(end);
+        mn.instructions.add(handler);
+        mn.instructions.add(new VarInsnNode(Opcodes.ASTORE, slot));
+        mn.instructions.add(new VarInsnNode(Opcodes.ALOAD, slot));
+        mn.instructions.add(new InsnNode(Opcodes.ATHROW));
+        mn.tryCatchBlocks = new java.util.ArrayList<>();
+        mn.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        if (mn.maxStack < 1) mn.maxStack = 1;
+        cfLog("      fake-ex-edge: catch-all rethrow added (local " + slot + ")");
+        return 1;
+    }
+
+    /**
+     * 条目 32: irreducible CFG. Prepends a small, genuinely executed
+     * two-entry loop:
+     *
+     * <pre>
+     *   if (_KboxCfSeed.idh() % 2 != 0) goto entry2
+     *   entry1: t = 0; goto head
+     *   entry2: t = 0; goto mid          &lt;- second entry into the loop body
+     *   head:   t++
+     *   mid:    if (t &lt; 2) goto head
+     * </pre>
+     *
+     * {@code head} does not dominate {@code mid} (the entry2 edge reaches it
+     * directly), so the loop is irreducible: dominance-tree based decompilers
+     * (CFR/FernFlower) must fall back to labeled {@code while(true)} emission
+     * or bail out. Unlike a dead-code region, BOTH entries are executed (the
+     * branch depends on a runtime hash), so a decompiler cannot prune it by
+     * constant folding. Semantics are unchanged: both entries initialise the
+     * dedicated counter to 0 and the loop always terminates after two steps.
+     */
+    private int injectIrreducibleEdges(MethodNode mn) {
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return 0;
+        int total = mn.instructions.size();
+        if (total < 20 || total > 900) return 0;
+        int t = mn.maxLocals++;
+        LabelNode entry2 = new LabelNode();
+        LabelNode entry1 = new LabelNode();
+        LabelNode head = new LabelNode();
+        LabelNode mid = new LabelNode();
+        InsnList seq = new InsnList();
+        seq.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "idh", "()I", false));
+        seq.add(new InsnNode(Opcodes.ICONST_2));
+        seq.add(new InsnNode(Opcodes.IREM));
+        seq.add(new JumpInsnNode(Opcodes.IFNE, entry2));
+        seq.add(new JumpInsnNode(Opcodes.GOTO, entry1));
+        // Second entry: jumps straight into the loop body.
+        seq.add(entry2);
+        seq.add(new InsnNode(Opcodes.ICONST_0));
+        seq.add(new VarInsnNode(Opcodes.ISTORE, t));
+        seq.add(new JumpInsnNode(Opcodes.GOTO, mid));
+        // First (header) entry.
+        seq.add(entry1);
+        seq.add(new InsnNode(Opcodes.ICONST_0));
+        seq.add(new VarInsnNode(Opcodes.ISTORE, t));
+        seq.add(head);
+        seq.add(new IincInsnNode(t, 1));
+        seq.add(mid);
+        seq.add(new VarInsnNode(Opcodes.ILOAD, t));
+        seq.add(new InsnNode(Opcodes.ICONST_2));
+        seq.add(new JumpInsnNode(Opcodes.IF_ICMPLT, head));
+        mn.instructions.insert(seq);
+        if (mn.maxStack < 2) mn.maxStack = 2;
+        cfLog("      irreducible: synthetic two-entry loop inserted (local " + t + ")");
+        return 1;
+    }
+
+    /** Ensures {@code node} is preceded by a LabelNode and returns it. */
+    private static LabelNode ensureLabel(MethodNode mn, AbstractInsnNode node) {
+        AbstractInsnNode prev = node.getPrevious();
+        if (prev instanceof LabelNode) return (LabelNode) prev;
+        LabelNode l = new LabelNode();
+        mn.instructions.insertBefore(node, l);
+        return l;
+    }
+
+    /**
+     * 条目 43: aggressive stack-map deformation. Splits a block with a
+     * redundant {@code GOTO next} that targets the very next label. The JVM
+     * requires a StackMapTable frame at every jump target, so each inserted
+     * site forces an additional frame entry and an additional CFG edge that
+     * carries no semantics — CFR/FernFlower must materialize an extra label
+     * and {@code break}/{@code continue} structure for it, while the runtime
+     * executes one extra resolved branch.
+     */
+    private int deformFrames(MethodNode mn) {
+        int total = mn.instructions.size();
+        if (total < 10 || total > 1200) return 0;
+        int[] hgt = stackHeights(mn);
+        if (hgt == null) return 0;
+        AbstractInsnNode[] insns = mn.instructions.toArray();
+        List<int[]> blocks = basicBlocks(mn, insns);
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        int budget = 2;
+        int done = 0;
+        for (int attempt = 0; attempt < 8 && done < budget; attempt++) {
+            int[] blk = blocks.get(r.nextInt(blocks.size()));
+            int f = firstRealIndex(insns, blk[0], blk[1]);
+            if (f < 0 || hgt[f] != 0) continue;
+            LabelNode here = ensureLabel(mn, insns[f]);
+            InsnList seq = new InsnList();
+            seq.add(new JumpInsnNode(Opcodes.GOTO, here));
+            mn.instructions.insertBefore(here, seq);
+            done++;
+        }
+        if (done > 0) cfLog("      frame-deform: " + done + " redundant frame edge(s)");
+        return done;
+    }
+
+    /** Per-instruction operand-stack height, or {@code null} when any block
+     *  boundary is non-empty (the transforms above require empty stacks). */
+    private static int[] stackHeights(MethodNode mn) {
+        AbstractInsnNode[] insns = mn.instructions.toArray();
+        int total = insns.length;
+        if (total == 0) return null;
+        java.util.IdentityHashMap<AbstractInsnNode, Integer> pos = new java.util.IdentityHashMap<>();
+        for (int i = 0; i < total; i++) pos.put(insns[i], i);
+        boolean[] start = new boolean[total];
+        start[0] = true;
+        for (int i = 0; i < total; i++) {
+            AbstractInsnNode n = insns[i];
+            if (n instanceof JumpInsnNode) {
+                Integer t = pos.get(((JumpInsnNode) n).label);
+                if (t != null) start[t] = true;
+            } else if (n instanceof TableSwitchInsnNode) {
+                TableSwitchInsnNode ts = (TableSwitchInsnNode) n;
+                Integer t = pos.get(ts.dflt);
+                if (t != null) start[t] = true;
+                for (LabelNode l : ts.labels) {
+                    Integer ti = pos.get(l);
+                    if (ti != null) start[ti] = true;
+                }
+            } else if (n instanceof LookupSwitchInsnNode) {
+                LookupSwitchInsnNode ls = (LookupSwitchInsnNode) n;
+                Integer t = pos.get(ls.dflt);
+                if (t != null) start[t] = true;
+                for (LabelNode l : ls.labels) {
+                    Integer ti = pos.get(l);
+                    if (ti != null) start[ti] = true;
+                }
+            }
+            int op = n.getOpcode();
+            if (n instanceof JumpInsnNode || Flattener.isReturn(op) || op == Opcodes.ATHROW
+                    || n instanceof TableSwitchInsnNode || n instanceof LookupSwitchInsnNode) {
+                int nx = i + 1;
+                while (nx < total && insns[nx].getOpcode() == -1) nx++;
+                if (nx < total) start[nx] = true;
+            }
+        }
+        int[] h = new int[total];
+        int cur = 0;
+        for (int i = 0; i < total; i++) {
+            if (start[i] && cur != 0) return null;
+            h[i] = cur;
+            cur += Flattener.stackEffect(insns[i]);
+            if (cur < 0) return null;
+        }
+        return h;
+    }
+
+    /** Basic blocks as {@code [startIndex, endIndexExclusive)} pairs. */
+    private static List<int[]> basicBlocks(MethodNode mn, AbstractInsnNode[] insns) {
+        int total = insns.length;
+        java.util.IdentityHashMap<AbstractInsnNode, Integer> pos = new java.util.IdentityHashMap<>();
+        for (int i = 0; i < total; i++) pos.put(insns[i], i);
+        boolean[] start = new boolean[total];
+        start[0] = true;
+        for (int i = 0; i < total; i++) {
+            AbstractInsnNode n = insns[i];
+            if (n instanceof JumpInsnNode) {
+                Integer t = pos.get(((JumpInsnNode) n).label);
+                if (t != null) start[t] = true;
+            } else if (n instanceof TableSwitchInsnNode) {
+                TableSwitchInsnNode ts = (TableSwitchInsnNode) n;
+                Integer t = pos.get(ts.dflt);
+                if (t != null) start[t] = true;
+                for (LabelNode l : ts.labels) {
+                    Integer ti = pos.get(l);
+                    if (ti != null) start[ti] = true;
+                }
+            } else if (n instanceof LookupSwitchInsnNode) {
+                LookupSwitchInsnNode ls = (LookupSwitchInsnNode) n;
+                Integer t = pos.get(ls.dflt);
+                if (t != null) start[t] = true;
+                for (LabelNode l : ls.labels) {
+                    Integer ti = pos.get(l);
+                    if (ti != null) start[ti] = true;
+                }
+            }
+            int op = n.getOpcode();
+            if (n instanceof JumpInsnNode || Flattener.isReturn(op) || op == Opcodes.ATHROW
+                    || n instanceof TableSwitchInsnNode || n instanceof LookupSwitchInsnNode) {
+                int nx = i + 1;
+                while (nx < total && insns[nx].getOpcode() == -1) nx++;
+                if (nx < total) start[nx] = true;
+            }
+        }
+        List<int[]> blocks = new ArrayList<>();
+        int begin = -1;
+        for (int i = 0; i < total; i++) {
+            if (start[i]) {
+                if (begin >= 0) blocks.add(new int[]{begin, i});
+                begin = i;
+            }
+        }
+        if (begin >= 0) blocks.add(new int[]{begin, total});
+        return blocks;
+    }
+
+    private static int firstRealIndex(AbstractInsnNode[] insns, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (insns[i].getOpcode() >= 0) return i;
+        }
+        return -1;
+    }
+
+    private static int lastRealIndex(AbstractInsnNode[] insns, int from, int to) {
+        for (int i = to - 1; i >= from; i--) {
+            if (insns[i].getOpcode() >= 0) return i;
+        }
+        return -1;
+    }
+
+    /** Pushes an int constant with the tightest instruction form. */
+    private static void pushInt(InsnList l, int v) {
+        if (v >= -1 && v <= 5) {
+            l.add(new InsnNode(Opcodes.ICONST_0 + v));
+        } else if (v >= Byte.MIN_VALUE && v <= Byte.MAX_VALUE) {
+            l.add(new IntInsnNode(Opcodes.BIPUSH, v));
+        } else if (v >= Short.MIN_VALUE && v <= Short.MAX_VALUE) {
+            l.add(new IntInsnNode(Opcodes.SIPUSH, v));
+        } else {
+            l.add(new LdcInsnNode(v));
         }
     }
 
@@ -548,8 +1263,8 @@ public final class ControlFlowObfuscator {
         }
     }
 
-    /** Strategy enum for opaque predicate type selection. */
-    private enum PredType { IDENTITY_HASH, TIMING, MBA, POLY }
+    /** Strategy enum for opaque predicate type selection (条目 34: 6 种策略). */
+    private enum PredType { IDENTITY_HASH, TIMING, MBA, POLY, QUAD, XORCON }
 
     /**
      * Builds a runtime-bound opaque predicate selected by strategy type.
@@ -579,46 +1294,46 @@ public final class ControlFlowObfuscator {
      * locals to confuse data-flow analysis, plus extra arithmetic on the
      * predicate result so it appears "used".
      */
-    private InsnList buildOpaquePredicate(PredType type, int tmp) {
+    private InsnList buildOpaquePredicate(PredType type, int tmp, int poison) {
         InsnList l = new InsnList();
         // Runtime-bound condition computation → int on stack
         switch (type) {
             case IDENTITY_HASH:
-                // int t = System.identityHashCode(new Object());  t % 2  [t==0 => even => IFEQ taken]
-                l.add(new TypeInsnNode(Opcodes.NEW, "java/lang/Object"));
-                l.add(new InsnNode(Opcodes.DUP));
-                l.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
-                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I", false));
+                // 条目 36: int t = _KboxCfSeed.idh();  t % 2  [t==0 => even => IFEQ taken]
+                // (identityHashCode of a fresh Object, whitened through the
+                // synthetic helper — no recognizable JDK pattern remains).
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "idh", "()I", false));
                 l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
                 l.add(new InsnNode(Opcodes.ICONST_2));
                 l.add(new InsnNode(Opcodes.IREM));
                 break;
             case TIMING:
-                // int t = (int)(System.nanoTime() & 1);
-                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
-                l.add(new InsnNode(Opcodes.LCONST_1));
-                l.add(new InsnNode(Opcodes.LAND));
-                l.add(new InsnNode(Opcodes.L2I));
+                // 条目 36: int t = _KboxCfSeed.now() % 2 — nondeterministic;
+                // both paths produce identical observable output.
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
                 l.add(new InsnNode(Opcodes.ICONST_2));
                 l.add(new InsnNode(Opcodes.IREM));
                 break;
             case MBA:
             default:
-                // Custom MBA predicate: predicate = ((t ^ 1) + 2*(t & 1)) - (t + 1)
-                // By the identity (x+y) == (x^y)+2*(x&y) with x=t, y=1, this equals 0 always.
-                // t = (int)(System.currentTimeMillis() & 0x7fffffff) — a runtime seed.
-                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                        "java/lang/System", "currentTimeMillis", "()J", false));
-                l.add(new LdcInsnNode(0x7fffffffL));
-                l.add(new InsnNode(Opcodes.LAND));
-                l.add(new InsnNode(Opcodes.L2I));
+                // 条目 34 MBA（poison 交织版）：v = (t + 1 + p) - ((t ^ 1) + 2*(t & 1) + p)
+                // 由恒等式 (x+y) == (x^y) + 2*(x&y)（x=t, y=1）知 v 恒为 0，
+                // 且对任意 poison p 都成立 —— 死分支注入的 p 无法使谓词翻转。
+                // 条目 36: seed via the synthetic helper (whitened time), then
+                // mask to non-negative — POLY's Java-% sign argument requires
+                // t >= 0 (t^5 - t must stay >= 0).
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+                l.add(new LdcInsnNode(0x7fffffff));
+                l.add(new InsnNode(Opcodes.IAND));
                 l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
-                // left = t + 1
+                // left = t + 1 + p
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
                 l.add(new InsnNode(Opcodes.ICONST_1));
                 l.add(new InsnNode(Opcodes.IADD));
-                // right = (t ^ 1) + 2*(t & 1)
+                l.add(new VarInsnNode(Opcodes.ILOAD, poison));
+                l.add(new InsnNode(Opcodes.IADD));
+                // right = (t ^ 1) + 2*(t & 1) + p
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
                 l.add(new InsnNode(Opcodes.ICONST_1));
                 l.add(new InsnNode(Opcodes.IXOR));
@@ -628,18 +1343,22 @@ public final class ControlFlowObfuscator {
                 l.add(new InsnNode(Opcodes.IAND));
                 l.add(new InsnNode(Opcodes.IMUL));
                 l.add(new InsnNode(Opcodes.IADD));
+                l.add(new VarInsnNode(Opcodes.ILOAD, poison));
+                l.add(new InsnNode(Opcodes.IADD));
                 // predicate = left - right  (always 0)
                 l.add(new InsnNode(Opcodes.ISUB));
                 break;
             case POLY:
-                // Polynomial identity over ints, runtime seed t:
-                //   p = (t^5 - t) mod 10   == 0   (Euler/totient: t^5 ≡ t mod 10)
-                // t = (int)(System.currentTimeMillis() & 0x7fffffff)
-                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                        "java/lang/System", "currentTimeMillis", "()J", false));
-                l.add(new LdcInsnNode(0x7fffffffL));
-                l.add(new InsnNode(Opcodes.LAND));
-                l.add(new InsnNode(Opcodes.L2I));
+                // 条目 34 POLY（poison 交织版）：
+                //   v = ((t^5 - t) + 2p) % 10 - (2p) % 10   恒为 0
+                // 由 t^5 ≡ t (mod 10)（Euler 定理），且死分支写入的 p 恒为非负
+                // （&0x7F 后乘加），Java % 对同号被除数满足 (10k + a) % 10 == a % 10。
+                // 条目 36: seed via the synthetic helper (whitened time), then
+                // mask to non-negative — POLY's Java-% sign argument requires
+                // t >= 0 (t^5 - t must stay >= 0).
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+                l.add(new LdcInsnNode(0x7fffffff));
+                l.add(new InsnNode(Opcodes.IAND));
                 l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
                 // t2 = t*t ; t4 = t2*t2 ; t5 = t4*t
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
@@ -654,9 +1373,68 @@ public final class ControlFlowObfuscator {
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
                 l.add(new InsnNode(Opcodes.IMUL));            // t^5
                 l.add(new VarInsnNode(Opcodes.ILOAD, tmp));    // - t
-                l.add(new InsnNode(Opcodes.ISUB));             // t^5 - t
+                l.add(new InsnNode(Opcodes.ISUB));             // t^5 - t (>=0, ≡0 mod 10)
+                l.add(new VarInsnNode(Opcodes.ILOAD, poison)); // + 2p
+                l.add(new InsnNode(Opcodes.ICONST_2));
+                l.add(new InsnNode(Opcodes.IMUL));
+                l.add(new InsnNode(Opcodes.IADD));
                 l.add(new IntInsnNode(Opcodes.BIPUSH, 10));
-                l.add(new InsnNode(Opcodes.IREM));             // mod 10 -> always 0
+                l.add(new InsnNode(Opcodes.IREM));             // a = (t^5-t+2p)%10
+                l.add(new VarInsnNode(Opcodes.ILOAD, poison)); // b = (2p)%10
+                l.add(new InsnNode(Opcodes.ICONST_2));
+                l.add(new InsnNode(Opcodes.IMUL));
+                l.add(new IntInsnNode(Opcodes.BIPUSH, 10));
+                l.add(new InsnNode(Opcodes.IREM));
+                l.add(new InsnNode(Opcodes.ISUB));             // a - b == 0 恒成立
+                break;
+            case QUAD:
+                // 条目 34 QUAD：数论恒假谓词。x² == 3y² - 1 无整数解：
+                // 两边 mod 3，x² ∈ {0,1} 而 3y²-1 ≡ 2 (mod 3)，矛盾。
+                // 取 x = t、y = t ^ 1（均为运行期种子），IFEQ 永不命中。
+                // 条目 36: seed via the synthetic helper (whitened time), then
+                // mask to non-negative — POLY's Java-% sign argument requires
+                // t >= 0 (t^5 - t must stay >= 0).
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+                l.add(new LdcInsnNode(0x7fffffff));
+                l.add(new InsnNode(Opcodes.IAND));
+                l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
+                // y = t ^ 1 → tmp+1
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
+                l.add(new InsnNode(Opcodes.ICONST_1));
+                l.add(new InsnNode(Opcodes.IXOR));
+                l.add(new VarInsnNode(Opcodes.ISTORE, tmp + 1));
+                // v = x² - 3y² + 1   (never 0)
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
+                l.add(new InsnNode(Opcodes.IMUL));             // x²
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp + 1));
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp + 1));
+                l.add(new InsnNode(Opcodes.IMUL));             // y²
+                l.add(new InsnNode(Opcodes.ICONST_3));
+                l.add(new InsnNode(Opcodes.IMUL));             // 3y²
+                l.add(new InsnNode(Opcodes.ISUB));
+                l.add(new InsnNode(Opcodes.ICONST_1));
+                l.add(new InsnNode(Opcodes.IADD));
+                break;
+            case XORCON:
+                // 条目 34 XORCON：t ^ (t+1) 恒为奇数（相邻整数最低位必相反），
+                // 故 v = ((t ^ (t+1)) & 1) - 1 恒为 0。
+                // 条目 36: seed via the synthetic helper (whitened time), then
+                // mask to non-negative — POLY's Java-% sign argument requires
+                // t >= 0 (t^5 - t must stay >= 0).
+                l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+                l.add(new LdcInsnNode(0x7fffffff));
+                l.add(new InsnNode(Opcodes.IAND));
+                l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
+                l.add(new InsnNode(Opcodes.ICONST_1));
+                l.add(new InsnNode(Opcodes.IADD));             // t+1
+                l.add(new VarInsnNode(Opcodes.ILOAD, tmp));    // t
+                l.add(new InsnNode(Opcodes.IXOR));             // t ^ (t+1) — always odd
+                l.add(new InsnNode(Opcodes.ICONST_1));
+                l.add(new InsnNode(Opcodes.IAND));
+                l.add(new InsnNode(Opcodes.ICONST_1));
+                l.add(new InsnNode(Opcodes.ISUB));             // always 0
                 break;
         }
         // Branch: if condition == 0 → goto bogus
@@ -666,42 +1444,66 @@ public final class ControlFlowObfuscator {
         // fall-through: real code continues
         l.add(new JumpInsnNode(Opcodes.GOTO, endBranch));
         l.add(bogusBranch);
-        // Dead branch: plausible junk (self-contained, no locals)
+        // Dead branch (条目 35 poison 交织): the junk store makes this branch
+        // LOOK live to data-flow analysis — the written value flows into the
+        // NEXT predicate's always-true identity, which holds for any p >= 0,
+        // so the dead edge can no longer be pruned as "no observable effect".
+        // p is masked to 7 bits then linearly combined: always non-negative,
+        // which the POLY identity's Java-% sign argument relies on. Seed source
+        // is the synthetic helper (条目 36) — no direct nanoTime reference.
+        l.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+        l.add(new IntInsnNode(Opcodes.BIPUSH, 0x7F));
+        l.add(new InsnNode(Opcodes.IAND));
         l.add(new InsnNode(Opcodes.ICONST_3));
-        l.add(new InsnNode(Opcodes.ICONST_5));
-        l.add(new InsnNode(Opcodes.IADD));
-        l.add(new IntInsnNode(Opcodes.BIPUSH, 7));
         l.add(new InsnNode(Opcodes.IMUL));
-        l.add(new InsnNode(Opcodes.POP));
-        // secondary junk
+        l.add(new InsnNode(Opcodes.ICONST_1));
+        l.add(new InsnNode(Opcodes.IADD));
+        l.add(new VarInsnNode(Opcodes.ISTORE, poison));
+        // secondary junk (arithmetic that appears consumed)
         l.add(new InsnNode(Opcodes.ICONST_M1));
         l.add(new InsnNode(Opcodes.ICONST_1));
         l.add(new InsnNode(Opcodes.IADD));
         l.add(new InsnNode(Opcodes.POP));
         l.add(new JumpInsnNode(Opcodes.GOTO, endBranch));
         l.add(endBranch);
+        // Merge point (both edges): real path resets poison to 0, so any later
+        // predicate reads a value the identity holds for regardless of which
+        // edge was taken at runtime.
+        l.add(new InsnNode(Opcodes.ICONST_0));
+        l.add(new VarInsnNode(Opcodes.ISTORE, poison));
         return l;
     }
 
+    /** 条目 42: quadratic-residue table {modulus, non-residue}. For every
+     *  entry, {@code t*t % m == r} is provably false for ALL ints (r is not a
+     *  quadratic residue mod m) — varied per build so the fixed
+     *  "t*t%7==3" textbook pattern can't be grepped. */
+    private static final int[][] QR_PAIRS = {
+            {5, 2}, {5, 3}, {7, 3}, {7, 5}, {7, 6},
+            {11, 2}, {11, 6}, {11, 7}, {13, 2}, {13, 5}, {13, 6}, {13, 7},
+    };
+
     /**
      * Builds the classic textbook predicate as a fallback for methods
-     * that are too small to absorb the runtime-bound patterns.
+     * that are too small to absorb the runtime-bound patterns. 条目 42: the
+     * modulus / non-residue pair is randomized from the QR table above.
      */
     private InsnList buildSimplePredicate(int t, int tmp) {
+        ThreadLocalRandom rr = ThreadLocalRandom.current();
+        int[] pair = QR_PAIRS[rr.nextInt(QR_PAIRS.length)];
+        int mod = pair[0], nonResidue = pair[1];
         InsnList l = new InsnList();
         l.add(new IntInsnNode(Opcodes.BIPUSH, t));
         l.add(new VarInsnNode(Opcodes.ISTORE, tmp));
-        // Quadratic-residue pattern: t^2 mod 7 [never 3,5,6 for small t]
-        // more opaque than t*(t+1)%2 which CFR recognizes
         l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
         l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
         l.add(new InsnNode(Opcodes.IMUL));          // t^2
-        l.add(new IntInsnNode(Opcodes.BIPUSH, 7));  // mod 7
+        pushInt(l, mod);                            // mod
         l.add(new InsnNode(Opcodes.IREM));
-        l.add(new IntInsnNode(Opcodes.BIPUSH, 3));
+        pushInt(l, nonResidue);
         LabelNode bogus = new LabelNode();
         LabelNode end = new LabelNode();
-        l.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, bogus));  // t^2 % 7 == 3 [never true]
+        l.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, bogus));  // t^2 % mod == nonResidue [never true]
         l.add(new JumpInsnNode(Opcodes.GOTO, end));
         l.add(bogus);
         l.add(new VarInsnNode(Opcodes.ILOAD, tmp));
@@ -776,6 +1578,14 @@ public final class ControlFlowObfuscator {
         }
         if (done > 0) {
             mn.maxLocals += 2;
+            // The MBA sequence's peak operand depth is 3 (load x,y → or → load
+            // x,y), one slot deeper than the IADD it replaces. Without this the
+            // stale maxStack makes ASM's Analyzer throw "Insufficient maximum
+            // stack size" in later phases (e.g. the flattener's local-state
+            // analysis), silently disabling flattening for every method that
+            // received an MBA substitution. COMPUTE_MAXS recomputes it anyway,
+            // but the tree-time value must stay sound for analyzers.
+            if (mn.maxStack < 3) mn.maxStack = 3;
             KBoxLog.debug(TAG, "    [subst] " + mn.name + mn.desc + ": "
                     + done + " IADD -> (x|y)+(x&y) MBA substitution");
         }

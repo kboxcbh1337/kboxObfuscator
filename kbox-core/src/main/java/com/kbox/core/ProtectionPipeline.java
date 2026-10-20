@@ -84,6 +84,16 @@ public final class ProtectionPipeline {
         // The static level is read by every native compile path below.
         com.kbox.core.nativeshell.NativeShellGuard.pump(cfg.getNativeShell());
 
+        // SROX：把 PE 壳的构建期研究设置传给引擎内部的原生库加壳路径。
+        // （JNIC/VMP/native-crypto 的 ShieldPacker 调用发生在更深层，无法直接拿到 cfg。）
+        System.setProperty("kbox.srox", String.valueOf(cfg.isNativeSrox()));
+        System.setProperty("kbox.sroxLevel", String.valueOf(cfg.getNativeSroxLevel()));
+        if (cfg.getNativeSroxReport() != null && !cfg.getNativeSroxReport().isEmpty()) {
+            System.setProperty("kbox.sroxReport", cfg.getNativeSroxReport());
+        } else {
+            System.clearProperty("kbox.sroxReport");
+        }
+
         // ---- Brainfuck chaos mode (brainfuckLoader) ----
         // A standalone opt-in scheme (防内存Dump / 防静态分析): the whole output
         // jar is converted to classes.bf.rle (with an embedded name->(offset,len)
@@ -516,6 +526,40 @@ public final class ProtectionPipeline {
         KBoxLog.stage(++stage, TOTAL_STAGES, "Auto JNIC/VMP method selection");
         new com.kbox.core.analysis.AutoJnicVmpSelector(graph, cfg).select();
 
+        // ---- Stage 5d: Reachability shrink (unused classes/members/resources) ----
+        // Runs after ALL keep-set seeding (reflection scan, auto keep rules,
+        // framework adaptation) so nothing reflection/framework-reachable gets
+        // deleted, and BEFORE call stripping so a stripped call no longer keeps
+        // its target alive.
+        if (cfg.isShrink()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Reachability shrink");
+            new com.kbox.core.analysis.Shrinker(graph, cfg).apply();
+        }
+
+        // ---- Stage 5e: Side-effect-free call stripping (assumenosideeffects) ----
+        // Removes log / assert-helper / user-specified calls before optimization
+        // so the optimizer sees the reduced CFG.
+        if (cfg.isStripLogs() || cfg.isStripKotlinIntrinsics()
+                || !cfg.getStripCalls().isEmpty()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Call stripping (logs/asserts)");
+            new com.kbox.core.obfu.CallStripper(graph, cfg).apply();
+        }
+
+        // ---- Stage 5f: Bytecode optimizer (peephole / const-fold / DCE) ----
+        if (cfg.isOptimize()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Bytecode optimization");
+            new com.kbox.core.obfu.BytecodeOptimizer(graph, cfg).apply();
+        }
+
+        // ---- Stage 5g: Constant byte[] literal encryption (条目 45) ----
+        // Runs BEFORE control-flow: opaque predicates are inserted at random
+        // stack-producer points and would split the canonical
+        // NEWARRAY/DUP/index/value/BASTORE construction this pass matches.
+        if (cfg.isEncryptStrings()) {
+            KBoxLog.stage(++stage, TOTAL_STAGES, "Byte[] literal encryption");
+            new com.kbox.core.stringenc.ByteArrayEncryptor(graph, cfg).apply();
+        }
+
         // ---- Stage 6: Control-flow obfuscation ----
         // Must run BEFORE JNIC so the obfuscated Java is what gets translated
         // to C. Also runs before VMP so VMP-dispatched code is already obscured.
@@ -605,6 +649,10 @@ public final class ProtectionPipeline {
         Mapping mapping = nameObfuscator.compute();
         Map<String, String> classMap = mapping.getClassMap();
         KBoxLog.info(TAG, "  Renamed " + classMap.size() + " classes");
+        // 条目 24：通用资源适配（-adaptresourcefilenames / -adaptresourcefilecontents）。
+        if (cfg.isAdaptResourceFileNames() || cfg.isAdaptResourceFileContents()) {
+            new com.kbox.core.resource.ResourceClassAdapter(graph, cfg, mapping).apply();
+        }
 
         // ---- Stage 8: Kotlin metadata fixup ----
         KBoxLog.stage(++stage, TOTAL_STAGES, "Kotlin @Metadata fixup");
@@ -733,6 +781,16 @@ public final class ProtectionPipeline {
 
         // ---- Stage 8: String encryption ----
         KBoxLog.stage(++stage, TOTAL_STAGES, "String encryption");
+        // 条目 58: class literals are hidden AFTER class/package renaming, so the
+        // encrypted binary name is the final runtime name (ClassRemapper only
+        // rewrites LDC Type constants, never our ciphertext byte array).
+        if (cfg.isEncryptStrings() && cfg.getStringEncryptionStrength() >= 2) {
+            new com.kbox.core.reflection.ClassLiteralHider(graph, cfg).apply();
+            // 条目 59/61/62: static/virtual call sites and static field
+            // accesses become invokedynamic through KboxIndy, so no Methodref/
+            // Fieldref to the real target survives in the constant pool.
+            new com.kbox.core.reflection.IndyCallSiteRewriter(graph, cfg).apply();
+        }
         // NOTE: the AES branch MUST be gated on cfg.isEncryptStrings(). The strength
         // knob defaults to 3, so `strength >= 3` alone made the AES string encryption
         // run even when the user had turned string encryption OFF — which then
@@ -929,7 +987,7 @@ public final class ProtectionPipeline {
         com.kbox.core.packaging.NativeLibPacker.Result natLibs = null;
         if (cfg.isProtectNativeLibs()) {
             KBoxLog.stage(++stage, TOTAL_STAGES, "Native library packing (protectNativeLibs)");
-            natLibs = com.kbox.core.packaging.NativeLibPacker.pack(graph, workDir);
+            natLibs = com.kbox.core.packaging.NativeLibPacker.pack(graph, workDir, cfg);
             if (natLibs == null || natLibs.entries.isEmpty()) {
                 KBoxLog.info(TAG, "  No native libraries found in jar"
                         + " (扫描 .dll/.so/.dylib 及以 .bin/.dat 等命名的共享库内容魔数)");
@@ -1061,6 +1119,8 @@ public final class ProtectionPipeline {
         int bfBuildSalt = bfLevel > 0
                 ? com.kbox.core.brainfuckshield.BfMethodInjector.newBuildSalt() : 0;
         VmpMethodInjector injector = new VmpMethodInjector(bfLevel, bfBuildSalt);
+        com.kbox.core.vmp.VmpCoverageReport coverage =
+                new com.kbox.core.vmp.VmpCoverageReport();
         Map<String, VmpTranslator.Result> perMethod = new HashMap<>();
         // Recompute total after dropping methods whose owner class is excluded
         // from VMP, so progress reaches 100% instead of stalling.
@@ -1068,16 +1128,18 @@ public final class ProtectionPipeline {
         for (String key : cfg.getVmpMethods()) {
             int hash = key.indexOf('#');
             String owner = hash > 0 ? key.substring(0, hash) : key;
-            if (cfg.isExcludedFromVmp(owner)) continue;
+            if (cfg.isExcludedFromVmp(owner)) { coverage.addExcluded(); continue; }
             ClassNode ownerNode = graph.getClasses().get(owner);
             // Interfaces / annotation types cannot host VMP's mutable state fields
             // (interface fields must be public static final) — see VmpMethodInjector.
             if (ownerNode != null
                     && (ownerNode.access & (0x0200 /* INTERFACE */ | 0x2000 /* ANNOTATION */)) != 0) {
+                coverage.addExcluded();
                 continue;
             }
             total++;
         }
+        coverage.setConfigured(total);
         int idx = 0;
         KBoxLog.info(TAG, "  VMP methods to find: " + total
                 + " keys: " + new ArrayList<>(cfg.getVmpMethods()));
@@ -1101,6 +1163,7 @@ public final class ProtectionPipeline {
                 if (!isVmp) continue;
                 if (!VmpTranslator.isSupported(mn)) {
                     KBoxLog.warn("vmp", "Method not VMP-supported: " + key + " (falling back)");
+                    coverage.addUnsupported(key);
                     continue;
                 }
                 try {
@@ -1138,10 +1201,12 @@ public final class ProtectionPipeline {
 
                     perMethod.put(cn.name + "#" + mn.name + "#" + mn.desc, r);
                     idx++;
+                    coverage.addTranslated(key, r.code.length);
                     KBoxLog.progress(100 * idx / Math.max(total, 1),
                             "Translated " + idx + "/" + total + ": " + key);
                 } catch (Exception ex) {
                     KBoxLog.warn("vmp", "VMP translate failed for " + key + ": " + ex.getMessage());
+                    coverage.addFailed(key);
                 }
             }
         }
@@ -1149,6 +1214,7 @@ public final class ProtectionPipeline {
             injector.rewrite(e.getValue(), perMethod);
         }
         KBoxLog.info(TAG, "  VMP: " + perMethod.size() + " methods injected");
+        coverage.write("vmp-coverage.txt");
     }
 
     /**

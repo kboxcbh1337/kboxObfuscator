@@ -303,10 +303,20 @@ public final class ReflectionGateInjector {
                 for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
                     if (!(ins instanceof MethodInsnNode)) continue;
                     MethodInsnNode call = (MethodInsnNode) ins;
-                    if (call.getOpcode() != Opcodes.INVOKESTATIC) continue;
-                    if (!"java/lang/Class".equals(call.owner)) continue;
-                    if (!"forName".equals(call.name)) continue;
-                    if (!FOR_NAME_1.equals(call.desc)) continue;  // only 1-arg form
+                    boolean forName = call.getOpcode() == Opcodes.INVOKESTATIC
+                            && "java/lang/Class".equals(call.owner)
+                            && "forName".equals(call.name)
+                            && FOR_NAME_1.equals(call.desc);          // only 1-arg form
+                    // 条目 60: ClassLoader.loadClass(String) is the other
+                    // name-based class-resolution entry point. The same
+                    // allowlist gate is applied; the 2-arg overload is skipped
+                    // because its operand layout (loader, name, boolean) does
+                    // not allow a bare String transform.
+                    boolean loadClass = call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && "java/lang/ClassLoader".equals(call.owner)
+                            && "loadClass".equals(call.name)
+                            && "(Ljava/lang/String;)Ljava/lang/Class;".equals(call.desc);
+                    if (!forName && !loadClass) continue;
                     InsnList wrap = new InsnList();
                     wrap.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, "checkForName",
                             "(Ljava/lang/String;)Ljava/lang/String;", false));

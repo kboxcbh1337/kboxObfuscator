@@ -56,6 +56,32 @@ public final class ShieldOptions {
     /** 是否对被虚拟化函数的 IR 做控制流平坦化（块号帧槽 + switch 派发器）。 */
     public boolean cfgFlatten = true;
 
+    /**
+     * SROX（Self-Researching Representation Obfuscation eXperiment）：
+     * 构建期自研究闭环。对每个被虚拟化函数生成多个语义保持候选表示，
+     * 用有界差分语义验证 + 可恢复性代理指标选择，失败则回滚到原表示。
+     * 仅影响构建期，不引入运行期自修改。
+     */
+    public boolean srox = true;
+
+    /** SROX 研究等级：0=关闭；1=轻度（变异/常量分裂）；2=+平坦化；3=+不可达区域/双族。 */
+    public int sroxLevel = 3;
+
+    /** 每函数候选数（研究轮数）。越大搜索越充分、构建越慢。 */
+    public int sroxRounds = 4;
+
+    /** 语义差分验证的随机状态组数。 */
+    public int sroxVerifyRuns = 4;
+
+    /** 超过该 IR 指令数的函数不做 SROX（仍走原有虚拟化路径）。 */
+    public int sroxMaxIrInsns = 4000;
+
+    /** SROX 报告输出路径；空 = 不写文件（只写构建日志摘要）。 */
+    public String sroxReport = "";
+
+    /** 本次构建的 SROX 研究种子（由 ShieldPacker 写入；同一产物可复现）。 */
+    public long sroxSeed = 0L;
+
     public ShieldOptions() {
     }
 
@@ -101,6 +127,26 @@ public final class ShieldOptions {
 
     public ShieldOptions cfgFlatten(boolean v) {
         this.cfgFlatten = v;
+        return this;
+    }
+
+    public ShieldOptions srox(boolean v) {
+        this.srox = v;
+        return this;
+    }
+
+    public ShieldOptions sroxLevel(int v) {
+        this.sroxLevel = v;
+        return this;
+    }
+
+    public ShieldOptions sroxRounds(int v) {
+        this.sroxRounds = v;
+        return this;
+    }
+
+    public ShieldOptions sroxReport(String v) {
+        this.sroxReport = v == null ? "" : v;
         return this;
     }
 

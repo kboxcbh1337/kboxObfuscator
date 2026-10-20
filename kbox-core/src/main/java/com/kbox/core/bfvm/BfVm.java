@@ -35,7 +35,7 @@ public final class BfVm {
 
     public static BfVmResult protect(byte[] classBytes, BfVmOptions opts) {
         ClassNode cn = new ClassNode(Opcodes.ASM9);
-        new ClassReader(classBytes).accept(cn, 0);
+        com.kbox.core.compat.ClassFileCompat.accept(classBytes, cn, 0);
         BfVmResult res = new BfVmResult();
         List<MethodNode> out = new ArrayList<>(cn.methods.size());
         for (MethodNode mn : cn.methods) {

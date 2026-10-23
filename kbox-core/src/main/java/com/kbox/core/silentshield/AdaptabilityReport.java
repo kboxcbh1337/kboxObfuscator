@@ -77,7 +77,9 @@ public final class AdaptabilityReport {
 
         // 1. 环境支柱。
         sb.append("\n[ENV] JDK 类文件版本跨度\n");
-        if (st.jdkMaxVersion == 0) {
+        if (st == null) {
+            sb.append("  n/a（modernStackAdapt=false，未采集）\n");
+        } else if (st.jdkMaxVersion == 0) {
             sb.append("  (无输入类)\n");
         } else {
             sb.append("  最低: ").append(st.jdkMinVersion).append(" = ")
@@ -90,13 +92,17 @@ public final class AdaptabilityReport {
 
         // 2. 现代技术栈主动适配。
         sb.append("\n[ADAPT] 现代技术栈主动适配\n");
-        sb.append("  Kotlin 协程     : ").append(st.kotlinSeen ? "是" : "否")
-                .append("，已排除 ").append(st.coroutineExclusions).append(" 个状态机类")
-                .append("（JNIC/VMP + 控制流）\n");
-        sb.append("  multi-release  : ").append(st.multiRelease ? "是" : "否").append('\n');
-        sb.append("  JPMS module-info: ").append(st.hasModuleInfo ? "是" : "否").append('\n');
-        sb.append("  GraalVM 元数据  : ").append(st.graalMetadataSeen ? "是" : "否")
-                .append(st.graalMetadataSeen ? "（已保留）" : "").append('\n');
+        if (st == null) {
+            sb.append("  n/a（modernStackAdapt=false，未采集）\n");
+        } else {
+            sb.append("  Kotlin 协程     : ").append(st.kotlinSeen ? "是" : "否")
+                    .append("，已排除 ").append(st.coroutineExclusions).append(" 个状态机类")
+                    .append("（JNIC/VMP + 控制流）\n");
+            sb.append("  multi-release  : ").append(st.multiRelease ? "是" : "否").append('\n');
+            sb.append("  JPMS module-info: ").append(st.hasModuleInfo ? "是" : "否").append('\n');
+            sb.append("  GraalVM 元数据  : ").append(st.graalMetadataSeen ? "是" : "否")
+                    .append(st.graalMetadataSeen ? "（已保留）" : "").append('\n');
+        }
 
         // 3. 支柱统计。
         sb.append("\n[SPEC/CONTRACT/DEGRADE] 四支柱覆盖\n");

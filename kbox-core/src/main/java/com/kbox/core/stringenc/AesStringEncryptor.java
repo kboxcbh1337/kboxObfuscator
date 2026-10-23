@@ -36,7 +36,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * AES-256-CTR string encryption. Replaces the weaker XOR-based encryptors with
- * a proper authenticated stream cipher.
+ * a standard AES stream-cipher construction.
+ *
+ * <p><b>KBX-STR-07 (honesty note):</b> AES-256-CTR provides <em>no integrity
+ * protection</em> — this scheme is NOT authenticated. A bit-flip in the stored
+ * ciphertext silently changes the decrypted string's semantics. (Upgrading to
+ * GCM or a truncated HMAC is tracked as a follow-up; both sides — runtime
+ * decryptor and build-time emitter — must change together.)
  *
  * <p>Each string literal is encrypted with AES-256-CTR under a per-build key
  * derived from a random 256-byte permutation table {@code T}: the AES key is
@@ -47,11 +53,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Encryption scheme (per string {@code s}):
  * <pre>
  *   key  = SHA-256(T)           // 32-byte AES-256 key
- *   iv   = random 12 bytes      // unique nonce per string
+ *   iv   = random 16 bytes      // unique IV per string (16 = AES block size)
  *   ct   = AES-256-CTR(key, iv, UTF-8 bytes of s)
- *   enc  = iv || ct             // 12-byte nonce prepended to ciphertext
+ *   enc  = iv || ct             // 16-byte IV prepended to ciphertext
  * </pre>
- * Decryption at runtime extracts the 12-byte IV, re-derives the key from
+ * Decryption at runtime extracts the 16-byte IV, re-derives the key from
  * {@code T}, and runs AES-256-CTR in decrypt mode.
  *
  * <p><b>Anti-tamper linkage.</b> When {@code AntiDebug.isTampered()} is true
@@ -78,12 +84,37 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code static final String} fields whose value lives in the
  * {@code ConstantValue} attribute are relocated into {@code <clinit>} via
  * decryption, so no plaintext survives in the class file.
+ *
+ * <p><b>KBX-STR-02 (honesty note):</b> the "wipe-after-use" (L6/L7) measures
+ * below reduce <em>runtime heap residency</em> only. The full key material
+ * (blind table {@code T'}, salt, domain tag) is still present, recoverable,
+ * inside the emitted {@code <clinit>} bytecode of the holder class in the
+ * jar itself — a decompiler can statically replay the derivation and recover
+ * every key without touching a running JVM. Wipe-after-use is an anti-dump
+ * measure, NOT a key-keeping factor; the key root remains artifact-resident
+ * (audit R1).</p>
  */
 public final class AesStringEncryptor {
 
     private static final String TAG = "aes-strings";
     /** Decryptor signature: (byte[] enc, int id) -> String. */
     private static final String DEC_DESC = "([BI)Ljava/lang/String;";
+    /**
+     * KBX-STR-08: decrypt-call anchor scattering. Historically every call site
+     * used exactly one descriptor {@code ([BI)Ljava/lang/String;} on one holder,
+     * so an analyst could enumerate (and hook) every decryption point with a
+     * single descriptor scan. Sites now spread over three shapes:
+     * <pre>
+     *   0: ([BI)Ljava/lang/String;              // enc, id
+     *   2: (Ljava/lang/Object;I)Ljava/lang/String; // enc as Object, id
+     * </pre>
+     * Layout 2 is bytecode-compatible with the same operand sequence (a
+     * {@code byte[]} is assignable to {@code Object}); the method body narrows
+     * it back with a {@code CHECKCAST [B} prologue.
+     */
+    private static String descOf(int layout) {
+        return layout == 2 ? "(Ljava/lang/Object;I)Ljava/lang/String;" : DEC_DESC;
+    }
     private static final String ANTIDEBUG_OWNER = "com/kbox/runtime/AntiDebug";
     private static final String CIPHER_SPEC = "AES/CTR/NoPadding";
     private static final String KEY_ALGO = "AES";
@@ -117,6 +148,8 @@ public final class AesStringEncryptor {
     private String holder;
     /** Randomized decryptor method names (2..3 variants). */
     private String[] decMethods;
+    /** KBX-STR-08: per-variant descriptor layout (0 = byte[], 2 = Object). */
+    private int[] decLayouts;
     /** Upper bound on the number of encrypted strings (sizes {@code _cache}). */
     private int cacheSize;
     /** Global per-string id counter; assigned in parallel, so atomic. */
@@ -163,7 +196,13 @@ public final class AesStringEncryptor {
         holder = "com/kbox/runtime/_" + randomName(14);
         int variants = 2 + rng.get().nextInt(2);   // 2..3 variants per build
         decMethods = new String[variants];
-        for (int i = 0; i < variants; i++) decMethods[i] = "z" + randomName(9);
+        decLayouts = new int[variants];
+        for (int i = 0; i < variants; i++) {
+            decMethods[i] = "z" + randomName(9);
+            // Force at least one of each anchor shape so a descriptor scan
+            // always sees more than one signature (KBX-STR-08).
+            decLayouts[i] = (i % 2 == 0) ? 0 : 2;
+        }
         table = randomPermutation();
         // S7: allocate a dedicated KBNL domain tag + salt for the string-key
         // material, so the holder blinds T behind KbnlKey.derive(D,S) instead of
@@ -245,12 +284,13 @@ public final class AesStringEncryptor {
                         if (s.isEmpty()) { ins = next; continue; }   // skip empty
                         try {
                             int id = nextId.getAndIncrement();
-                            String decName = decMethods[rng.get().nextInt(decMethods.length)];
+                            int vi = rng.get().nextInt(decMethods.length);
                             byte[] enc = encrypt(s);
                             InsnList repl = new InsnList();
                             pushByteArray(repl, enc);
                             pushInt(repl, id);
-                            repl.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, decName, DEC_DESC, false));
+                            repl.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder,
+                                    decMethods[vi], descOf(decLayouts[vi]), false));
                             mn.instructions.insertBefore(ins, repl);
                             mn.instructions.remove(ins);
                             encrypted.incrementAndGet();
@@ -318,12 +358,13 @@ public final class AesStringEncryptor {
             // in the class file (ASM serialises fn.value as ConstantValue).
             fn.value = null;
             int id = nextId.getAndIncrement();
-            String decName = decMethods[rng.get().nextInt(decMethods.length)];
+            int vi = rng.get().nextInt(decMethods.length);
             byte[] enc = encrypt(literal);
             InsnList init = new InsnList();
             pushByteArray(init, enc);
             pushInt(init, id);
-            init.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, decName, DEC_DESC, false));
+            init.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder,
+                    decMethods[vi], descOf(decLayouts[vi]), false));
             init.add(new FieldInsnNode(Opcodes.PUTSTATIC, cn.name, fn.name, fn.desc));
             // Assign at the start of <clinit> (order is irrelevant for distinct
             // fields; keeping them first preserves any existing clinit body).
@@ -432,13 +473,14 @@ public final class AesStringEncryptor {
                 String plain = (String) part[1];
                 if (plain.isEmpty()) continue;
                 // sb.append(dec(enc, id))
-                String decName = decMethods[rng.get().nextInt(decMethods.length)];
+                int vi = rng.get().nextInt(decMethods.length);
                 byte[] enc = encrypt(plain);
                 int id = nextId.getAndIncrement();
                 InsnList seg = new InsnList();
                 pushByteArray(seg, enc);
                 pushInt(seg, id);
-                seg.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder, decName, DEC_DESC, false));
+                seg.add(new MethodInsnNode(Opcodes.INVOKESTATIC, holder,
+                        decMethods[vi], descOf(decLayouts[vi]), false));
                 seg.add(new VarInsnNode(Opcodes.ALOAD, sbSlot));
                 seg.add(new InsnNode(Opcodes.SWAP));   // String -> underneath, sb on top? see below
                 // We used ALOAD sb AFTER pushing String; correct order for
@@ -669,6 +711,9 @@ public final class AesStringEncryptor {
         // _key 本体（SecretKeySpec 内部 byte[32]）无法擦除 —— 每次解密都要用它，
         // 这是 JVM 运行时必须保留的最小密钥面；D/S/T 去掉后堆扫描无法再拿到
         // 表与盐来重派生或交叉验证。
+        // KBX-STR-02: 以上只约束 *运行期堆*。密钥派生材料仍完整存在于产物 jar
+        // 的 holder <clinit> 字节码里，静态反编译即可离线重放 —— 擦除是反 dump
+        // 手段，不是密钥保密因子。
         cl.add(new InsnNode(Opcodes.ACONST_NULL));
         cl.add(new FieldInsnNode(Opcodes.PUTSTATIC, holder, "T", "[B"));
         cl.add(new InsnNode(Opcodes.ACONST_NULL));
@@ -681,8 +726,8 @@ public final class AesStringEncryptor {
         cn.methods.add(clinit);
 
         // --- decryptor variants ---
-        for (String decName : decMethods) {
-            cn.methods.add(buildDecryptor(decName));
+        for (int i = 0; i < decMethods.length; i++) {
+            cn.methods.add(buildDecryptor(decMethods[i], decLayouts[i]));
         }
 
         graph.getClasses().put(holder, cn);
@@ -702,10 +747,19 @@ public final class AesStringEncryptor {
      * The whole decrypt body is wrapped in a catch-all handler that falls
      * through to the noise path, so a malformed blob never crashes the app.
      */
-    private MethodNode buildDecryptor(String decName) {
+    private MethodNode buildDecryptor(String decName, int layout) {
         MethodNode dec = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
-                decName, DEC_DESC, null, null);
+                decName, descOf(layout), null, null);
         InsnList d = new InsnList();
+        // KBX-STR-08 layout 2: the descriptor declares the ciphertext as Object,
+        // so narrow it back to byte[] before the shared body runs. A store into
+        // slot 0 is legal (byte[] is assignable to Object) and leaves the
+        // verifier frame with the more precise type on the only path.
+        if (layout == 2) {
+            d.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            d.add(new TypeInsnNode(Opcodes.CHECKCAST, "[B"));
+            d.add(new VarInsnNode(Opcodes.ASTORE, 0));
+        }
         // locals: 0=enc, 1=id, 2=wr, 3=iv, 4=cipher, 5=pt, 6=result, 7=exc, 8=cached
         String CACHE = "[Ljava/lang/ref/WeakReference;";
 

@@ -24,7 +24,16 @@ import java.security.SecureRandom;
 import java.util.List;
 
 /**
- * White-box string encryption.
+ * Table-substitution string encryption ("whitebox" mode).
+ *
+ * <p><b>KBX-STR-04 (honesty note):</b> this is NOT a white-box construction in
+ * the academic sense (Chow et al.) — there is no encoded-table algebra, no
+ * external encodings, no mask binding. The lookup table <em>is</em> the key and
+ * it ships inside the artifact next to the ciphertext, so an attacker who
+ * extracts the table can decrypt everything offline. The name is kept for
+ * config/API compatibility only; treat this as an obfuscated substitution
+ * cipher with per-build keys, roughly comparable to the AES scheme in
+ * {@link AesStringEncryptor} in terms of the static-extraction ceiling.
  *
  * <p>Encrypts each string literal into a byte array via a random 256-entry
  * permutation lookup table {@code T} (the "key"). The table is embedded in a
@@ -207,22 +216,26 @@ public final class WhiteboxStringEncryptor {
         cn.methods.add(clinit);
 
         // Multiple decryptor variants: each is (byte[] enc, int salt) -> String.
-        //   y = invT[enc[i] & 0xFF]; p = (y - i - salt) & 0xFF; append (char)p
+        //   out = new byte[enc.length]
+        //   y = invT[enc[i] & 0xFF]; out[i] = (byte)((y - i - salt) & 0xFF)
+        //   return new String(out, StandardCharsets.UTF_8)
+        // KBX-STR-03: the encryption side encodes UTF-8 bytes, so the decryptor
+        // MUST decode UTF-8. The old per-byte append((char)(x&0xFF)) was Latin-1
+        // and silently corrupted every non-ASCII string (e.g. "中" -> "ä¸­").
         // No single API symbol exists to hook; each site picked one at random.
         for (String decName : decMethods) {
             MethodNode dec = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, decName,
                     DEC_DESC, null, null);
             InsnList d = new InsnList();
-            // locals: arg0=enc(0), arg1=salt(1), arr=4, sb=5, i=6, x=7
-            int arr = 4, sb = 5, i = 6, x = 7;
+            // locals: arg0=enc(0), arg1=salt(1), out=2, i=3, y=4
+            int out = 2, i = 3, y = 4;
             int saltSlot = 1;
 
-            d.add(new TypeInsnNode(Opcodes.NEW, "java/lang/StringBuilder"));
-            d.add(new InsnNode(Opcodes.DUP));
-            d.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false));
-            d.add(new VarInsnNode(Opcodes.ASTORE, sb));
+            // out = new byte[enc.length]
             d.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            d.add(new VarInsnNode(Opcodes.ASTORE, arr));
+            d.add(new InsnNode(Opcodes.ARRAYLENGTH));
+            d.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
+            d.add(new VarInsnNode(Opcodes.ASTORE, out));
             d.add(new InsnNode(Opcodes.ICONST_0));
             d.add(new VarInsnNode(Opcodes.ISTORE, i));
 
@@ -230,42 +243,49 @@ public final class WhiteboxStringEncryptor {
             LabelNode loopEnd = new LabelNode();
             d.add(loopStart);
             d.add(new VarInsnNode(Opcodes.ILOAD, i));
-            d.add(new VarInsnNode(Opcodes.ALOAD, arr));
+            d.add(new VarInsnNode(Opcodes.ALOAD, 0));
             d.add(new InsnNode(Opcodes.ARRAYLENGTH));
             d.add(new JumpInsnNode(Opcodes.IF_ICMPGE, loopEnd));
 
-            // x = invT[arr[i] & 0xFF]
+            // y = invT[enc[i] & 0xFF]
             d.add(new FieldInsnNode(Opcodes.GETSTATIC, holder, "invT", "[B"));
-            d.add(new VarInsnNode(Opcodes.ALOAD, arr));
+            d.add(new VarInsnNode(Opcodes.ALOAD, 0));
             d.add(new VarInsnNode(Opcodes.ILOAD, i));
-            d.add(new InsnNode(Opcodes.BALOAD));          // arr[i] (sign-extended byte)
+            d.add(new InsnNode(Opcodes.BALOAD));          // enc[i] (sign-extended byte)
             d.add(new LdcInsnNode(0xFF));
-            d.add(new InsnNode(Opcodes.IAND));            // arr[i] & 0xFF
+            d.add(new InsnNode(Opcodes.IAND));            // enc[i] & 0xFF
             d.add(new InsnNode(Opcodes.BALOAD));          // invT[...]
-            d.add(new VarInsnNode(Opcodes.ISTORE, x));
+            d.add(new VarInsnNode(Opcodes.ISTORE, y));
 
-            // sb.append((char)((x - i - salt) & 0xFF))
-            d.add(new VarInsnNode(Opcodes.ALOAD, sb));
-            d.add(new VarInsnNode(Opcodes.ILOAD, x));
+            // out[i] = (byte)((y - i - salt) & 0xFF)
+            d.add(new VarInsnNode(Opcodes.ALOAD, out));
             d.add(new VarInsnNode(Opcodes.ILOAD, i));
-            d.add(new InsnNode(Opcodes.ISUB));            // x - i
+            d.add(new VarInsnNode(Opcodes.ILOAD, y));
+            d.add(new VarInsnNode(Opcodes.ILOAD, i));
+            d.add(new InsnNode(Opcodes.ISUB));            // y - i
             d.add(new VarInsnNode(Opcodes.ILOAD, saltSlot)); // - salt
-            d.add(new InsnNode(Opcodes.ISUB));            // x - i - salt
+            d.add(new InsnNode(Opcodes.ISUB));            // y - i - salt
             d.add(new LdcInsnNode(0xFF));
             d.add(new InsnNode(Opcodes.IAND));            // & 0xFF
-            d.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(C)Ljava/lang/StringBuilder;", false));
-            d.add(new InsnNode(Opcodes.POP));
+            d.add(new InsnNode(Opcodes.I2B));             // (byte)
+            d.add(new InsnNode(Opcodes.BASTORE));
 
             d.add(new org.objectweb.asm.tree.IincInsnNode(i, 1));
             d.add(new JumpInsnNode(Opcodes.GOTO, loopStart));
             d.add(loopEnd);
 
-            d.add(new VarInsnNode(Opcodes.ALOAD, sb));
-            d.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false));
+            // return new String(out, StandardCharsets.UTF_8)
+            d.add(new TypeInsnNode(Opcodes.NEW, "java/lang/String"));
+            d.add(new InsnNode(Opcodes.DUP));
+            d.add(new VarInsnNode(Opcodes.ALOAD, out));
+            d.add(new FieldInsnNode(Opcodes.GETSTATIC,
+                    "java/nio/charset/StandardCharsets", "UTF_8", "Ljava/nio/charset/Charset;"));
+            d.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/String", "<init>",
+                    "([BLjava/nio/charset/Charset;)V", false));
             d.add(new InsnNode(Opcodes.ARETURN));
             dec.instructions = d;
             dec.maxStack = 5;
-            dec.maxLocals = 8;
+            dec.maxLocals = 5;
             cn.methods.add(dec);
         }
 

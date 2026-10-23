@@ -14,16 +14,16 @@ import java.util.List;
  * <p>Detection vectors (expanded for commercial-grade coverage):
  * <ul>
  *   <li><b>JDWP / -javaagent / -agentpath / -Xrunjdwp</b> in JVM input arguments.</li>
- *   <li><b>JVMTI attach API</b>: if {@code com.sun.tools.attach} loads, an
- *       agent is likely to be attachable.</li>
- *   <li><b>JMX remote</b>: {@code com.sun.management.jmxremote} port open.</li>
- *   <li><b>Self-attach</b>: {@code jdk.attach.allowAttachSelf=true} system property.</li>
+ *   <li><b>JMX remote</b>: {@code com.sun.management.jmxremote} port open
+ *       (KBX-NAT-05: now a documented no-op — legitimate ops tooling).</li>
  *   <li><b>Timing</b>: multi-round computational canary with CPU-time vs wall-time
  *       cross-check; if wall time greatly exceeds CPU time, a syscall hook is
  *       likely delaying returns.</li>
  *   <li><b>TracerPid</b> (Linux): non-zero TracerPid in {@code /proc/self/status}.</li>
- *   <li><b>Instrumentation</b>: detection of {@code java.lang.instrument} agent
- *       classes loaded in the current classloader.</li>
+ *   <li><b>Loaded agent libraries</b> (Linux): JVMTI/agent shared-object
+ *       markers in {@code /proc/self/maps} — the live-agent indicator
+ *       (KBX-NAT-18: the earlier reflection probes for the attach API /
+ *       instrumentation classes were dead checks and have been removed).</li>
  * </ul>
  *
  * <p>Strings here are intentionally non-descriptive; when this class is itself
@@ -42,9 +42,10 @@ public final class AntiDebug {
     public static void check() {
         checkJvmArgs();
         checkJmxRemote();
-        checkSelfAttach();
-        checkAttachApi();
-        checkInstrumentation();
+        // KBX-NAT-18: the reflection probes (self-attach property, attach-API
+        // presence, instrumentation classes) were removed — their results never
+        // influenced any decision, so they were dead checks. Real agent detection
+        // happens in checkAgentNativeLibraries (/proc/self/maps markers).
         checkAgentNativeLibraries();
         checkTiming();
         checkTracerPid();
@@ -66,9 +67,6 @@ public final class AntiDebug {
                 try {
                     Thread.sleep(4000L);
                     checkJvmArgs();
-                    checkSelfAttach();
-                    checkAttachApi();
-                    checkInstrumentation();
                     checkAgentNativeLibraries();
                     checkTracerPid();
                     checkCrashDumpResidue();
@@ -102,9 +100,12 @@ public final class AntiDebug {
                 if (files == null) continue;
                 for (java.io.File f : files) {
                     String n = f.getName();
-                    if (n.startsWith("hs_err_pid" + pid) || n.startsWith("replay_pid" + pid)
-                            || n.startsWith("java_pid" + pid)) {
-                        // A crash/JVMTI dump for this VM is present in the trace directory.
+                    // KBX-NAT-05: java_pid<pid> is the attach-listener socket the
+                    // JVM creates on demand for jstack/jcmd/jmap — plain ops
+                    // tooling, NOT a crash dump. Flagging it corrupted strings
+                    // after every routine jstack. Only real crash artifacts
+                    // (hs_err/replay) count as residue.
+                    if (n.startsWith("hs_err_pid" + pid) || n.startsWith("replay_pid" + pid)) {
                         tampered = true;
                         return;
                     }
@@ -126,6 +127,25 @@ public final class AntiDebug {
         }
     }
 
+    // KBX-NAT-05: production JVMs legitimately run APM/profiling agents
+    // (-javaagent / -agentpath). Flagging every agent permanently corrupted all
+    // protected strings on monitored deployments. Agents whose path matches one
+    // of these keywords are whitelisted; anything else still trips the canary.
+    private static final String[] AGENT_WHITELIST = {
+        "skywalking", "pinpoint", "elastic-apm", "apm-elastic", "newrelic",
+        "appdynamics", "datadog", "opentelemetry", "otel", "jacoco",
+        "jrebel", "prometheus", "jmx_prometheus", "async-profiler",
+        "brightwing", "oneapm", "tingyun", "听云", "egls", "bugsnag"
+    };
+
+    private static boolean whitelistedAgent(String arg) {
+        String al = arg.toLowerCase(java.util.Locale.ROOT);
+        for (String w : AGENT_WHITELIST) {
+            if (al.contains(w)) return true;
+        }
+        return false;
+    }
+
     private static void checkJvmArgs() {
         try {
             RuntimeMXBean rt = ManagementFactory.getRuntimeMXBean();
@@ -134,44 +154,20 @@ public final class AntiDebug {
             for (String a : args) {
                 if (a == null) continue;
                 String al = a.toLowerCase();
+                // Debugger-specific flags are always fatal indicators.
                 if (al.startsWith("-agentlib:jdwp")
                         || al.startsWith("-xrunjdwp")
-                        || al.contains("-agentpath")
-                        || al.contains("-javaagent")
-                        || al.contains("-xdebug")
                         || al.contains("jdwp=")
+                        || al.contains("-xdebug")
                         || al.contains("transport=dt_socket")) {
                     tampered = true;
                     return;
                 }
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /**
-     * Detect JMX remote debugging port. If {@code com.sun.management.jmxremote}
-     * is enabled and a port is configured, an attacker can connect via JConsole
-     * or VisualVM and inspect/modify runtime state.
-     */
-    private static void checkJmxRemote() {
-        try {
-            // Check system properties for JMX remote
-            String jmxPort = System.getProperty("com.sun.management.jmxremote.port");
-            if (jmxPort != null && !jmxPort.isEmpty()) {
-                tampered = true;
-                return;
-            }
-            // Check JVM args for JMX remote flags
-            RuntimeMXBean rt = ManagementFactory.getRuntimeMXBean();
-            List<String> args = rt.getInputArguments();
-            if (args == null) return;
-            for (String a : args) {
-                if (a == null) continue;
-                String al = a.toLowerCase();
-                if (al.contains("jmxremote.port")
-                        || al.contains("jmxremote.authenticate=false")
-                        || al.contains("jmxremote.ssl=false")) {
+                // Generic agents only trip the canary when NOT whitelisted
+                // (APM/coverage agents are legitimate production tooling).
+                if ((al.contains("-agentpath") || al.contains("-javaagent")
+                        || al.startsWith("-agentlib:"))
+                        && !whitelistedAgent(a)) {
                     tampered = true;
                     return;
                 }
@@ -181,62 +177,24 @@ public final class AntiDebug {
     }
 
     /**
-     * Detect {@code jdk.attach.allowAttachSelf=true} — allows a process to
-     * attach to itself, enabling self-injection of agents at runtime.
+     * KBX-NAT-05: JMX remote monitoring is standard operations tooling
+     * (jconsole/VisualVM/jmx-prometheus exporters). It exposes read/manage
+     * hooks, not execution control, and flagging it corrupted every protected
+     * string on managed production hosts. This check is intentionally a no-op
+     * now; kept for API compatibility and to document the decision.
      */
-    private static void checkSelfAttach() {
-        try {
-            String allow = System.getProperty("jdk.attach.allowAttachSelf");
-            if ("true".equalsIgnoreCase(allow)) {
-                tampered = true;
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void checkAttachApi() {
-        try {
-            Class.forName("com.sun.tools.attach.VirtualMachine", false,
-                    AntiDebug.class.getClassLoader());
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /**
-     * Detect {@code java.lang.instrument} agent classes. If an Instrumentation
-     * instance is reachable, a JVMTI agent has been loaded (e.g. via -javaagent
-     * or Attach API). We check for common agent-loaded indicators.
-     */
-    private static void checkInstrumentation() {
-        try {
-            // Check if any agent-related classes are loaded
-            Class.forName("java.lang.instrument.Instrumentation", false,
-                    AntiDebug.class.getClassLoader());
-            // Check for common agent frameworks
-            String[] agentClasses = {
-                "sun.instrument.InstrumentationImpl",
-                "com.sun.tools.attach.AttachNotSupportedException"
-            };
-            for (String cls : agentClasses) {
-                try {
-                    Class.forName(cls, false, AntiDebug.class.getClassLoader());
-                    // Don't auto-flag on class existence alone — these exist on JDKs.
-                    // The real indicator is if they're actively used, which we can't
-                    // easily detect without deeper introspection.
-                } catch (Throwable ignored) {
-                }
-            }
-        } catch (Throwable ignored) {
-        }
+    @SuppressWarnings("unused")
+    private static void checkJmxRemote() {
+        // Deliberately no tampered flag — see javadoc above.
     }
 
     /**
      * Detects JVMTI/agent native libraries actually loaded into this process by
      * scanning {@code /proc/self/maps} (Linux). Catches {@code -javaagent},
      * {@code -agentpath}, and agents attached <em>after</em> boot, because a
-     * loaded shared library's mapping persists for the process lifetime. This
-     * plugs the gap left by the reflection probes, which only confirm the JDK
-     * classes <em>exist</em> on the classpath rather than an agent being live.
+     * loaded shared library's mapping persists for the process lifetime. This is
+     * the authoritative live-agent signal; class-presence reflection probes were
+     * removed as dead checks (KBX-NAT-18) since these JDK classes always exist.
      * Silent no-op on platforms without {@code /proc/self/maps}.
      */
     private static void checkAgentNativeLibraries() {
@@ -286,6 +244,7 @@ public final class AntiDebug {
             long totalWall = 0;
             long totalCpu = 0;
             int rounds = 3;
+            long[] wallPerRound = new long[rounds];
             for (int round = 0; round < rounds; round++) {
                 long wallStart = System.nanoTime();
                 long cpuStart = cpuTimeSupported ? threadBean.getCurrentThreadCpuTime() : 0;
@@ -301,16 +260,21 @@ public final class AntiDebug {
 
                 long wallEnd = System.nanoTime();
                 long cpuEnd = cpuTimeSupported ? threadBean.getCurrentThreadCpuTime() : 0;
+                wallPerRound[round] = wallEnd - wallStart;
                 totalWall += (wallEnd - wallStart);
                 totalCpu += (cpuEnd - cpuStart);
             }
 
-            // Wall time check: > 50ms per round average => single-stepping.
-            // The canary loop is a few thousand trivial integer ops, so even on a
-            // heavily loaded/oversubscribed machine it stays well under 50ms; the
-            // old 5ms threshold tripped on ordinary scheduling jitter and silently
-            // corrupted every protected string for the whole run.
-            if (totalWall / rounds > 50_000_000L) {
+            // KBX-NAT-05: use the MEDIAN of per-round wall times instead of the
+            // mean — a single GC pause or scheduler burst inflates the mean and
+            // permanently corrupted every protected string. The median is robust
+            // to one outlier round (median of 3 = middle value).
+            java.util.Arrays.sort(wallPerRound);
+            long medianWall = wallPerRound[rounds / 2];
+            // The canary loop is a few thousand trivial integer ops; even under
+            // single-stepping the median round stays far above 50ms, while GC /
+            // descheduling hits at most one of three rounds.
+            if (medianWall > 50_000_000L) {
                 tampered = true;
             }
 

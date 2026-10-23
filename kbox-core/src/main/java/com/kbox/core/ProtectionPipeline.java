@@ -62,7 +62,10 @@ import java.util.Map;
 public final class ProtectionPipeline {
 
     private static final String TAG = "pipeline";
-    private static final int TOTAL_STAGES = 25;
+    // PL-16: the stage total depends on which optional stages the config turns
+    // on (fixed 25 while allMax actually runs 36 -> progress showed >100%).
+    // Computed per-build in the constructor; see countStages().
+    private final int totalStages;
 
     private final Path inputJar;
     private final Path outputJar;
@@ -74,9 +77,61 @@ public final class ProtectionPipeline {
         this.outputJar = outputJar;
         this.cfg = cfg;
         this.workDir = workDir;
+        this.totalStages = countStages(cfg);
+    }
+
+    /**
+     * PL-16: mirror every conditional stage site in {@link #run()} so the
+     * progress denominator equals the stages that will actually execute.
+     * Unconditional sites (analysis, mixin analysis, reflection scan, ...,
+     * complete) count 23; every conditional stage adds one when enabled.
+     */
+    private static int countStages(ProtectionConfig cfg) {
+        int n = 23;
+        if (cfg.isBrainfuckLoader()) n++;
+        if (cfg.isAutoAdaptMinecraft()) n++;
+        if (cfg.isSilentShield()) n++;
+        if (cfg.isShrink()) n++;
+        if (cfg.isStripLogs() || cfg.isStripKotlinIntrinsics()
+                || !cfg.getStripCalls().isEmpty()) n++;
+        if (cfg.isOptimize()) n++;
+        if (cfg.isEncryptStrings()) n++;
+        if (cfg.getOpaqueStateMachine() > 0) n++;
+        if (cfg.getMbaConstants() > 0) n++;
+        if (cfg.getMbaRewrite() > 0) n++;
+        if (cfg.getSedVx() > 0) n++;
+        if (cfg.getHoneypotLevel() > 0) n++;
+        if (cfg.isEnableVmp() && cfg.isEnableVmpNative()) n++;
+        if (cfg.getSentinelInterleave() > 0 || cfg.getStackFrameRedirect() > 0
+                || cfg.getEntropyTimeAnchor() > 0 || cfg.getSelfWipeSections() > 0
+                || cfg.getProcessHeartbeat() > 0 || cfg.getHoneypotPe() > 0
+                || cfg.getOneTimeSemantic() > 0 || cfg.getLineageChain() > 0
+                || cfg.getSelfRefAuth() > 0 || cfg.getMultiRep() > 0
+                || cfg.getPolyGold() > 0 || cfg.getSignalPoison() > 0
+                || cfg.getBuildSigBind() > 0) n++;
+        if (cfg.isEnableBfvm()) n++;
+        if (cfg.isEnableOtp()) n++;
+        if (cfg.isProtectNativeLibs()) n++;
+        if (cfg.getMappingFile() != null && !cfg.getMappingFile().isEmpty()) n++;
+        return n;
     }
 
     public void run() throws IOException {
+        // PL-18 (pragmatic fix): the per-build seed / SROX hand-off to the
+        // native packaging paths still travels through process-level statics
+        // (the kbox.srox* system properties and HardwareKeyRing's build-seed
+        // slot), so two concurrent run() calls in one JVM could pair class
+        // bytes from build A with build B's seed -> permanently undecryptable
+        // artifact. Serializing whole builds removes that hazard; replacing
+        // the statics with an explicit per-instance BuildContext is the R5
+        // architectural follow-up.
+        synchronized (ProtectionPipeline.class) {
+            runLocked();
+        }
+    }
+
+    /** Serialized build body — concurrent builds are excluded by run(). */
+    private void runLocked() throws IOException {
         Files.createDirectories(workDir);
 
         // Native shell hardening (beyond kboxShield): arm the build-time native
@@ -124,11 +179,23 @@ public final class ProtectionPipeline {
         KBoxLog.info(TAG, "Config: " + cfg);
         KBoxLog.info(TAG, "--------------------------------------------------------");
         printFeatureSummary();
+        cfg.warnStringModeOverlap();
+        // PL-10: with the default ALL scope the include/exclude pattern lists
+        // are dead configuration (FileSelector short-circuits on ALL). Warn
+        // loudly instead of letting --exclude silently do nothing.
+        if ((cfg.getObfuscationScope() == null
+                    || cfg.getObfuscationScope() == ProtectionConfig.ObfuscationScope.ALL)
+                && (!cfg.getIncludePatterns().isEmpty() || !cfg.getExcludePatterns().isEmpty())) {
+            KBoxLog.warn(TAG, "obfuscationScope=ALL ignores includePatterns/excludePatterns ("
+                    + (cfg.getIncludePatterns().size() + cfg.getExcludePatterns().size())
+                    + " entries configured). Use scope=EXCLUDE to honour exclude "
+                    + "patterns or scope=SELECTIVE for include patterns.");
+        }
 
         int stage = 0;
 
         // ---- Stage 1: Analyze ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Class & resource analysis");
+        KBoxLog.stage(++stage, totalStages, "Class & resource analysis");
         long t0 = System.currentTimeMillis();
         DependencyAnalyzer analyzer = new DependencyAnalyzer();
         ClassGraph graph = analyzer.analyze(inputJar);
@@ -221,6 +288,12 @@ public final class ProtectionPipeline {
             byte[] seed = new byte[32];
             new java.security.SecureRandom().nextBytes(seed);
             com.kbox.runtime.HardwareKeyRing.attachBuildSeed(seed);
+            // KBX-CF-18: every obfuscation pass draws its transform-shape
+            // randomness from a stream derived from THIS seed (DetRandom.of(
+            // passId, classKey)), so builds are reproducible per seed and two
+            // builds diverge exactly as much as their seeds do. Never used for
+            // key material — key derivation keeps its own dedicated domain.
+            com.kbox.core.util.DetRandom.installBuildSeed(seed);
             KBoxLog.debug(TAG, "  Per-build key seed installed (" + seed.length + "B, random per build)");
         }
 
@@ -243,7 +316,7 @@ public final class ProtectionPipeline {
         //    kbox_bf_loader.c; both are documented BF-coexistent (see above).
         // Only an input with no discoverable entry point degrades.
         if (cfg.isBrainfuckLoader()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Brainfuck chaos (防内存Dump)");
+            KBoxLog.stage(++stage, totalStages, "Brainfuck chaos (防内存Dump)");
             boolean mcMeta = graph.getResources().containsKey("fabric.mod.json")
                     || graph.getResources().containsKey("META-INF/mods.toml")
                     || graph.getResources().containsKey("META-INF/neoforge.mods.toml")
@@ -315,7 +388,7 @@ public final class ProtectionPipeline {
         // plugin.yml / TweakClass / mixins.json) and seed keep + resource rules
         // so the mod's entry points survive obfuscation without manual config.
         if (cfg.isAutoAdaptMinecraft()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Auto Minecraft mod adaptation");
+            KBoxLog.stage(++stage, totalStages, "Auto Minecraft mod adaptation");
             try {
                 com.kbox.core.minecraft.MinecraftModDetector detector =
                         new com.kbox.core.minecraft.MinecraftModDetector(graph, cfg);
@@ -339,7 +412,7 @@ public final class ProtectionPipeline {
         // obfuscator corrupts Mixin target classes (e.g. leader.event.rd),
         // causing VerifyError: "Bad type on operand stack" when Mixin's
         // runtime injector processes corrupted bytecode.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Mixin config analysis");
+        KBoxLog.stage(++stage, totalStages, "Mixin config analysis");
         com.kbox.core.analysis.MixinConfigParser.Result mixinResult =
                 com.kbox.core.analysis.MixinConfigParser.parse(graph);
         // Add mixin classes and their targets to keepPrefixes so isKept()
@@ -449,7 +522,7 @@ public final class ProtectionPipeline {
         com.kbox.core.silentshield.AuditOrchestrator.Result ss = null;
         java.util.List<com.kbox.core.silentshield.AuditFinding> allFindings = new ArrayList<>();
         if (cfg.isSilentShield()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "SilentShield adaptability audit (intelligent)");
+            KBoxLog.stage(++stage, totalStages, "SilentShield adaptability audit (intelligent)");
             try {
                 Path ssReport = cfg.getSilentShieldReport() != null
                         ? Paths.get(cfg.getSilentShieldReport()) : workDir.resolve("silentshield-report.txt");
@@ -475,28 +548,35 @@ public final class ProtectionPipeline {
 
         // ---- 适配性验收报告：四支柱 + 现代技术栈 + JDK 8..25 + 来源类别矩阵。----
         // 汇总 SilentShield 发现 + ModernStackAdapter 结果，输出供合规审查的验收报告。
-        if ((cfg.getAdaptabilityReport() != null || cfg.getSilentShieldReport() != null)
-                && stackResult != null) {
-            boolean anyAdapt = cfg.isSilentShield() || cfg.isModernStackAdapt();
-            if (anyAdapt) {
-                try {
-                    Path reportPath = cfg.getAdaptabilityReport() != null
-                            ? Paths.get(cfg.getAdaptabilityReport())
-                            : workDir.resolve("adaptability-report.txt");
-                    int applied = ss != null ? ss.appliedActions : 0;
-                    com.kbox.core.silentshield.AdaptabilityReport.render(graph, cfg,
-                            new com.kbox.core.silentshield.AdaptabilityReport.Data(
-                                    allFindings, applied, stackResult),
-                            reportPath);
-                    KBoxLog.info(TAG, "  Adaptability report: " + reportPath);
-                } catch (Exception e) {
-                    KBoxLog.warn(TAG, "Adaptability report failed: " + e.getMessage());
-                }
+        // PL-15: generate whenever the user configured a report — previously the
+        // whole deliverable was silently skipped when modernStackAdapt=false;
+        // now uncollected sections render as n/a instead of vanishing.
+        if (cfg.getAdaptabilityReport() != null || cfg.getSilentShieldReport() != null) {
+            try {
+                Path reportPath = cfg.getAdaptabilityReport() != null
+                        ? Paths.get(cfg.getAdaptabilityReport())
+                        : workDir.resolve("adaptability-report.txt");
+                int applied = ss != null ? ss.appliedActions : 0;
+                com.kbox.core.silentshield.AdaptabilityReport.render(graph, cfg,
+                        new com.kbox.core.silentshield.AdaptabilityReport.Data(
+                                allFindings, applied, stackResult),
+                        reportPath);
+                KBoxLog.info(TAG, "  Adaptability report: " + reportPath);
+            } catch (Exception e) {
+                KBoxLog.warn(TAG, "Adaptability report failed: " + e.getMessage());
             }
         }
 
+        // PL-17: the summary above shows the USER's requested config, but the
+        // graph-driven degrade passes (self-obfuscation, BF degradation, MC
+        // adaptation, Spring Boot compat, SilentShield actions) rewrite cfg in
+        // place. Reprint the EFFECTIVE config after that section so the log
+        // matches what the artifact actually does.
+        KBoxLog.info(TAG, "Effective config after auto-degradation:");
+        printFeatureSummary();
+
         // ---- Stage 2: Reflection scan ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Reflection scan (keep-set seeding)");
+        KBoxLog.stage(++stage, totalStages, "Reflection scan (keep-set seeding)");
         new ReflectionScanner().scan(graph);
 
         // ---- Stage 3: Auto keep-rule derivation ----
@@ -505,7 +585,7 @@ public final class ProtectionPipeline {
         // annotations, native methods, ServiceLoader entries, and class-name
         // shaped string constants — the equivalent of ProGuard's -keep inference
         // plus Spring/Hibernate/Jackson component-scan rules, but automatic.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Auto keep-rule derivation (adaptive)");
+        KBoxLog.stage(++stage, totalStages, "Auto keep-rule derivation (adaptive)");
         if (cfg.isAutoKeepRules()) {
             new AutoKeepDeriver(graph, cfg).derive();
         } else {
@@ -516,14 +596,14 @@ public final class ProtectionPipeline {
         // Runs after auto-keep so keep rules are already established for
         // annotated classes. Scans @Native/@NotNative annotations and seeds
         // the nativeMethods config.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "@Native/@NotNative annotation scan");
+        KBoxLog.stage(++stage, totalStages, "@Native/@NotNative annotation scan");
         new com.kbox.core.analysis.NativeAnnotationScanner(graph, cfg).scan();
 
         // ---- Stage 6: Auto JNIC/VMP method selection ----
         // Runs BEFORE control-flow obfuscation so instruction counts are
         // based on the original (small) methods.  Keys will be remapped
         // after identifier renaming so JNIC uses the final class names.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Auto JNIC/VMP method selection");
+        KBoxLog.stage(++stage, totalStages, "Auto JNIC/VMP method selection");
         new com.kbox.core.analysis.AutoJnicVmpSelector(graph, cfg).select();
 
         // ---- Stage 5d: Reachability shrink (unused classes/members/resources) ----
@@ -532,7 +612,7 @@ public final class ProtectionPipeline {
         // deleted, and BEFORE call stripping so a stripped call no longer keeps
         // its target alive.
         if (cfg.isShrink()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Reachability shrink");
+            KBoxLog.stage(++stage, totalStages, "Reachability shrink");
             new com.kbox.core.analysis.Shrinker(graph, cfg).apply();
         }
 
@@ -541,13 +621,13 @@ public final class ProtectionPipeline {
         // so the optimizer sees the reduced CFG.
         if (cfg.isStripLogs() || cfg.isStripKotlinIntrinsics()
                 || !cfg.getStripCalls().isEmpty()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Call stripping (logs/asserts)");
+            KBoxLog.stage(++stage, totalStages, "Call stripping (logs/asserts)");
             new com.kbox.core.obfu.CallStripper(graph, cfg).apply();
         }
 
         // ---- Stage 5f: Bytecode optimizer (peephole / const-fold / DCE) ----
         if (cfg.isOptimize()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Bytecode optimization");
+            KBoxLog.stage(++stage, totalStages, "Bytecode optimization");
             new com.kbox.core.obfu.BytecodeOptimizer(graph, cfg).apply();
         }
 
@@ -556,33 +636,33 @@ public final class ProtectionPipeline {
         // stack-producer points and would split the canonical
         // NEWARRAY/DUP/index/value/BASTORE construction this pass matches.
         if (cfg.isEncryptStrings()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Byte[] literal encryption");
+            KBoxLog.stage(++stage, totalStages, "Byte[] literal encryption");
             new com.kbox.core.stringenc.ByteArrayEncryptor(graph, cfg).apply();
         }
 
         // ---- Stage 6: Control-flow obfuscation ----
         // Must run BEFORE JNIC so the obfuscated Java is what gets translated
         // to C. Also runs before VMP so VMP-dispatched code is already obscured.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Control-flow obfuscation");
+        KBoxLog.stage(++stage, totalStages, "Control-flow obfuscation");
         new ControlFlowObfuscator(graph, cfg).obfuscate();
 
         // ---- Stage 6a: S2 opaque state-machine fake branches (kboxDedeobfShieldV1) ----
         // Inflates the CFG with constant-outcome chained-state guards + dead poison
         // blocks, run right after control-flow so JNIC/VMP later see the inflated graph.
         if (cfg.getOpaqueStateMachine() > 0) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "S2 opaque state-machine");
+            KBoxLog.stage(++stage, totalStages, "S2 opaque state-machine");
             new com.kbox.core.obfu.OpaqueStateObfuscator(graph, cfg).apply();
         }
 
         // ---- Stage 6b: Method inlining/extraction ----
         // Breaks method boundaries to foil decompiler method-graph analysis.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Method inlining / extraction");
+        KBoxLog.stage(++stage, totalStages, "Method inlining / extraction");
         new com.kbox.core.obfu.MethodObfuscator(graph, cfg).apply();
 
         // ---- Stage 6c: Annotation erasure ----
         // Strips runtime annotations (except framework-critical ones) to remove
         // semantic metadata useful to reverse engineers.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Annotation erasure");
+        KBoxLog.stage(++stage, totalStages, "Annotation erasure");
         new com.kbox.core.obfu.AnnotationEraser(graph, cfg).apply();
         // 元数据擦除：SourceFile/LineNumberTable/LVT/MethodParameters（+可选 Signature/
         // InnerClasses/EnclosingMethod）。不擦 SourceFile 时"改名"可被 100% 反查原名。
@@ -590,12 +670,12 @@ public final class ProtectionPipeline {
 
         // ---- Stage 6d: Call-graph hiding ----
         // Injects dead-code decoy calls to obscure the true call graph.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Call-graph hiding");
+        KBoxLog.stage(++stage, totalStages, "Call-graph hiding");
         new com.kbox.core.obfu.CallGraphHider(graph, cfg).apply();
 
         // ---- Stage 6e: Debug-info forging ----
         // Injects fake local-variable metadata to mislead decompilers.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Debug-info forging");
+        KBoxLog.stage(++stage, totalStages, "Debug-info forging");
         new com.kbox.core.obfu.DebugInfoForger(graph, cfg).apply();
 
         // ---- Stage 6f: L3 type confusion ----first
@@ -603,13 +683,27 @@ public final class ProtectionPipeline {
         // relay + reflection redirection. Runs BEFORE const-obf so it sees the
         // original (non-indirect) int literals and its verifier-safe relays can
         // be serialized cleanly. Safely no-ops unless typeConfusion>0.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "L3 type confusion");
+        KBoxLog.stage(++stage, totalStages, "L3 type confusion");
         new com.kbox.core.obfu.TypeConfusionObfuscator(graph, cfg).apply();
+
+        // ---- Stage 6f2: SED-VX semantic-evidence diffusion ----
+        // Restricted implementation of the SED-VX design: build a semantic
+        // atlas, rank critical slices (sensitive methods + 1-2 hop neighbours),
+        // and rewrite their value evidence through the equivalent-realization
+        // pool under the build seed. Runs BEFORE constant obfuscation so it
+        // still sees the original literals, and before VMP/JNIC which replace
+        // bodies wholesale. Every rewrite is verified or reverted.
+        if (cfg.getSedVx() > 0) {
+            KBoxLog.stage(++stage, totalStages, "SED-VX semantic diffusion");
+            com.kbox.core.sedvx.SedVxReport sedvx =
+                    com.kbox.core.sedvx.SedVxEngine.run(graph, cfg, true);
+            com.kbox.core.sedvx.SedVxEngine.writeReports(sedvx, workDir);
+        }
 
         // ---- Stage 6g: Constant obfuscation ----
         // Replaces magic-number int constants with an indirect runtime lookup,
         // raising the cost of static analysis (constants no longer appear inline).
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Constant obfuscation");
+        KBoxLog.stage(++stage, totalStages, "Constant obfuscation");
         new com.kbox.core.obfu.ConstantObfuscator(graph, cfg).apply();
 
         // ---- Stage 6h: Intertwined constant expressions (mbaConstants) ----
@@ -618,7 +712,7 @@ public final class ProtectionPipeline {
         // is no single decryptor signature / table to grep or replay. Stage counter
         // is only bumped when active to keep progress labels truthful.
         if (cfg.getMbaConstants() > 0) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Intertwined constant expressions");
+            KBoxLog.stage(++stage, totalStages, "Intertwined constant expressions");
             new com.kbox.core.obfu.MbaConstantObfuscator(graph, cfg).apply();
         }
 
@@ -628,7 +722,7 @@ public final class ProtectionPipeline {
         // bitwise-identity trees, recursively re-expanded per level. Stack-neutral; the
         // packager recomputes frames/sizes for classes marked CF-modified.
         if (cfg.getMbaRewrite() > 0) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Run-time MBA rewrite");
+            KBoxLog.stage(++stage, totalStages, "Run-time MBA rewrite");
             new com.kbox.core.obfu.MbaRewriteObfuscator(graph, cfg).apply();
         }
 
@@ -637,14 +731,14 @@ public final class ProtectionPipeline {
         // visible, tempting literals (the bait is meant to be found), and BEFORE
         // identifier renaming so the bait is woven into the final rename topology.
         if (cfg.getHoneypotLevel() > 0) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "S4 honeypot bait");
+            KBoxLog.stage(++stage, totalStages, "S4 honeypot bait");
             new com.kbox.core.obfu.HoneypotInjector(graph, cfg).apply();
         }
 
         // ---- Stage 7: Identifier renaming ----
         // MUST run BEFORE JNIC so the native DLL's JNI_OnLoad uses the
         // renamed class names in FindClass/RegisterNatives.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Identifier renaming");
+        KBoxLog.stage(++stage, totalStages, "Identifier renaming");
         NameObfuscator nameObfuscator = new NameObfuscator(graph, cfg);
         Mapping mapping = nameObfuscator.compute();
         Map<String, String> classMap = mapping.getClassMap();
@@ -655,7 +749,7 @@ public final class ProtectionPipeline {
         }
 
         // ---- Stage 8: Kotlin metadata fixup ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Kotlin @Metadata fixup");
+        KBoxLog.stage(++stage, totalStages, "Kotlin @Metadata fixup");
         new KotlinMetadataFixer(graph, cfg).fix(mapping);
 
         // Apply renames to every class via ClassRemapper.
@@ -665,6 +759,13 @@ public final class ProtectionPipeline {
                 new ArrayList<>(graph.getClasses().entrySet());
         int renameTotal = allClasses.size();
         int renameThreads = cfg.getParallelThreads();
+        // KBX-PL-02: a per-class rename failure canNOT be rolled back — every
+        // other class already has its references remapped to the new name, so
+        // keeping the original class yields a guaranteed NoClassDefFoundError.
+        // Remember the first failure and abort the build after the loop.
+        final java.util.concurrent.atomic.AtomicReference<Throwable> renameFailure =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        final String[] failedClass = {null};
         if (renameThreads != 1 && renameTotal > 8) {
             // Parallel remap: ClassRemapper rewrites each class independently and
             // the Mapping is read-only once computed, so the apply loop fans out
@@ -683,17 +784,18 @@ public final class ProtectionPipeline {
                             ClassNode remapped = nameObfuscator.apply(e.getValue());
                             remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
                         } catch (Throwable t) {
-                            // NEVER drop a class: a remap failure used to kill the
-                            // whole future-wait loop (pool.shutdownNow aborted the
-                            // rest), so classes vanished from the jar and the app
-                            // died with ClassNotFoundException at startup.
+                            // NEVER drop a class silently: record the failure and
+                            // abort after the loop — a partially renamed jar is
+                            // unrecoverable (references to this class are already
+                            // remapped to the new name in every other class).
+                            renameFailure.compareAndSet(null, t);
+                            failedClass[0] = e.getKey();
                             StringBuilder tb = new StringBuilder();
                             for (int fi = 0; fi < Math.min(6, t.getStackTrace().length); fi++) {
                                 tb.append(" | ").append(t.getStackTrace()[fi]);
                             }
-                            KBoxLog.warn(TAG, "Rename failed for " + e.getKey() + " (" + t
-                                    + tb + ") — keeping the original class");
-                            remappedClasses.put(e.getKey(), e.getValue());
+                            KBoxLog.error(TAG, "Rename failed for " + e.getKey() + " (" + t
+                                    + tb + ") — build will abort (partial rename is unrecoverable)");
                         } finally {
                             int d = renameDone.incrementAndGet();
                             if (renameTotal > 100 && d % (renameTotal / 10 + 1) == 0) {
@@ -723,9 +825,12 @@ public final class ProtectionPipeline {
                     ClassNode remapped = nameObfuscator.apply(e.getValue());
                     remappedClasses.put(mapping.mapClass(e.getKey()), remapped);
                 } catch (Throwable t) {
-                    KBoxLog.warn(TAG, "Rename failed for " + e.getKey() + " (" + t
-                            + ") — keeping the original class");
-                    remappedClasses.put(e.getKey(), e.getValue());
+                    // KBX-PL-02: keep-original-name is unrecoverable (references
+                    // in other classes already remapped) — record and abort.
+                    renameFailure.compareAndSet(null, t);
+                    failedClass[0] = e.getKey();
+                    KBoxLog.error(TAG, "Rename failed for " + e.getKey() + " (" + t
+                            + ") — build will abort (partial rename is unrecoverable)");
                 }
                 renameIdx++;
                 if (renameTotal > 100 && renameIdx % (renameTotal / 10 + 1) == 0) {
@@ -741,6 +846,13 @@ public final class ProtectionPipeline {
                     + " of " + renameTotal + " disappeared during the remap stage — "
                     + "the output would fail with ClassNotFoundException");
         }
+        // KBX-PL-02: any per-class rename failure means the output is guaranteed
+        // broken (references already remapped to the new name). Abort the build.
+        if (renameFailure.get() != null) {
+            throw new RuntimeException("Rename failed for class " + failedClass[0]
+                    + "; aborting because a partially-renamed output is unrecoverable",
+                    renameFailure.get());
+        }
         KBoxLog.progress(100, "All classes remapped (" + renameTotal + " total)");
 
         // Remap JNIC/VMP method keys to use renamed class names so
@@ -750,7 +862,7 @@ public final class ProtectionPipeline {
         // ---- Stage 10: JNIC (Java→Native translation) ----
         // Runs AFTER control-flow obfuscation AND identifier renaming (so
         // FindClass/RegisterNatives uses the renamed class name), and BEFORE VMP.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "JNIC (Java→Native translation)");
+        KBoxLog.stage(++stage, totalStages, "JNIC (Java→Native translation)");
         JnicOrchestrator jnic = new JnicOrchestrator(graph, cfg);
         JnicOrchestrator.Result jnicResult = jnic.run(workDir);
         if (!cfg.isEnableJnic()) {
@@ -780,7 +892,7 @@ public final class ProtectionPipeline {
         }
 
         // ---- Stage 8: String encryption ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "String encryption");
+        KBoxLog.stage(++stage, totalStages, "String encryption");
         // 条目 58: class literals are hidden AFTER class/package renaming, so the
         // encrypted binary name is the final runtime name (ClassRemapper only
         // rewrites LDC Type constants, never our ciphertext byte array).
@@ -832,7 +944,7 @@ public final class ProtectionPipeline {
         // Runs AFTER JNIC so VMP only processes methods that were NOT
         // sunk to native. This avoids unnecessary VMP on methods that
         // are already compiled to C.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "VMP (Virtual Machine Protection)");
+        KBoxLog.stage(++stage, totalStages, "VMP (Virtual Machine Protection)");
         if (cfg.isEnableVmp()) {
             new com.kbox.core.vmp.VmpRuntimeProtector(graph, cfg).load();
             injectVmp(graph);
@@ -848,7 +960,7 @@ public final class ProtectionPipeline {
         // so a failed/missing native build never changes a protected app's output.
         byte[] vmpBlob = null;
         if (cfg.isEnableVmp() && cfg.isEnableVmpNative()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "VM原生化 (native VMP interpreter)");
+            KBoxLog.stage(++stage, totalStages, "VM原生化 (native VMP interpreter)");
             try {
                 vmpBlob = com.kbox.core.jnic.NativeCompiler.compileVmp(
                         workDir, cfg.getCc(), cfg.isShieldNativeOutput());
@@ -864,7 +976,7 @@ public final class ProtectionPipeline {
         }
 
         // ---- Stage 10: Anti-analysis passes ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Anti-analysis (anti-decompiler + watermark + exception-jump)");
+        KBoxLog.stage(++stage, totalStages, "Anti-analysis (anti-decompiler + watermark + exception-jump)");
         new com.kbox.core.controlflow.AntiDecompiler(graph, cfg).apply();
         new com.kbox.core.controlflow.Watermarker(graph, cfg).apply();
         new com.kbox.core.controlflow.ExceptionJumpObfuscator(graph, cfg).apply();
@@ -882,7 +994,7 @@ public final class ProtectionPipeline {
                     || cfg.getPolyGold() > 0 || cfg.getSignalPoison() > 0
                     || cfg.getBuildSigBind() > 0;
             if (anyDedeobf) {
-                KBoxLog.stage(++stage, TOTAL_STAGES, "kboxDedeobfShieldV1 dynamic-guard injection (S3/D/C/X)");
+                KBoxLog.stage(++stage, totalStages, "kboxDedeobfShieldV1 dynamic-guard injection (S3/D/C/X)");
                 new com.kbox.core.obfu.DedeobfShieldInjector(graph, cfg).apply();
             }
         }
@@ -890,7 +1002,7 @@ public final class ProtectionPipeline {
         // ---- Stage 12b: Null-guard injection ----
         // Injects null checks after Class.getResourceAsStream() calls so that
         // obfuscated resource paths returning null don't cause downstream NPE.
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Null-guard injection (getResourceAsStream safety)");
+        KBoxLog.stage(++stage, totalStages, "Null-guard injection (getResourceAsStream safety)");
         new com.kbox.core.controlflow.ResourceNullGuardTransformer(graph, cfg).apply();
 
         // ---- Stage 9c: BFVM full method virtualization ----
@@ -909,7 +1021,7 @@ public final class ProtectionPipeline {
                         graph, cfg, cfg.getVmpMethods(), cfg.getNativeMethods(), 1500);
                 KBoxLog.info(TAG, "  BFVM auto-select: " + bfvmTargets.size() + " candidate method(s)");
             }
-            KBoxLog.stage(++stage, TOTAL_STAGES, "BFVM full method virtualization");
+            KBoxLog.stage(++stage, totalStages, "BFVM full method virtualization");
             bfvmResult = new com.kbox.core.bfvm.BfvmMethodInjector(
                     bfvmTargets, cfg.getVmpMethods(), cfg.getNativeMethods())
                     .apply(graph);
@@ -920,7 +1032,7 @@ public final class ProtectionPipeline {
         // JNIC 原生库内隐藏的构建种子加密成 share 写入类文件；运行期还原 → 执行 →
         // 用运行期熵就地重随机。静态产物中没有稳定可反编译的方法体。
         if (cfg.isEnableOtp()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "K-OTP one-time programs");
+            KBoxLog.stage(++stage, totalStages, "K-OTP one-time programs");
             // Engine classes (honeypots / shield / runtime) must never be OTP'd.
             // They may have been renamed into a random package (renamePackages),
             // so resolve their FINAL names from the original com/kbox/ keys.
@@ -931,7 +1043,7 @@ public final class ProtectionPipeline {
             new com.kbox.core.otp.OtpMethodInjector(
                     graph, cfg, cfg.getVmpMethods(), cfg.getNativeMethods(),
                     bfvmResult == null ? null : new java.util.LinkedHashSet<>(bfvmResult.transformed),
-                    engineFinal)
+                    engineFinal, jnic.getOtpNativeSeed())
                     .apply();
         }
 
@@ -951,7 +1063,7 @@ public final class ProtectionPipeline {
         }
 
         // ---- Stage 13: Resource obfuscation ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Resource obfuscation (rename + encrypt)");
+        KBoxLog.stage(++stage, totalStages, "Resource obfuscation (rename + encrypt)");
         ResourceMapping resMapping = null;
         byte[] resSeed = null;
         if (cfg.isObfuscateResources() && !cfg.isBfBlobActive()) {
@@ -986,7 +1098,7 @@ public final class ProtectionPipeline {
         // 交给打包器写入 META-INF/kbox/natlib/，明文原生库不进产物 jar。
         com.kbox.core.packaging.NativeLibPacker.Result natLibs = null;
         if (cfg.isProtectNativeLibs()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Native library packing (protectNativeLibs)");
+            KBoxLog.stage(++stage, totalStages, "Native library packing (protectNativeLibs)");
             natLibs = com.kbox.core.packaging.NativeLibPacker.pack(graph, workDir, cfg);
             if (natLibs == null || natLibs.entries.isEmpty()) {
                 KBoxLog.info(TAG, "  No native libraries found in jar"
@@ -995,7 +1107,7 @@ public final class ProtectionPipeline {
         }
 
         // ---- Stage 14: Packaging ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Packaging (write jar + inject runtime + integrity hash)");
+        KBoxLog.stage(++stage, totalStages, "Packaging (write jar + inject runtime + integrity hash)");
         // Phase3-L2a: EPL binning manifest — build once from the FINAL (post-rename)
         // native/VMP method sets so the audit file cross-references the shipped jar.
         byte[] epdManifest = com.kbox.core.analysis.AutoJnicVmpSelector
@@ -1026,12 +1138,12 @@ public final class ProtectionPipeline {
         // stack traces can be de-obfuscated. Runs after packaging so the final
         // class/resource names are captured.
         if (cfg.getMappingFile() != null && !cfg.getMappingFile().isEmpty()) {
-            KBoxLog.stage(++stage, TOTAL_STAGES, "Deobfuscation mapping output");
+            KBoxLog.stage(++stage, totalStages, "Deobfuscation mapping output");
             com.kbox.core.name.MappingWriter.write(mapping, cfg, resMapping);
         }
 
         // ---- Stage 15: Done ----
-        KBoxLog.stage(++stage, TOTAL_STAGES, "Complete");
+        KBoxLog.stage(++stage, totalStages, "Complete");
         long totalMs = System.currentTimeMillis() - startMs;
         KBoxLog.info(TAG, "========================================================");
         KBoxLog.info(TAG, "Protection complete in " + (totalMs / 1000.0) + "s");

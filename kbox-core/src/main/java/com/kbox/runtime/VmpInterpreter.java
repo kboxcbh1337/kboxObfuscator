@@ -174,6 +174,16 @@ public final class VmpInterpreter {
         /** Per-method opcode twin derived from K: {@code (st1 ^ st2)} -> real opcode. */
         private final int twin;
         /**
+         * KBX-VMP-12: 32-bit twin material. The old dispatcher computed
+         * {@code st1 = twin ^ kb; st2 = kb; (st1 ^ st2)} — an identity that
+         * cancels the ephemeral byte, so the visible index was the constant
+         * {@code twin}. The full 32-bit value now feeds a per-execution dispatch
+         * mask (see {@code execute0}), so the index and the dispatch table both
+         * change on every run and the class no longer contains one fixed
+         * opcode->handler mapping to dump.
+         */
+        private final int twin32;
+        /**
          * Per-method inverse opcode permutation derived from K. The stored stream
          * holds {@code perm[real] ^ twin}; dispatch recovers the real VmpOp via
          * {@code invPerm[(st1 ^ st2) ^ raw]}. Identity under noise mode.
@@ -200,7 +210,7 @@ public final class VmpInterpreter {
          * the interpreter's instruction set are nowhere recoverable statically.
          */
         private final Handler[] handlers;
-        /** True when the hardware-bound key unwrap failed (wrong machine / tamper). */
+        /** True when the wrapped-key unwrap failed (tamper / seed mismatch). */
         private final boolean noise;
         /**
          * VortexVM/L2 runtime handler re-permutation: a monotonic per-method sequence
@@ -217,6 +227,14 @@ public final class VmpInterpreter {
             int t = (K != null && K.length > 0) ? (K[0] & 0xFF) : 0;
             if (t == 0 && K != null && K.length > 1) t = K[K.length - 1] & 0xFF;
             return (t == 0) ? 0xB1 : t;
+        }
+
+        /** KBX-VMP-12: 32-bit twin folded from four key bytes (never zero). */
+        private static int opcodeTwin32(byte[] K) {
+            if (K == null || K.length < 4) return 0x51ED270B;
+            int v = ((K[0] & 0xFF) << 24) | ((K[1] & 0xFF) << 16)
+                    | ((K[2] & 0xFF) << 8) | (K[3] & 0xFF);
+            return v == 0 ? 0x51ED270B : v;
         }
 
         /** Deterministic slot permutation from K (MUST match VmpMethodInjector.slotPerm). */
@@ -325,11 +343,12 @@ public final class VmpInterpreter {
 
         /**
          * Constructs a VmpMethod whose instruction stream is decrypted with a
-         * HARDWARE-BOUND wrapped key:
+         * wrapped key under the per-build-seed master (KBX-NAT-15: portable,
+         * NOT hardware-bound — every host re-derives the same master):
          * <pre>
-         *   master   = HKDF(hardwareFeed, VMP_SALT, "kbox.master", 32)   // per machine
-         *   K        = AES-GCM-decrypt(master, wrappedK)                  // unwrap (throws off-device)
-         *   eph      = HKDF(master, perLaunchSalt, "kbox.run", 32)        // per launch
+         *   master   = HKDF(portableSeed, VMP_SALT, "kbox.master", 32)  // per build
+         *   K        = AES-GCM-decrypt(master, wrappedK)                 // unwrap
+         *   eph      = HKDF(master, perLaunchSalt, "kbox.run", 32)       // per launch
          *   resident = plain ^ ksEph   (re-encrypted under the per-run stream)
          *   b(pos)   = resident[pos] ^ ksEph[pos] = plain[pos]            // only single bytes transient
          * </pre>
@@ -355,9 +374,10 @@ public final class VmpInterpreter {
                 K = null;
             }
             if (K == null || K.length == 0) {
-                // Wrong machine / tampered wrapped key -> noise method.
+                // Seed mismatch / tampered wrapped key -> noise method.
                 this.noise = true;
                 this.twin = 0xB1;
+                this.twin32 = 0x51ED270B;
                 this.invPerm = new int[256];
                 for (int i = 0; i < 256; i++) this.invPerm[i] = i;   // identity under noise
                 this.microPerm = new int[256];
@@ -380,6 +400,7 @@ public final class VmpInterpreter {
             } else {
                 this.noise = false;
                 this.twin = opcodeTwin(K);
+                this.twin32 = opcodeTwin32(K);
                 // BrainfuckShield（二次虚拟化）: 静态字段存的是「磁带程序」（KBFT）而非直存密文。
                 // 用 K 逐格回放解码回 VMP 密文流 encVmp。解码失败（trailer 校验不过 =
                 // 磁带被静态补丁 / 插桩改动）时回退到原始磁带字节作为噪声流 fail-closed，
@@ -738,15 +759,67 @@ public final class VmpInterpreter {
 
         OP_HANDLER[0x45] = c -> { return false; };                                               // NOP (VortexVM/L2 interleave filler)
         OP_HANDLER[0x40] = c -> { --c.sp; return false; };                                              // POP
-        OP_HANDLER[0x41] = c -> { c.sp -= 2; return false; };                                           // POP2
+        // KBX-VMP-03: in this single-slot model a cat-2 value (long/double) is ONE
+        // stack entry (a boxed Long/Double). POP2 must pop 1 slot when the top is
+        // cat-2, 2 slots when the top two are cat-1 (the old unconditional sp-=2
+        // drove sp negative / ate a live value below).
+        OP_HANDLER[0x41] = c -> { c.sp -= isCat2(c.stack[c.sp - 1]) ? 1 : 2; return false; };           // POP2
         OP_HANDLER[0x42] = c -> { c.stack[c.sp] = c.stack[c.sp - 1]; c.sp++; return false; };           // DUP
         OP_HANDLER[0x43] = c -> { Object v = c.stack[c.sp - 1]; c.stack[c.sp] = v; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = v; c.sp++; return false; }; // DUP_X1
         OP_HANDLER[0xCA] = c -> { Object v = c.stack[c.sp - 1]; c.stack[c.sp] = v; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = c.stack[c.sp - 3]; c.stack[c.sp - 3] = v; c.sp++; return false; }; // DUP_X2
-        OP_HANDLER[0xCB] = c -> { c.stack[c.sp] = c.stack[c.sp - 1]; c.stack[c.sp + 1] = c.stack[c.sp - 2]; c.sp += 2; return false; }; // DUP2
-        OP_HANDLER[0xCC] = c -> { Object v1 = c.stack[c.sp - 1]; Object v2 = c.stack[c.sp - 2]; c.stack[c.sp] = v1; c.stack[c.sp + 1] = v2; c.stack[c.sp - 1] = c.stack[c.sp - 3]; c.stack[c.sp - 2] = v1; c.stack[c.sp - 3] = v2; c.sp += 2; return false; }; // DUP2_X1
-        /* DUP2_X2 (JVMS 6.5): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1.
-         * Single-slot model collapses all four forms to this 4-slot rotation. */
-        OP_HANDLER[0xCD] = c -> { Object v1 = c.stack[c.sp - 1]; Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3]; Object v4 = c.stack[c.sp - 4]; c.stack[c.sp - 4] = v2; c.stack[c.sp - 3] = v1; c.stack[c.sp - 2] = v4; c.stack[c.sp - 1] = v3; c.stack[c.sp] = v2; c.stack[c.sp + 1] = v1; c.sp += 2; return false; }; // DUP2_X2
+        // KBX-VMP-02: the DUP2 family must respect JVMS forms. A cat-2 top value is
+        // detected at runtime as a boxed Long/Double (the only 2-slot runtime types
+        // this model pushes); a reference slot that happens to HOLD a Long is a known
+        // rare ambiguity (javac never emits DUP2-family over (Object, Object) where
+        // the object is a live boxed numeric — patterns like a[i]++ always carry an
+        // int index / array ref / raw long there).
+        OP_HANDLER[0xCB] = c -> {                                                                       // DUP2
+            if (isCat2(c.stack[c.sp - 1])) {
+                c.stack[c.sp] = c.stack[c.sp - 1]; c.sp++;                                     // cat2: v1,v1
+            } else {
+                c.stack[c.sp] = c.stack[c.sp - 2]; c.stack[c.sp + 1] = c.stack[c.sp - 1];
+                c.sp += 2;                                                                     // cat1: v2,v1,v2,v1
+            }
+            return false; };
+        OP_HANDLER[0xCC] = c -> {                                                                       // DUP2_X1
+            if (isCat2(c.stack[c.sp - 1])) {
+                // ..., v3, v1(cat2) => ..., v1, v3, v1
+                Object v1 = c.stack[c.sp - 1]; Object v3 = c.stack[c.sp - 2];
+                c.stack[c.sp - 2] = v1; c.stack[c.sp - 1] = v3; c.stack[c.sp] = v1; c.sp += 1;
+            } else {
+                // ..., v3, v2, v1 => ..., v2, v1, v3, v2, v1
+                Object v1 = c.stack[c.sp - 1]; Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3];
+                c.stack[c.sp - 3] = v2; c.stack[c.sp - 2] = v1; c.stack[c.sp - 1] = v3;
+                c.stack[c.sp] = v2; c.stack[c.sp + 1] = v1; c.sp += 2;
+            }
+            return false; };
+        OP_HANDLER[0xCD] = c -> {                                                                       // DUP2_X2
+            Object v1 = c.stack[c.sp - 1];
+            if (isCat2(v1)) {
+                if (isCat2(c.stack[c.sp - 2])) {
+                    // form D: ..., v2(cat2), v1(cat2) => ..., v1, v2, v1
+                    Object v2 = c.stack[c.sp - 2];
+                    c.stack[c.sp - 2] = v1; c.stack[c.sp - 1] = v2; c.stack[c.sp] = v1; c.sp += 1;
+                } else {
+                    // form C: ..., v3, v2, v1(cat2) => ..., v1, v3, v2, v1
+                    Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3];
+                    c.stack[c.sp - 3] = v1; c.stack[c.sp - 2] = v3; c.stack[c.sp - 1] = v2;
+                    c.stack[c.sp] = v1; c.sp += 1;
+                }
+            } else {
+                if (isCat2(c.stack[c.sp - 3])) {
+                    // form B: ..., v3(cat2), v2, v1 => ..., v2, v1, v3, v2, v1
+                    Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3];
+                    c.stack[c.sp - 3] = v2; c.stack[c.sp - 2] = v1; c.stack[c.sp - 1] = v3;
+                    c.stack[c.sp] = v2; c.stack[c.sp + 1] = v1; c.sp += 2;
+                } else {
+                    // form A: ..., v4, v3, v2, v1 => ..., v2, v1, v4, v3, v2, v1
+                    Object v2 = c.stack[c.sp - 2]; Object v3 = c.stack[c.sp - 3]; Object v4 = c.stack[c.sp - 4];
+                    c.stack[c.sp - 4] = v2; c.stack[c.sp - 3] = v1; c.stack[c.sp - 2] = v4; c.stack[c.sp - 1] = v3;
+                    c.stack[c.sp] = v2; c.stack[c.sp + 1] = v1; c.sp += 2;
+                }
+            }
+            return false; };
         OP_HANDLER[0x44] = c -> { Object t = c.stack[c.sp - 1]; c.stack[c.sp - 1] = c.stack[c.sp - 2]; c.stack[c.sp - 2] = t; return false; }; // SWAP
 
         OP_HANDLER[0x50] = c -> {
@@ -757,13 +830,16 @@ public final class VmpInterpreter {
         OP_HANDLER[0x51] = c -> {
             Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), true);
             initClass(f.getDeclaringClass());
-            f.set(null, c.stack[--c.sp]); c.pc += 4; return false; };                                    // PUTSTATIC
+            // 窄类型（Z/B/C/S）在栈上是 boxed Integer：必须强转后再 set，
+            // 否则 Field.set 抛 "Can not set boolean field ... to java.lang.Integer"。
+            f.set(null, coerceFieldValue(f, c.stack[--c.sp])); c.pc += 4; return false; };               // PUTSTATIC
         OP_HANDLER[0x52] = c -> {
             Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), false);
             Object o = c.stack[--c.sp]; c.stack[c.sp++] = f.get(o); c.pc += 4; return false; };          // GETFIELD
         OP_HANDLER[0x53] = c -> {
             Field f = resolveField(c.m, c.cp, c.m.i4(c.pc), false);
-            Object v = c.stack[--c.sp]; Object o = c.stack[--c.sp]; f.set(o, v); c.pc += 4; return false; }; // PUTFIELD
+            Object v = c.stack[--c.sp]; Object o = c.stack[--c.sp];
+            f.set(o, coerceFieldValue(f, v)); c.pc += 4; return false; };                                // PUTFIELD
 
         OP_HANDLER[0x60] = c -> {                                                                        // INVOKEVIRTUAL
             int idx = c.m.i4(c.pc); c.pc += 4;
@@ -829,8 +905,10 @@ public final class VmpInterpreter {
         OP_HANDLER[0x75] = c -> { Object v = c.stack[--c.sp]; int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.set(a, i, v); return false; }; // AASTORE
         OP_HANDLER[0x76] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getInt(a, i); return false; }; // IALOAD
         OP_HANDLER[0x77] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setInt(a, i, v); return false; }; // IASTORE
-        OP_HANDLER[0x7A] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getByte(a, i); return false; }; // BALOAD
-        OP_HANDLER[0x7B] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setByte(a, i, (byte) v); return false; }; // BASTORE
+        OP_HANDLER[0x7A] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp];
+            c.stack[c.sp++] = (a instanceof boolean[]) ? Array.getBoolean(a, i) : Array.getByte(a, i); return false; }; // BALOAD (KBX-VMP-05: boolean[] dispatch)
+        OP_HANDLER[0x7B] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp];
+            if (a instanceof boolean[]) Array.setBoolean(a, i, v != 0); else Array.setByte(a, i, (byte) v); return false; }; // BASTORE (KBX-VMP-05: boolean[] dispatch)
         OP_HANDLER[0x7C] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getChar(a, i); return false; }; // CALOAD
         OP_HANDLER[0x7D] = c -> { int v = toInt(c.stack[--c.sp]); int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; Array.setChar(a, i, (char) v); return false; }; // CASTORE
         OP_HANDLER[0x7E] = c -> { int i = toInt(c.stack[--c.sp]); Object a = c.stack[--c.sp]; c.stack[c.sp++] = Array.getShort(a, i); return false; }; // SALOAD
@@ -974,11 +1052,17 @@ public final class VmpInterpreter {
         int pc = 0;
 
         // Load arguments into locals (instance first if non-static).
+        // KBX-VMP-01: the translated code uses ORIGINAL JVM slot numbers, where
+        // long/double occupy TWO consecutive slots. Advancing li by 1 per
+        // argument misaligned every parameter after the first category-2 one
+        // (e.g. f(long a, int b): ILOAD 2 read null). Advance by the argument's
+        // category width: boxed Long/Double are the only 2-slot runtime types.
         int li = 0;
         if (instance != null) locals[li++] = instance;
         if (args != null) {
             for (Object a : args) {
                 locals[li++] = a;
+                if (a instanceof Long || a instanceof Double) li++;
             }
         }
 
@@ -998,6 +1082,24 @@ public final class VmpInterpreter {
             Handler[] base = m.handlers;
             for (int s = 0; s < 256; s++) runHandlers[R[s]] = base[s];
         }
+        // KBX-VMP-12: per-execution dispatch TABLE, keyed by the 32-bit twin mixed
+        // with this run's ephemeral stream. The old code was
+        //     st1 = twin ^ kb; st2 = kb; slot = composite[(st1 ^ st2) ^ raw]
+        // where (st1 ^ st2) is identically `twin` — the ephemeral byte cancelled,
+        // so the visible index was a per-method CONSTANT and a single dump of
+        // `composite` rebuilt the whole opcode->handler map.
+        //
+        // Now the mask changes every execution and the composite array is
+        // re-keyed through it, so the in-memory table AND the index are both
+        // run-specific. Semantics are unchanged by construction:
+        //     runComp[raw ^ dispMask] == composite[(raw ^ dispMask) ^ dispMask ^ twin]
+        //                             == composite[raw ^ twin]
+        // which is exactly what the old dispatch evaluated.
+        int dispMask = m.twin32 ^ m.ksEph.atMasked(0);
+        dispMask ^= dispMask >>> 16;
+        dispMask &= 0xFF;
+        int[] runComp = new int[256];
+        for (int i = 0; i < 256; i++) runComp[i ^ dispMask] = m.composite[i ^ m.twin];
         // Execution context shared by the data-driven micro-op handlers. The dispatch
         // loop only ever reads/writes ctx.* — the operand stack, locals and pc live here.
         Ctx ctx = new Ctx();
@@ -1015,19 +1117,13 @@ public final class VmpInterpreter {
             resumeDispatch = false;
             try {
             while (true) {
-                // Two-state XOR dispatch: st1/st2 both evolve per-pc using the per-run
-                // ephemeral layer, so the dispatch value is opaque to static analysis
-                // while provably correct (the ephemeral byte cancels: st1 ^ st2 == twin).
-                // Data-driven micro-op dispatch: the composite permutation maps the
-                // stored ciphertext byte directly onto a handler SLOT. Neither the real
-                // VmpOp nor any dispatch value is ever materialized:
-                //   slot = composite[twin ^ raw] = micro[inv[perm[real] ^ twin ^ twin]] = micro[real]
-                //   handlers[micro[real]] is the semantic handler for that build+method.
+                // KBX-VMP-12: data-driven micro-op dispatch over a PER-EXECUTION
+                // re-keyed table. `raw` is the decrypted stored byte; the index is
+                // masked by a mask derived from the 32-bit twin and this run's
+                // ephemeral stream, so neither the index nor the table layout is a
+                // per-method constant. The real VmpOp is still never materialized.
                 int raw = m.b(ctx.pc);
-                int kb = m.ksEph.atMasked(ctx.pc);
-                int st1 = m.twin ^ kb;   // twin = st1 ^ st2
-                int st2 = kb;
-                int slot = m.composite[(st1 ^ st2) ^ raw];
+                int slot = runComp[raw ^ dispMask];
                 ppc = ctx.pc;
                 ctx.pc++; // advance past opcode; operand readers advance further
                 // Periodically surface a watchdog-poisoned method. The poison also
@@ -1139,6 +1235,12 @@ public final class VmpInterpreter {
         if (o instanceof Byte) return (byte) o;
         if (o instanceof Short) return (short) o;
         throw new ClassCastException("VMP: not int-compatible: " + o);
+    }
+
+    /** KBX-VMP-02/03: in the single-slot model a category-2 JVM value occupies ONE
+     *  stack entry and is always a boxed {@code Long} or {@code Double}. */
+    private static boolean isCat2(Object o) {
+        return o instanceof Long || o instanceof Double;
     }
 
     /**
@@ -1642,28 +1744,41 @@ public final class VmpInterpreter {
         Class<?> t = f.getType();
         if (v == null) return null;
         if (t == boolean.class) {
-            return v instanceof Boolean ? v : Boolean.valueOf(((Number) v).intValue() != 0);
+            return v instanceof Boolean ? v
+                    : (v instanceof Character ? ((char) v) != 0
+                    : ((Number) v).intValue() != 0);
         }
+        // KBX-VMP-18: a char-typed producer puts a Character on the stack, and
+        // Character is NOT a Number — routing it through ((Number) v).intValue()
+        // threw CCE on assignments like `o.intField = o.charField`. Normalize
+        // Character to its int code first, then reuse the Number path.
+        final int iv;
+        if (v instanceof Character) iv = (char) v;
+        else if (v instanceof Number) iv = ((Number) v).intValue();
+        else iv = toInt(v);
         if (t == byte.class) {
-            return v instanceof Byte ? v : (byte) ((Number) v).intValue();
+            return v instanceof Byte ? v : (byte) iv;
         }
         if (t == char.class) {
-            return v instanceof Character ? v : (char) ((Number) v).intValue();
+            return v instanceof Character ? v : (char) iv;
         }
         if (t == short.class) {
-            return v instanceof Short ? v : (short) ((Number) v).intValue();
+            return v instanceof Short ? v : (short) iv;
         }
         if (t == int.class) {
-            return v instanceof Integer ? v : ((Number) v).intValue();
+            return v instanceof Integer ? v : iv;
         }
         if (t == long.class) {
-            return v instanceof Long ? v : ((Number) v).longValue();
+            return v instanceof Long ? v
+                    : (v instanceof Character ? (long) (char) v : ((Number) v).longValue());
         }
         if (t == float.class) {
-            return v instanceof Float ? v : ((Number) v).floatValue();
+            return v instanceof Float ? v
+                    : (v instanceof Character ? (float) (char) v : ((Number) v).floatValue());
         }
         if (t == double.class) {
-            return v instanceof Double ? v : ((Number) v).doubleValue();
+            return v instanceof Double ? v
+                    : (v instanceof Character ? (double) (char) v : ((Number) v).doubleValue());
         }
         return v;
     }

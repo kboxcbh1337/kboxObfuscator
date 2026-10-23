@@ -35,7 +35,10 @@ import java.util.Map;
 public final class ResourceEncryptor {
 
     private static final String TAG = "resource-enc";
-    private static final byte MAGIC = (byte) 0x93;   // 'K'^0xD8, masked (NOT ASCII 'K')
+    // MUST stay 0x4B: ResourceGuardClassLoader.decryptResource (runtime) and
+    // Packager.encryptMap (mapping blob) both gate on raw 'K' (0x4B). A different
+    // value here would make the runtime silently return ciphertext (KBX-NAT-01).
+    private static final byte MAGIC = (byte) 0x4B;   // magic 'K', shared with runtime
     private static final int IV_LEN = 12;
     private static final int TAG_BITS = 128;
 

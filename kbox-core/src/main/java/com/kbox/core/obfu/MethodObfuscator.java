@@ -8,6 +8,7 @@ import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
@@ -186,6 +187,18 @@ public final class MethodObfuscator {
                 if (ins instanceof VarInsnNode) {
                     int v = ((VarInsnNode) ins).var;
                     if (!varMap.containsKey(v)) {
+                        // Category-2 locals (long/double) occupy two slots;
+                        // allocating only one made the NEXT fresh slot land
+                        // inside this pair and two locals aliased each other.
+                        varMap.put(v, slot);
+                        slot += isCat2VarInsn(ins.getOpcode()) ? 2 : 1;
+                    }
+                } else if (ins instanceof IincInsnNode) {
+                    // IINC also touches a local: without pre-registering its
+                    // var here the clone loop below left it UNREMAPPED and the
+                    // inlined body incremented the CALLER's local.
+                    int v = ((IincInsnNode) ins).var;
+                    if (!varMap.containsKey(v)) {
                         varMap.put(v, slot++);
                     }
                 }
@@ -230,6 +243,10 @@ public final class MethodObfuscator {
                     Integer mapped = varMap.get(v.var);
                     body.add(new VarInsnNode(v.getOpcode(),
                             mapped != null ? mapped : v.var));
+                } else if (ins instanceof IincInsnNode) {
+                    IincInsnNode ii = (IincInsnNode) ins;
+                    Integer mapped = varMap.get(ii.var);
+                    body.add(new IincInsnNode(mapped != null ? mapped : ii.var, ii.incr));
                 } else {
                     body.add(ins.clone(labelMap));
                 }
@@ -269,6 +286,11 @@ public final class MethodObfuscator {
             case Type.SHORT: case Type.INT: return Opcodes.ILOAD;
             default: return Opcodes.ALOAD;
         }
+    }
+
+    private static boolean isCat2VarInsn(int opcode) {
+        return opcode == Opcodes.LLOAD || opcode == Opcodes.LSTORE
+                || opcode == Opcodes.DLOAD || opcode == Opcodes.DSTORE;
     }
 
     // ================= Extraction =================

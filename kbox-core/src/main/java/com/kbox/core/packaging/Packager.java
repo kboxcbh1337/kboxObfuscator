@@ -62,6 +62,11 @@ public final class Packager {
      *  runtime-class injectors can read the per-build BF rename map without
      *  threading a parameter through every call site. */
     private ProtectionConfig activeCfg;
+    /** 本次打包实际写入的非运行时 .class 条目（名 -> 字节），用于完整性摘要。
+     *  必须覆盖审计器/诱饵/入口桩等在 writeIntegrityHash 之后生成的类，否则
+     *  运行期对整包重新求哈希时必然判定为被篡改（字符串解密全部乱码）。 */
+    private static final ThreadLocal<java.util.LinkedHashMap<String, byte[]>> WRITTEN_CLASSES =
+            ThreadLocal.withInitial(java.util.LinkedHashMap::new);
 
     private static String rtName(ProtectionConfig cfg, String internal) {
         java.util.Map<String, String> m = cfg == null ? null : cfg.getRuntimeRenameMap();
@@ -346,6 +351,7 @@ public final class Packager {
                       byte[] epdManifest,
                       com.kbox.core.packaging.NativeLibPacker.Result natLibs) throws IOException {
         activeCfg = cfg;
+        WRITTEN_CLASSES.get().clear();
         Path parent = outputJar.getParent();
         if (parent != null) Files.createDirectories(parent);
         Map<String, String> classMap = mapping != null ? mapping.getClassMap() : java.util.Collections.emptyMap();
@@ -583,11 +589,7 @@ public final class Packager {
                 }
                 if (verifyErr != null) {
                     // TEMP-DIAG: dump the verify-failing transformed bytes for analysis.
-                    try {
-                        java.nio.file.Files.write(
-                                java.nio.file.Paths.get("kbox-verify-dump-" + newInternal.replace('/', '_') + ".class"),
-                                bytes);
-                    } catch (Exception ignoredDump) {}
+                    dumpDiagnosticClassFile("kbox-verify-dump-", newInternal, bytes);
                     byte[] orig = lookupOriginalBytes(oldInternal, reverseClassMap, graph);
                     if (orig != null) {
                         KBoxLog.warn(TAG, "Verify failed: " + verifyErr
@@ -830,9 +832,9 @@ public final class Packager {
                 KBoxLog.info(TAG, "Wrote EPL binning manifest ("
                         + epdManifest.length + " bytes) -> META-INF/kbox/method_epd.bin");
             }
-            if (cfg.isIntegrityCheck()) {
-                writeIntegrityHash(out, written, clsRoot);
-            }
+            // NOTE: writeIntegrityHash runs at the very END of this method, after
+            // every class entry (including decoys / guard stubs / mock-fill) has
+            // been written — see the comment at the call site.
             if (rtCount > 0) {
                 KBoxLog.info(TAG, "Injected " + rtCount + " runtime classes");
             }
@@ -907,6 +909,12 @@ public final class Packager {
                         putEntry(out, ze.getName(), new byte[0]);
                     }
                 }
+            }
+            // 完整性摘要必须最后计算：它覆盖 putEntry 实际写入的全部 .class
+            // （含反编译器诱饵、守卫桩、mock-fill、入口桩等在旧调用点之后生成的类）。
+            // 否则运行期对整包重算必然不匹配，所有字符串会被 TamperShield 判为篡改。
+            if (cfg.isIntegrityCheck()) {
+                writeIntegrityHash(out, written, clsRoot);
             }
         }
 
@@ -1659,15 +1667,24 @@ public final class Packager {
     private void writeIntegrityHash(ZipOutputStream out, java.util.Map<String, byte[]> written,
                                     String clsRoot) throws IOException {
         try {
+            // 使用本次打包「实际写入」的全部类条目：审计器/诱饵/入口桩/守卫类
+            // 可能在旧调用点之后才生成，只哈希 written 会让运行期对整包重算时
+            // 必然不匹配（表现为所有字符串解密成乱码）。
+            java.util.LinkedHashMap<String, byte[]> entries =
+                    new java.util.LinkedHashMap<>(WRITTEN_CLASSES.get());
+            if (entries.isEmpty()) {
+                for (java.util.Map.Entry<String, byte[]> e : written.entrySet()) {
+                    if (e.getKey().startsWith("com/kbox/runtime/")) continue;
+                    entries.put(clsRoot + e.getKey() + ".class", e.getValue());
+                }
+            }
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
             // Ascending entry-name order, matching IntegrityChecker's TreeSet.
-            java.util.TreeSet<String> sorted = new java.util.TreeSet<>(written.keySet());
+            java.util.TreeSet<String> sorted = new java.util.TreeSet<>(entries.keySet());
             int hashed = 0;
-            for (String internal : sorted) {
-                if (internal.startsWith("com/kbox/runtime/")) continue; // runtime excluded
-                String entryName = clsRoot + internal + ".class";
+            for (String entryName : sorted) {
                 md.update(entryName.getBytes(StandardCharsets.UTF_8));
-                md.update(written.get(internal));
+                md.update(entries.get(entryName));
                 hashed++;
             }
             byte[] hash = md.digest();
@@ -1684,13 +1701,11 @@ public final class Packager {
             // future incremental check (which entry changed) and is the basis
             // for the periodic re-verification introduced in 条目 91.
             java.util.List<byte[]> leaves = new java.util.ArrayList<>();
-            for (String internal : sorted) {
-                if (internal.startsWith("com/kbox/runtime/")) continue;
-                String entryName = clsRoot + internal + ".class";
+            for (String entryName : sorted) {
                 java.security.MessageDigest leaf =
                         java.security.MessageDigest.getInstance("SHA-256");
                 leaf.update(entryName.getBytes(StandardCharsets.UTF_8));
-                leaf.update(written.get(internal));
+                leaf.update(entries.get(entryName));
                 leaves.add(leaf.digest());
             }
             java.util.List<byte[]> cur = leaves;
@@ -1743,6 +1758,7 @@ public final class Packager {
             }
             KBoxLog.info(TAG, "Wrote integrity hash + Merkle root (" + hashed + " classes, "
                     + leaves.size() + " leaves)");
+            WRITTEN_CLASSES.get().clear();
         } catch (Exception e) {
             KBoxLog.warn(TAG, "Integrity hash computation failed: " + e.getMessage());
         }
@@ -2915,11 +2931,27 @@ public final class Packager {
             ClassWriter cw = graphAwareWriter(graph, flags);
             cn.accept(cw);
             byte[] bytes = cw.toByteArray();
-            String file = "_cfdump-" + cn.name.replace('/', '_') + ".class";
-            java.nio.file.Files.write(java.nio.file.Paths.get(file), bytes);
-            KBoxLog.warn(TAG, "  [CF-DUMP] wrote " + file + " (" + bytes.length + " bytes)");
+            dumpDiagnosticClassFile("_cfdump-", cn.name, bytes);
         } catch (Throwable t) {
             KBoxLog.warn(TAG, "  [CF-DUMP] failed to dump " + cn.name + ": " + t);
+        }
+    }
+
+    /**
+     * NAT-17: diagnostic dumps go to the system temp dir (delete-on-exit)
+     * instead of the current working directory — the build machine must not
+     * keep intermediate artifacts (deobfuscation-mapping hints) and CI
+     * sandboxes often have a read-only CWD.
+     */
+    private static void dumpDiagnosticClassFile(String prefix, String internalName, byte[] bytes) {
+        try {
+            java.io.File f = java.io.File.createTempFile(
+                    prefix + internalName.replace('/', '_') + "-", ".class");
+            java.nio.file.Files.write(f.toPath(), bytes);
+            f.deleteOnExit();
+            KBoxLog.warn(TAG, "  [DIAG] wrote " + f + " (" + bytes.length + " bytes)");
+        } catch (Throwable t) {
+            KBoxLog.warn(TAG, "  [DIAG] failed to dump " + internalName + ": " + t);
         }
     }
 
@@ -3859,10 +3891,21 @@ public final class Packager {
     }
 
     private static void putEntry(ZipOutputStream out, String name, byte[] data) throws IOException {
+        trackIntegrityEntry(name, data);
         ZipEntry e = new ZipEntry(name);
         out.putNextEntry(e);
         out.write(data);
         out.closeEntry();
+    }
+
+    /** Records real .class entries for the whole-jar integrity digest. */
+    private static void trackIntegrityEntry(String name, byte[] data) {
+        if (name == null || !name.endsWith(".class")) return;
+        // KBox runtime classes are injected verbatim and excluded on both sides;
+        // decoys under META-INF are excluded on both sides as well.
+        if (name.startsWith("com/kbox/runtime/")) return;
+        if (name.contains("/META-INF/")) return;
+        WRITTEN_CLASSES.get().put(name, data);
     }
 
     /**
@@ -3881,6 +3924,7 @@ public final class Packager {
      */
     private static void putStoredEntry(ZipOutputStream out, String name, byte[] data)
             throws IOException {
+        trackIntegrityEntry(name, data);
         java.util.zip.CRC32 crc = new java.util.zip.CRC32();
         crc.update(data);
         ZipEntry e = new ZipEntry(name);

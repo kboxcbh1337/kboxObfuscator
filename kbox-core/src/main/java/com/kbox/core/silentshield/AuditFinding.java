@@ -25,10 +25,23 @@ public final class AuditFinding {
     public final String trigger;
     /** 人类可读的缓解/处理说明。 */
     public final String mitigation;
+    /**
+     * 动作真正应落在的类（internal name）。默认与 owner 相同；但当"发现位置"
+     * 与"受影响目标"不同（如 REFLECTION_FOR_NAME：owner 是 forName 的调用方，
+     * 需要保名的是被加载的目标类）时由发现方显式给出，KEEP_CLASS 等动作
+     * 优先使用该字段，避免钉死调用方而放过目标。
+     */
+    public final String targetClass;
 
     public AuditFinding(String family, String owner, String member,
                         RiskLevel risk, ProtectionAction action,
                         String trigger, String mitigation) {
+        this(family, owner, member, risk, action, trigger, mitigation, "");
+    }
+
+    public AuditFinding(String family, String owner, String member,
+                        RiskLevel risk, ProtectionAction action,
+                        String trigger, String mitigation, String targetClass) {
         this.family = family;
         this.owner = owner == null ? "" : owner;
         this.member = member == null ? "" : member;
@@ -36,11 +49,14 @@ public final class AuditFinding {
         this.action = action;
         this.trigger = trigger;
         this.mitigation = mitigation;
+        this.targetClass = targetClass == null ? "" : targetClass;
     }
 
-    /** 去重标识：同 family + owner + member 视为同一条。 */
+    /** 去重标识：同 family + owner + member 视为同一条；targetClass 参与去重，
+     *  否则同一调用方对不同目标类的多次 forName 会互相吞掉。 */
     public String key() {
-        return family + "|" + owner + "|" + member;
+        return family + "|" + owner + "|" + member
+                + (targetClass.isEmpty() ? "" : "|" + targetClass);
     }
 
     @Override

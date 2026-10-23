@@ -210,11 +210,25 @@ public final class NativeLoader {
         return System.getProperty("os.name", "").toLowerCase();
     }
 
-    /** Loads the native library exactly once. Safe to call from multiple <clinit>. */
+    /** Loads the native library exactly once. Safe to call from multiple <clinit>.
+     *  A failed attempt is CACHED and rethrown on every subsequent call — the
+     *  in-progress flag alone previously latched true on failure, so retries
+     *  silently no-op'ed and the error only surfaced at the first native call. */
     public static synchronized void load() {
         if (_L1) return;
         if (_L4) return; // Already in the process of loading (re-entrant call from bcInit via JNI_OnLoad)
+        if (_loadFailure != null) {
+            if (_loadFailure instanceof UnsatisfiedLinkError) {
+                throw (UnsatisfiedLinkError) _loadFailure;
+            }
+            // UnsatisfiedLinkError(String,Throwable) is Java 9+; initCause keeps --release 8.
+            UnsatisfiedLinkError cached = new UnsatisfiedLinkError(
+                    "KBox native init failed (cached): " + _loadFailure);
+            cached.initCause(_loadFailure);
+            throw cached;
+        }
         _L4 = true;
+        try {
         ClassLoader cl = NativeLoader.class.getClassLoader();
         byte[] blob;
         try (InputStream in = cl.getResourceAsStream(_BP1)) {
@@ -255,8 +269,23 @@ public final class NativeLoader {
             purgeTemp(tmp);
         }
         _L1 = true;
-        _L4 = false;
+        } catch (Throwable t) {
+            // Cache and rethrow the ORIGINAL error so retries fail identically
+            // instead of returning silently (NAT-08).
+            _loadFailure = t;
+            if (t instanceof UnsatisfiedLinkError) {
+                throw (UnsatisfiedLinkError) t;
+            }
+            UnsatisfiedLinkError wrapped = new UnsatisfiedLinkError("KBox native init failed: " + t);
+            wrapped.initCause(t);
+            throw wrapped;
+        } finally {
+            _L4 = false;
+        }
     }
+
+    /** First fatal failure of {@link #load()}; rethrown on all later calls. */
+    private static volatile Throwable _loadFailure;
 
     /** Registers native methods for the given JNIC class, bypassing JNI_OnLoad's
      * FindClass which may fail with custom ClassLoaders. Called from
@@ -277,9 +306,10 @@ public final class NativeLoader {
     /** Decrypts (ChaCha20) + decompresses (Inflater) the packed blob.
      *  The ChaCha20 key is NOT stored in the blob — it is derived at runtime
      *  from a per-blob salt + the per-build random domain tag read from the
-     *  header + the hardware factor ({@link KbnlKey}), so a static scan cannot
-     *  pull a clean 32-byte key out of the jar, and one interpreter's key does
-     *  not decrypt the others (A1: domain is per-build random, not enumerable). */
+     *  header + the per-build portable seed ({@link KbnlKey}), so the clean
+     *  32-byte key never rests in one place in the jar, and one interpreter's
+     *  key does not decrypt the others (A1: domain is per-build random, not
+     *  enumerable). */
     private static byte[] unpack(byte[] blob) {
         if (blob.length < 68 || !KbnlKey.isKbnl(blob, 0)) {
             throw new UnsatisfiedLinkError("KBox native blob: bad magic");
@@ -293,6 +323,15 @@ public final class NativeLoader {
         int compLen = readIntLE(blob, 56);
         int rawLen = readIntLE(blob, 60);
         int domainTag = readIntLE(blob, 64);
+        // NAT-13: never trust the header — a malformed blob previously produced
+        // NegativeArraySizeException / multi-GB allocations with no context.
+        // A real blob's cipher is the rest of the file and the plaintext library
+        // never exceeds 512 MB.
+        if (compLen <= 0 || compLen > blob.length - 68 || rawLen <= 0
+                || rawLen > (512 << 20)) {
+            throw new UnsatisfiedLinkError("KBox native blob: corrupt length header"
+                    + " (compLen=" + compLen + " rawLen=" + rawLen + " blobLen=" + blob.length + ")");
+        }
         byte[] cipher = new byte[compLen];
         System.arraycopy(blob, 68, cipher, 0, compLen);
         byte[] key = KbnlKey.derive(domainTag, blobSalt);

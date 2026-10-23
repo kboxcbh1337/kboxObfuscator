@@ -6,7 +6,7 @@
 
     <groupId>com.kbox</groupId>
     <artifactId>kbox-obfuscator</artifactId>
-    <version>3.0.3</version>
+    <version>3.0.4</version>
     <packaging>pom</packaging>
     <name>KBox Obfuscator</name>
     <description>Java application protection system</description>

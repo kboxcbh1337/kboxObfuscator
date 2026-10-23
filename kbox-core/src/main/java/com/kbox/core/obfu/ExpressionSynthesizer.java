@@ -79,6 +79,161 @@ public final class ExpressionSynthesizer {
         return out;
     }
 
+    /**
+     * KBX-STR-10: long-constant counterpart of {@link #synthesize(int, int, Random)}.
+     * Uses the same exact-by-construction splits over {@code LADD/LSUB/LMUL/LXOR},
+     * so {@code long} magic numbers no longer stay as a bare {@code LDC} while only
+     * {@code int} constants are covered. Stack-neutral: pushes one {@code long}
+     * (two slots) and consumes nothing.
+     */
+    public static InsnList synthesizeLong(long value, int maxDepth, Random rng) {
+        LongNode node = buildLong(value, Math.max(1, maxDepth), new Budget(), rng);
+        InsnList out = new InsnList();
+        node.toBytes(out);
+        return out;
+    }
+
+    /**
+     * KBX-STR-10: variable-carrying MBA identity.
+     *
+     * <p>The audit's point about constant-only trees is that a symbolic
+     * simplifier folds them in one linear pass. This version mixes a
+     * <em>run-time</em> value {@code k} (read from {@code varSlot}) into the
+     * constant through the bitwise identity
+     * <pre>x + y == (x ^ y) + 2 * (x &amp; y)</pre>
+     * evaluated as {@code v == ((v ^ k) + 2*(v &amp; k)) - k}. The identity holds
+     * for every {@code k} in {@code Z/2^32} (so int overflow is harmless), but a
+     * fold now needs the value of {@code k} first — a compile-time constant no
+     * longer recovers {@code v} from the tree alone.
+     *
+     * <p>Stack effect: pushes exactly one int; the local must already be a
+     * definite int on every path reaching the site.
+     */
+    public static InsnList synthesizeVarMba(int value, int varSlot, Random rng) {
+        InsnList out = new InsnList();
+        // (v ^ k)
+        pushInt(out, value);
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, varSlot));
+        out.add(new InsnNode(Opcodes.IXOR));
+        // 2 * (v & k)
+        pushInt(out, value);
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, varSlot));
+        out.add(new InsnNode(Opcodes.IAND));
+        out.add(new InsnNode(Opcodes.ICONST_2));
+        out.add(new InsnNode(Opcodes.IMUL));
+        out.add(new InsnNode(Opcodes.IADD));
+        // - k
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, varSlot));
+        out.add(new InsnNode(Opcodes.ISUB));
+        return out;
+    }
+
+    /**
+     * Field-based variant of {@link #synthesizeVarMba(int, int, Random)}: the
+     * run-time term is read with {@code GETSTATIC owner.field} instead of a local
+     * slot. Used when the class hosts its own synthetic run-time int slot.
+     */
+    public static InsnList synthesizeVarMba(int value, String owner, String fieldName, Random rng) {
+        InsnList out = new InsnList();
+        // (v ^ k)
+        pushInt(out, value);
+        out.add(new org.objectweb.asm.tree.FieldInsnNode(Opcodes.GETSTATIC, owner, fieldName, "I"));
+        out.add(new InsnNode(Opcodes.IXOR));
+        // 2 * (v & k)
+        pushInt(out, value);
+        out.add(new org.objectweb.asm.tree.FieldInsnNode(Opcodes.GETSTATIC, owner, fieldName, "I"));
+        out.add(new InsnNode(Opcodes.IAND));
+        out.add(new InsnNode(Opcodes.ICONST_2));
+        out.add(new InsnNode(Opcodes.IMUL));
+        out.add(new InsnNode(Opcodes.IADD));
+        // - k
+        out.add(new org.objectweb.asm.tree.FieldInsnNode(Opcodes.GETSTATIC, owner, fieldName, "I"));
+        out.add(new InsnNode(Opcodes.ISUB));
+        return out;
+    }
+
+    /** Long counterpart of {@link #synthesizeVarMba(int, int, Random)}. */
+    public static InsnList synthesizeLongVarMba(long value, int varSlot, Random rng) {
+        InsnList out = new InsnList();
+        pushLong(out, value);
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.LLOAD, varSlot));
+        out.add(new InsnNode(Opcodes.LXOR));
+        pushLong(out, value);
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.LLOAD, varSlot));
+        out.add(new InsnNode(Opcodes.LAND));
+        pushLong(out, 2L);
+        out.add(new InsnNode(Opcodes.LMUL));
+        out.add(new InsnNode(Opcodes.LADD));
+        out.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.LLOAD, varSlot));
+        out.add(new InsnNode(Opcodes.LSUB));
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    //  Long tree model
+    // ------------------------------------------------------------------
+
+    private interface LongNode {
+        long evalLong();
+        void toBytes(InsnList out);
+    }
+
+    private static final class LongLeaf implements LongNode {
+        final long val;
+        LongLeaf(long v) { this.val = v; }
+        @Override public long evalLong() { return val; }
+        @Override public void toBytes(InsnList out) { pushLong(out, val); }
+    }
+
+    private static final class LongBin implements LongNode {
+        final int op;
+        final LongNode l, r;
+        LongBin(int op, LongNode l, LongNode r) { this.op = op; this.l = l; this.r = r; }
+        @Override public long evalLong() {
+            long a = l.evalLong(), b = r.evalLong();
+            switch (op) {
+                case Opcodes.LADD: return a + b;
+                case Opcodes.LSUB: return a - b;
+                case Opcodes.LMUL: return a * b;
+                case Opcodes.LXOR: return a ^ b;
+                default: throw new IllegalStateException("unexpected long op " + op);
+            }
+        }
+        @Override public void toBytes(InsnList out) {
+            l.toBytes(out);
+            r.toBytes(out);
+            out.add(new InsnNode(op));
+        }
+    }
+
+    private static LongNode buildLong(long v, int depth, Budget budget, Random rng) {
+        if (depth <= 0 || !budget.tryAllocate()) return new LongLeaf(v);
+        switch (rng.nextInt(3)) {
+            case 0: {
+                long a = rng.nextLong();
+                return new LongBin(Opcodes.LXOR, buildLong(a, depth - 1, budget, rng),
+                        buildLong(v ^ a, depth - 1, budget, rng));
+            }
+            case 1: {
+                long a = rng.nextLong();
+                return new LongBin(Opcodes.LADD, buildLong(a, depth - 1, budget, rng),
+                        buildLong(v - a, depth - 1, budget, rng));
+            }
+            default: {
+                long a = rng.nextLong();
+                return new LongBin(Opcodes.LSUB, buildLong(a, depth - 1, budget, rng),
+                        buildLong(a - v, depth - 1, budget, rng));
+            }
+        }
+    }
+
+    /** Append the most compact load instruction for a long constant. */
+    static void pushLong(InsnList out, long v) {
+        if (v == 0L) out.add(new InsnNode(Opcodes.LCONST_0));
+        else if (v == 1L) out.add(new InsnNode(Opcodes.LCONST_1));
+        else out.add(new LdcInsnNode(v));
+    }
+
     // ------------------------------------------------------------------
     // Tree model
     // ------------------------------------------------------------------

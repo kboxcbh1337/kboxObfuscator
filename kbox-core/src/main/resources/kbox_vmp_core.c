@@ -1028,7 +1028,31 @@ static int h_GOTO(kbox_cpu_t* cpu,kbox_stream_t* st){
 
 /* ---- stack manipulation ---- */
 static int h_POP(kbox_cpu_t* cpu,kbox_stream_t* st){ cpu->cpu[1]-=1; return 0; }
-static int h_POP2(kbox_cpu_t* cpu,kbox_stream_t* st){ cpu->cpu[1]-=2; return 0; }
+
+/* KBX-VMP-02/03: in the single-slot model a category-2 JVM value occupies ONE
+ * stack entry and is always a boxed Long or Double. Mirrors
+ * VmpInterpreter.isCat2. */
+static int kbox_is_cat2(kbox_cpu_t* cpu, int slot){
+    JNIEnv*e=cpu->env;
+    jobject o=(*e)->GetObjectArrayElement(e,cpu->stack,slot);
+    if (o==NULL) return 0;
+    int r=0;
+    jclass lc=(*e)->GetObjectClass(e,o);
+    if (lc){
+        if (g_ids.longCls && (*e)->IsSameObject(e,lc,g_ids.longCls)) r=1;
+        else if (g_ids.doubleCls && (*e)->IsSameObject(e,lc,g_ids.doubleCls)) r=1;
+        (*e)->DeleteLocalRef(e,lc);
+    }
+    (*e)->DeleteLocalRef(e,o);
+    return r;
+}
+
+/* POP2: cat-2 top value pops 1 slot; cat-1 pair pops 2. */
+static int h_POP2(kbox_cpu_t* cpu,kbox_stream_t* st){
+    int sp=(int)cpu->cpu[1];
+    cpu->cpu[1] -= kbox_is_cat2(cpu, sp-1) ? 1 : 2;
+    return 0;
+}
 static int h_DUP(kbox_cpu_t* cpu,kbox_stream_t* st){
     int sp=(int)cpu->cpu[1]; jobject v=(*cpu->env)->GetObjectArrayElement(cpu->env,cpu->stack,sp-1);
     (*cpu->env)->SetObjectArrayElement(cpu->env,cpu->stack,sp,v); cpu->cpu[1]+=1; return 0;
@@ -1053,43 +1077,98 @@ static int h_DUP_X2(kbox_cpu_t* cpu,kbox_stream_t* st){
     (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v1);
     cpu->cpu[1]+=1; return 0;
 }
+/* KBX-VMP-02: DUP2 family must respect JVMS forms (cat-2 detection via
+ * kbox_is_cat2). Must stay semantics-identical with VmpInterpreter.OP_HANDLER
+ * [0xCB/0xCC/0xCD] — see the Java side for the per-form layout comments. */
 static int h_DUP2(kbox_cpu_t* cpu,kbox_stream_t* st){
     JNIEnv*e=cpu->env; int sp=(int)cpu->cpu[1];
-    jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
-    jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v2);
-    cpu->cpu[1]+=2; return 0;
+    if (kbox_is_cat2(cpu, sp-1)){
+        jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
+        cpu->cpu[1]+=1;
+    } else {
+        jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+        jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp,v2);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v1);
+        cpu->cpu[1]+=2;
+    }
+    return 0;
 }
 static int h_DUP2_X1(kbox_cpu_t* cpu,kbox_stream_t* st){
     JNIEnv*e=cpu->env; int sp=(int)cpu->cpu[1];
-    jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
-    jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
-    jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v2);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v1);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v2);
-    cpu->cpu[1]+=2; return 0;
+    if (kbox_is_cat2(cpu, sp-1)){
+        /* ..., v3, v1(cat2) => ..., v1, v3, v1 */
+        jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+        jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v1);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
+        cpu->cpu[1]+=1;
+    } else {
+        /* ..., v3, v2, v1 => ..., v2, v1, v3, v2, v1 */
+        jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+        jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+        jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v2);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v1);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp,v2);
+        (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v1);
+        cpu->cpu[1]+=2;
+    }
+    return 0;
 }
-/* DUP2_X2 (JVMS 6.5): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1.
- * Single-slot model collapses all four forms to this 4-slot rotation; must
- * stay byte-identical with VmpInterpreter.OP_HANDLER[0xCD] and the JNIC v3
- * interpreter (kbox_jnic_interp_v3.c DUP2_X2). */
 static int h_DUP2_X2(kbox_cpu_t* cpu,kbox_stream_t* st){
     JNIEnv*e=cpu->env; int sp=(int)cpu->cpu[1];
-    jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
-    jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
-    jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
-    jobject v4=(*e)->GetObjectArrayElement(e,cpu->stack,sp-4);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-4,v2);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v1);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v4);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp,v2);
-    (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v1);
-    cpu->cpu[1]+=2; return 0;
+    if (kbox_is_cat2(cpu, sp-1)){
+        if (kbox_is_cat2(cpu, sp-2)){
+            /* form D: ..., v2(cat2), v1(cat2) => ..., v1, v2, v1 */
+            jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+            jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v1);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
+            cpu->cpu[1]+=1;
+        } else {
+            /* form C: ..., v3, v2, v1(cat2) => ..., v1, v3, v2, v1 */
+            jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+            jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+            jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v1);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v3);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp,v1);
+            cpu->cpu[1]+=1;
+        }
+    } else {
+        if (kbox_is_cat2(cpu, sp-3)){
+            /* form B: ..., v3(cat2), v2, v1 => ..., v2, v1, v3, v2, v1 */
+            jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+            jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+            jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v1);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v1);
+            cpu->cpu[1]+=2;
+        } else {
+            /* form A: ..., v4, v3, v2, v1 => ..., v2, v1, v4, v3, v2, v1 */
+            jobject v1=(*e)->GetObjectArrayElement(e,cpu->stack,sp-1);
+            jobject v2=(*e)->GetObjectArrayElement(e,cpu->stack,sp-2);
+            jobject v3=(*e)->GetObjectArrayElement(e,cpu->stack,sp-3);
+            jobject v4=(*e)->GetObjectArrayElement(e,cpu->stack,sp-4);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-4,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-3,v1);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-2,v4);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp-1,v3);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp,v2);
+            (*e)->SetObjectArrayElement(e,cpu->stack,sp+1,v1);
+            cpu->cpu[1]+=2;
+        }
+    }
+    return 0;
 }
 static int h_SWAP(kbox_cpu_t* cpu,kbox_stream_t* st){
     JNIEnv*e=cpu->env; int sp=(int)cpu->cpu[1];
@@ -1340,7 +1419,10 @@ JNIEXPORT jobject JNICALL Java_com_kbox_runtime_VmpInterpreterNative_execute(
     if (stack==NULL || locals==NULL) return NULL;
     (*env)->DeleteLocalRef(env, objCls);
 
-    /* ---- load locals: instance first, then args ---- */
+    /* ---- load locals: instance first, then args ----
+     * KBX-VMP-01: translated code uses ORIGINAL JVM slot numbers, where
+     * long/double occupy TWO consecutive slots. Advance li by the argument's
+     * category width: boxed Long/Double are the only 2-slot runtime types. */
     int li = 0;
     if (instance != NULL){
         (*env)->SetObjectArrayElement(env, locals, li++, instance);
@@ -1350,6 +1432,15 @@ JNIEXPORT jobject JNICALL Java_com_kbox_runtime_VmpInterpreterNative_execute(
         for (jsize i=0;i<na;i++){
             jobject a = (*env)->GetObjectArrayElement(env, args, i);
             (*env)->SetObjectArrayElement(env, locals, li++, a);
+            if (a != NULL){
+                jclass lc = (*env)->GetObjectClass(env, a);
+                if (lc != NULL){
+                    jboolean isLong  = g_ids.longCls  ? (*env)->IsSameObject(env, lc, g_ids.longCls)  : JNI_FALSE;
+                    jboolean isDouble= g_ids.doubleCls? (*env)->IsSameObject(env, lc, g_ids.doubleCls): JNI_FALSE;
+                    (*env)->DeleteLocalRef(env, lc);
+                    if (isLong || isDouble) li++;
+                }
+            }
             (*env)->DeleteLocalRef(env, a);
         }
     }

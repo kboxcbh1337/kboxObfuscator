@@ -378,8 +378,14 @@ public final class TypeConfusionObfuscator {
     /** Replace {@code INVOKESTATIC owner name ()I} with a reflection call. */
     private boolean relayReflectStatic(MethodNode mn, MethodInsnNode mi) {
         LabelNode after = new LabelNode();
+        // KBX-STR-11: JVMS static resolution walks the superclass chain, but
+        // Class.getDeclaredMethod only searches the receiver class — a call site
+        // targeting an INHERITED static method would throw NoSuchMethodException
+        // at runtime. Resolve the declaring class through the graph's superName
+        // chain at build time and reflect against THAT class instead.
+        String forNameOwner = resolveStaticDeclaringClass(mi.owner, mi.name);
         InsnList r = new InsnList();
-        r.add(new LdcInsnNode(mi.owner.replace('/', '.')));
+        r.add(new LdcInsnNode(forNameOwner.replace('/', '.')));
         r.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/Class",
                 "forName", "(Ljava/lang/String;)Ljava/lang/Class;", false));
         r.add(new LdcInsnNode(mi.name));
@@ -405,6 +411,33 @@ public final class TypeConfusionObfuscator {
         mn.instructions.insert(mi, r);
         mn.instructions.remove(mi);
         return true;
+    }
+
+    /**
+     * KBX-STR-11: walk the {@code superName} chain of {@code owner} inside the
+     * class graph and return the internal name of the class that actually
+     * declares a static method {@code name} with descriptor {@code ()I}. Falls
+     * back to {@code owner} when the chain leaves the graph or declares nothing
+     * (best-effort — mirrors JVMS resolution as far as the graph allows).
+     */
+    private String resolveStaticDeclaringClass(String owner, String name) {
+        String cur = owner;
+        int depth = 0;
+        while (cur != null && graph.getClasses().containsKey(cur) && depth++ < 64) {
+            ClassNode c = graph.getClasses().get(cur);
+            boolean declares = false;
+            for (MethodNode m : c.methods) {
+                if (m.name.equals(name) && m.desc.equals("()I")
+                        && (m.access & Opcodes.ACC_STATIC) != 0
+                        && (m.access & Opcodes.ACC_PRIVATE) == 0) {
+                    declares = true;
+                    break;
+                }
+            }
+            if (declares) return cur;
+            cur = c.superName;
+        }
+        return owner;
     }
 
     // ------------------------------------------------------------------

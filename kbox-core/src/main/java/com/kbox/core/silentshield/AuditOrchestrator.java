@@ -156,7 +156,12 @@ public final class AuditOrchestrator {
         void apply(AuditFinding f, ProtectionAction action) {
             switch (action) {
                 case KEEP_CLASS:
-                    if (!f.owner.isEmpty()) keepClasses.add(f.owner);
+                    // PL-04: when the finding names an explicit target class
+                    // (e.g. the Class.forName load target), pin THAT class —
+                    // pinning f.owner would keep the caller and leave the
+                    // target free to be renamed (the exact bug this fixes).
+                    String keepTarget = !f.targetClass.isEmpty() ? f.targetClass : f.owner;
+                    if (!keepTarget.isEmpty()) keepClasses.add(keepTarget);
                     break;
                 case KEEP_MEMBER:
                     if (!f.owner.isEmpty() && !f.member.isEmpty()) {
@@ -741,10 +746,16 @@ public final class AuditOrchestrator {
                     if (mi.owner.equals("java/lang/Class") && "forName".equals(mi.name)) {
                         String cls = prevLdcString(ins);
                         if (cls != null) {
-                            out.add(new AuditFinding("REFLECTION_FOR_NAME", cn.name, "", RiskLevel.HIGH,
-                                    ProtectionAction.KEEP_CLASS,
+                            // PL-04: the class that must KEEP its name is the
+                            // forName TARGET, not the caller. owner stays the
+                            // caller (audit context); targetClass carries the
+                            // load target so ActionSink pins the right class.
+                            String targetInternal = cls.replace('.', '/');
+                            out.add(new AuditFinding("REFLECTION_FOR_NAME", cn.name, "",
+                                    RiskLevel.HIGH, ProtectionAction.KEEP_CLASS,
                                     "Class.forName(\"" + cls + "\") in " + cn.name + "." + mn.name,
-                                    "keep class " + cls.replace('.', '/') + " so dynamic load survives renaming"));
+                                    "keep class " + targetInternal + " so dynamic load survives renaming",
+                                    targetInternal));
                         }
                     } else if (mi.owner.equals("java/lang/Class")
                             && (mi.name.equals("getDeclaredMethod") || mi.name.equals("getMethod")

@@ -144,7 +144,7 @@ public final class LicVerifier {
             byte[] secret = new byte[32];
             di.readFully(secret);
 
-            // ② hardware bind (anti-transfer)
+            // ② fingerprint bind (anti-transfer; portable seed — see class javadoc)
             if (bound == 1 && devFp != null) {
                 byte[] cur = HardwareKeyRing.fingerprint();
                 if (!constantTimeEq(hex(cur), devFp)) return fail("hardware mismatch");

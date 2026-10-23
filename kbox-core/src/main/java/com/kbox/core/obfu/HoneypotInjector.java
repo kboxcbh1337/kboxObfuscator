@@ -3,8 +3,11 @@ package com.kbox.core.obfu;
 import com.kbox.core.analysis.ClassGraph;
 import com.kbox.core.config.ProtectionConfig;
 import com.kbox.core.log.KBoxLog;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.util.CheckClassAdapter;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
@@ -18,6 +21,8 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -71,6 +76,9 @@ public final class HoneypotInjector {
         for (int i = 0; i < count; i++) {
             String internal = "com/kbox/honey/_h" + randomName(12);
             ClassNode cn = buildBait(internal);
+            // Self-check NOW: packaging-time COMPUTE_FRAMES would silently drop
+            // an invalid bait class while this pass still logs "injected".
+            verifyBait(cn);
             graph.getClasses().put(internal, cn);
             // COMPUTE_FRAMES will regenerate stale StackMapTable for these bodies.
             graph.markCfModified(internal);
@@ -247,9 +255,12 @@ public final class HoneypotInjector {
         hk.add(new org.objectweb.asm.tree.IincInsnNode(1, 1));
         hk.add(new JumpInsnNode(Opcodes.GOTO, loopTop));
         hk.add(done);
-        // return new String(c);
+        // return new String(c) — via String.valueOf([C): an INVOKESPECIAL <init>
+        // here would pop the char[] as the uninitialized "this" reference
+        // (missing NEW String + DUP), which is illegal bytecode and made every
+        // bait class fail verification and get silently dropped.
         hk.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        hk.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/String", "<init>", "([C)V", false));
+        hk.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/String", "valueOf", "([C)Ljava/lang/String;", false));
         hk.add(new InsnNode(Opcodes.ARETURN));
         hook.maxStack = 6;
         hook.maxLocals = 2;
@@ -263,5 +274,17 @@ public final class HoneypotInjector {
         else if (v >= Byte.MIN_VALUE && v <= Byte.MAX_VALUE) l.add(new IntInsnNode(Opcodes.BIPUSH, v));
         else if (v >= Short.MIN_VALUE && v <= Short.MAX_VALUE) l.add(new IntInsnNode(Opcodes.SIPUSH, v));
         else l.add(new LdcInsnNode(v));
+    }
+
+    /** Data-flow-verify a synthetic bait class; throws (loudly) on invalid body. */
+    private static void verifyBait(ClassNode cn) {
+        ClassWriter cw = new ClassWriter(0);
+        cn.accept(cw);
+        StringWriter sw = new StringWriter();
+        CheckClassAdapter.verify(new ClassReader(cw.toByteArray()), false, new PrintWriter(sw));
+        if (sw.getBuffer().length() > 0) {
+            throw new IllegalStateException("honeypot bait " + cn.name
+                    + " failed bytecode verification:\n" + sw);
+        }
     }
 }

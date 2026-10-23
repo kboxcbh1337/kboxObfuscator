@@ -38,6 +38,8 @@ public final class ConfigLoader {
         if (file == null || !Files.exists(file)) {
             return cfg; // empty / defaults
         }
+        java.util.List<String> errors = new java.util.ArrayList<>();
+        java.util.List<String> normalizedKeys = new java.util.ArrayList<>();
         try (BufferedReader r = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             String line;
             int ln = 0;
@@ -60,20 +62,70 @@ public final class ConfigLoader {
                 // like hex secrets) are left intact when not spaced.
                 int ci = indexOfInlineComment(t);
                 String body = (ci < 0) ? t : t.substring(0, ci);
+                // PL-12: ProGuard-style keys ("-keep class Foo { *; }") were
+                // treated as unknown keys and silently dropped — the CLI accepts
+                // them, the config file must too. Strip the leading '-' and, for
+                // the space-separated ProGuard form (no '='), split key/value at
+                // the first whitespace.
+                if (body.startsWith("-")) {
+                    int sp = body.indexOf(' ');
+                    if (body.indexOf('=') < 0 && sp > 0) {
+                        String key = body.substring(1, sp).trim();
+                        String val = body.substring(sp + 1).trim();
+                        normalizedKeys.add(key);
+                        apply(cfg, key, val, ln, errors);
+                        continue;
+                    }
+                    // '='-form with a leading dash: just normalize the key.
+                    int eqD = body.indexOf('=');
+                    if (eqD > 0) {
+                        body = body.substring(1, eqD).trim() + body.substring(eqD);
+                        normalizedKeys.add(body.substring(0, body.indexOf('=')).trim());
+                    }
+                }
                 int eq = body.indexOf('=');
                 if (eq < 0) {
                     throw new KBoxException("Config line " + ln + " has no '=': " + line);
                 }
                 String key = body.substring(0, eq).trim();
                 String val = body.substring(eq + 1).trim();
-                apply(cfg, key, val);
+                apply(cfg, key, val, ln, errors);
             }
+        } catch (java.io.IOException io) {
+            throw io;
+        }
+        // PL-13: aggregate every (line, key, value) parse error and FAIL the
+        // load. A typo like `encryptStrings = ture` previously parsed as
+        // false and silently switched the protection off — for an obfuscator,
+        // silently-weak output is the worst possible failure mode.
+        if (!errors.isEmpty()) {
+            StringBuilder msg = new StringBuilder("Invalid configuration in "
+                    + file.getFileName() + " (" + errors.size() + " error(s)):");
+            for (String e : errors) msg.append("\n  - ").append(e);
+            throw new KBoxException(msg.toString());
+        }
+        if (!normalizedKeys.isEmpty()) {
+            com.kbox.core.log.KBoxLog.warn("config", "Normalized " + normalizedKeys.size()
+                    + " ProGuard-style key(s) (leading '-' stripped): " + normalizedKeys);
         }
         // Ensure entry points are kept (they hold main()/SPI bootstrap).
         for (String ep : cfg.getEntryPoints()) {
             cfg.getKeepPrefixes().add(ep);
         }
         return cfg;
+    }
+
+    private static void apply(ProtectionConfig cfg, String key, String val, int ln,
+                              java.util.List<String> errors) {
+        try {
+            apply(cfg, key, val);
+        } catch (KBoxException e) {
+            errors.add("line " + ln + ", key '" + key + "', value '" + val + "': " + e.getMessage());
+        } catch (NumberFormatException e) {
+            errors.add("line " + ln + ", key '" + key + "', value '" + val
+                    + "': not a valid integer");
+        }
+        // Other RuntimeExceptions are genuine bugs — propagate.
     }
 
     private static void apply(ProtectionConfig cfg, String key, String val) {
@@ -177,6 +229,9 @@ public final class ConfigLoader {
             case "flattenerMaxInsns": case "flattenerMax": cfg.setFlattenerMaxInsns(Integer.parseInt(val)); break;
             case "stringEncryptionStrength": cfg.setStringEncryptionStrength(Integer.parseInt(val)); break;
             case "mbaRewrite": cfg.setMbaRewrite(intVal(val, 0)); break;
+            case "sedVx": cfg.setSedVx(intVal(val, 0)); break;
+            case "sedVxMaxSlices": cfg.setSedVxMaxSlices(intVal(val, 200)); break;
+            case "sedVxBudget": cfg.setSedVxBudget(intVal(val, 6)); break;
             case "jnicEplDriven": cfg.setJnicEplDriven(bool(val)); break;
             case "failOnNativeError": cfg.setFailOnNativeError(bool(val)); break;
             case "nativeCoverage": cfg.setJnicFullCoverage(val.trim().equalsIgnoreCase("full")); break;
@@ -237,12 +292,22 @@ public final class ConfigLoader {
         }
     }
 
+    /** PL-13: strict boolean parse — garbage now throws (aggregated by load)
+     *  instead of silently evaluating to false and switching protection off. */
     private static boolean bool(String v) {
-        return "true".equalsIgnoreCase(v) || "1".equals(v) || "yes".equalsIgnoreCase(v);
+        if ("true".equalsIgnoreCase(v) || "1".equals(v) || "yes".equalsIgnoreCase(v)) return true;
+        if ("false".equalsIgnoreCase(v) || "0".equals(v) || "no".equalsIgnoreCase(v)) return false;
+        throw new KBoxException("not a valid boolean (expected true/false/1/0/yes/no)");
     }
 
+    /** PL-13: strict integer parse — garbage now throws (aggregated by load)
+     *  instead of silently falling back to the default. */
     private static int intVal(String v, int dflt) {
-        try { return Integer.parseInt(v.trim()); } catch (Exception e) { return dflt; }
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (Exception e) {
+            throw new KBoxException("not a valid integer (default would be " + dflt + ")");
+        }
     }
 
     /**

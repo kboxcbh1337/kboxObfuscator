@@ -99,21 +99,71 @@ public final class DesktopGui {
         static final Color CONSOLE = new Color(0x080C11);
     }
 
-    private static final Font UI = pickFont("Segoe UI", "Microsoft YaHei UI", Font.SANS_SERIF);
-    private static final Font UI_BOLD = UI.deriveFont(Font.BOLD);
-    private static final Font MONO = pickFont("Cascadia Mono", "Consolas", Font.MONOSPACED);
+    /** 用于字形覆盖检测的中文探针。 */
+    private static final String CJK_PROBE = "\u4e2d\u6587\u6d4b\u8bd5";
 
-    private static Font pickFont(String first, String second, String fallback) {
+    /**
+     * UI 字体：必须优先选择真正包含中文字形的字体。
+     * Swing/AWT 不会像 Windows GDI 那样做 font-linking，选了不含 CJK 的
+     * Latin 字体（如 Segoe UI / Cascadia Mono / Consolas）时中文会渲染成
+     * 口口（tofu）。这里用 {@link Font#canDisplayUpTo} 逐个校验字形覆盖。
+     */
+    private static final Font UI = pickCjkFont(new String[]{
+            "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+            "Noto Sans CJK SC", "Source Han Sans SC", "Segoe UI"
+    }, Font.SANS_SERIF);
+    private static final Font UI_BOLD = UI.deriveFont(Font.BOLD);
+    /** 等宽字体：优先中文等宽族，其次逻辑 Monospaced（复合字体，CJK 走 fallback）。 */
+    private static final Font MONO = pickMonoFont();
+
+    /**
+     * 等宽字体选择：真·中文等宽字体稀缺（本机常见只有 NSimSun/SimSun，
+     * 且不一定安装）。逻辑字体 {@code Monospaced} 是复合字体，拉丁字符保持
+     * 等宽，缺失的 CJK 字形由 fallback 链补足，是控制台最稳妥的选择。
+     */
+    private static Font pickMonoFont() {
         String[] all = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
                 .getAvailableFontFamilyNames();
-        for (String want : new String[] { first, second }) {
-            for (String f : all) {
-                if (f.equalsIgnoreCase(want)) {
-                    return new Font(f, Font.PLAIN, 13);
-                }
-            }
+        for (String want : new String[]{"Sarasa Mono SC", "Noto Sans Mono CJK SC",
+                "NSimSun", "SimSun"}) {
+            String family = findFamily(all, want);
+            if (family == null) continue;
+            Font f = new Font(family, Font.PLAIN, 13);
+            if (f.canDisplayUpTo(CJK_PROBE) < 0) return f;
         }
-        return new Font(fallback, Font.PLAIN, 13);
+        Font logical = new Font(Font.MONOSPACED, Font.PLAIN, 13);
+        if (logical.canDisplayUpTo(CJK_PROBE) < 0) return logical;
+        return pickCjkFont(new String[]{"Microsoft YaHei UI", "Microsoft YaHei",
+                "Cascadia Mono", "Consolas"}, Font.MONOSPACED);
+    }
+
+    /**
+     * 选择第一个「已安装且能显示中文」的字体族；都不满足时退回逻辑字体
+     * （逻辑字体是复合字体，带 fallback 链），最后兜底扫描全部已安装字体。
+     */
+    private static Font pickCjkFont(String[] candidates, String fallback) {
+        String[] all = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
+                .getAvailableFontFamilyNames();
+        for (String want : candidates) {
+            String family = findFamily(all, want);
+            if (family == null) continue;
+            Font f = new Font(family, Font.PLAIN, 13);
+            if (f.canDisplayUpTo(CJK_PROBE) < 0) return f;
+        }
+        Font logical = new Font(fallback, Font.PLAIN, 13);
+        if (logical.canDisplayUpTo(CJK_PROBE) < 0) return logical;
+        for (String family : all) {
+            Font f = new Font(family, Font.PLAIN, 13);
+            if (f.canDisplayUpTo(CJK_PROBE) < 0) return f;
+        }
+        return logical;
+    }
+
+    private static String findFamily(String[] all, String want) {
+        for (String f : all) {
+            if (f.equalsIgnoreCase(want)) return f;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
@@ -182,6 +232,20 @@ public final class DesktopGui {
         UIManager.put("Tree.selectionForeground", C.TEXT);
         UIManager.put("Tree.background", C.SIDEBAR);
         UIManager.put("Tree.foreground", C.TEXT);
+        // 标准组件（菜单/对话框/文件选择器/表格/提示条等）不走自绘路径，
+        // 必须显式覆盖 LAF 默认字体，否则中文会回落到无 CJK 字形的默认面。
+        String[] fontKeys = {
+                "Label.font", "Button.font", "ToggleButton.font", "CheckBox.font",
+                "RadioButton.font", "ComboBox.font", "Menu.font", "MenuItem.font",
+                "CheckBoxMenuItem.font", "RadioButtonMenuItem.font", "PopupMenu.font",
+                "ToolBar.font", "ToolTip.font", "Table.font", "TableHeader.font",
+                "Tree.font", "List.font", "TextField.font", "TextArea.font",
+                "TextPane.font", "EditorPane.font", "PasswordField.font",
+                "FormattedTextField.font", "Spinner.font", "TitledBorder.font",
+                "OptionPane.messageFont", "OptionPane.buttonFont",
+                "InternalFrame.titleFont", "TabbedPane.font"
+        };
+        for (String k : fontKeys) UIManager.put(k, UI);
 
         frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         frame.setMinimumSize(new Dimension(1180, 760));

@@ -6,7 +6,8 @@ package com.kbox.runtime;
  * <p>Exposes two atomic operations implemented in C ({@code kbox_vmp_crypto.c}):
  * <ul>
  *   <li>{@link #hkdfSha256(byte[], byte[], byte[], int)} — byte-for-byte identical
- *       to {@code HardwareKeyRing.hkdfSha256(...)} (RFC 5869), run in native code
+ *       to {@code HardwareKeyRing.hkdfSha256(...)} (a KDF with RFC-5869-style
+ *       expand but a NON-RFC extract step; see that javadoc), run in native code
  *       so the master/per-run key derivation never has to materialise the PRK on
  *       the Java heap.</li>
  *   <li>{@link #decryptByteAt(byte[], int, byte[])} — decrypts a single byte of a
@@ -107,10 +108,11 @@ public final class NativeCrypto {
     }
 
     /**
-     * Native HKDF-SHA256 (RFC 5869) — byte-identical to
-     * {@link HardwareKeyRing#hkdfSha256(byte[], byte[], String, int)} where the
-     * {@code info} string is its UTF-8 bytes. Returns {@code null} if the native
-     * lib is unavailable (caller falls back to the Java implementation).
+     * Native KDF-SHA256 (RFC-5869-style expand, NON-RFC extract — mirrors
+     * {@link HardwareKeyRing#hkdfSha256(byte[], byte[], String, int)} EXACTLY, see
+     * that javadoc) where the {@code info} string is its UTF-8 bytes. Returns
+     * {@code null} if the native lib is unavailable (caller falls back to the Java
+     * implementation).
      */
     public static byte[] hkdfSha256(byte[] ikm, byte[] salt, byte[] info, int len) {
         if (!available()) return null;

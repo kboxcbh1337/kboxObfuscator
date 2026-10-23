@@ -7,42 +7,44 @@ import java.security.MessageDigest;
  * Runtime derivation of the per-blob ChaCha20 key for native-library containers
  * ({@code native.bin} / {@code jnic.bin} / {@code vmp.bin} / {@code native-crypto.bin}).
  *
- * <p><b>KEY 出域 / hardware-rooted seed:</b> the old design baked a fixed, obscured
+ * <p><b>KEY 出域 / per-build portable seed:</b> the old design baked a fixed, obscured
  * per-domain {@code DOMAIN_BASE} constant into the class constant pool, so every
  * domain seed was statically recoverable by reverse-engineering a single jar (the
- * evaluation's "密钥全部静态可派生 — 无保密因子" finding). This class removes that
- * static base entirely. Each domain seed is now computed at <em>first use</em> as
+ * evaluation's "密钥全部静态可派生 — 无保密因子" finding). The static base constant is
+ * gone. Each domain seed is now computed at <em>first use</em> as
  *
  * <pre>
- *   domainSeed = SHA-256( fingerprint() || externalToken() || "kbnl-v3/domain/"+domain )
+ *   domainSeed = SHA-256( fingerprint() || externalToken() || "kbnl-v4/domain/"+domain )
  * </pre>
  *
- * where {@code fingerprint()} is {@link HardwareKeyRing#fingerprint()} — a hardware
- * factor digest that is <em>deterministic on the current host</em> (subprocess-free:
- * OS/arch/CPUs/MAC/boot-disk). There is no base constant left in the constant pool:
- * an attacker holding the jar still cannot derive the key without first producing the
- * host's hardware factor (or solving the environment token).</p>
+ * where {@code fingerprint()} is {@link HardwareKeyRing#fingerprint()} — a digest of
+ * the <b>per-build portable seed</b> the packager injects into the product
+ * ({@code META-INF/kbox/seed.bin}). Hardware binding was removed (2026-09-05): the
+ * same keys re-derive on every host, so build↔run agreement holds machine-free
+ * (KBX-NAT-15: earlier javadoc wrongly advertised a hardware factor here).</p>
  *
  * <p><b>外部 token (opt-in):</b> an operator can additionally inject a secret token at
  * <em>both</em> pack time and run time via system property {@code kbox.keystoken} or
  * env {@code KBOX_KEYS_TOKEN}. It is mixed into every domain seed as a second factor.
- * When absent the derivation reduces to hardware fingerprint + domain tag, so the
- * existing pack→run workflow still works unchanged on the build machine. Because the
- * hardware factor and any token are inputs to the same SHA-256, build-time
+ * When absent the derivation reduces to portable build seed + domain tag, so the
+ * existing pack→run workflow still works unchanged. Because the build seed and any
+ * token are inputs to the same SHA-256, build-time
  * {@link com.kbox.core.jnic.NativePacker} and the run-time decryptor agree on the
- * identical key on a given host.</p>
+ * identical key on any host.</p>
  *
  * <p><b>单点分体 (interpreter/dispersion):</b> every blob family still derives a
  * <em>distinct</em> seed (distinct domain tag + per-domain cache), so no single
  * derivation unlocks all four containers. The salt in the blob header is still mixed
  * at {@link #derive} so each artifact additionally carries per-blob randomness.</p>
  *
- * <p>Honest ceiling: because each jar is self-contained and the target host's factors
- * are observable at run time, a determined attacker with that exact hardware present
- * can re-derive the domain seeds. This removes the <em>free</em> static extraction and
- * the "base constant in the constant pool" trunk-key, adds a hardware-binding second
- * factor, and preserves cross-domain dispersion. The remaining static root (hardware
- * factor) is what the "壳层 / PE shell" track further hardens at the native layer.</p>
+ * <p>Honest ceiling (KBX-NAT-15 / audit R1): each jar is self-contained and the
+ * portable seed travels <em>inside</em> it, so a determined attacker holding the jar
+ * can re-derive the domain seeds — this root is a per-build randomization +
+ * dispersion measure, NOT an external key-keeping factor. Single-machine
+ * distribution without a license file or server cannot keep the master out of the
+ * artifact; stronger roots are an architecture decision (audit R1), not a comment
+ * fix. What this design does buy: no constant unlocks all builds, every build
+ * carries a fresh tag+seed, and cross-domain dispersion is preserved.</p>
  */
 public final class KbnlKey {
 
@@ -69,18 +71,19 @@ public final class KbnlKey {
     /**
      * External secret factor, injected at pack AND run time. Read from system
      * property {@code kbox.keystoken} else env {@code KBOX_KEYS_TOKEN}. Absent
-     * (null) → derivation reduces to hardware fingerprint + domain tag only, so the
+     * (null) → derivation reduces to portable build seed + domain tag only, so the
      * existing no-token pack→run workflow keeps working. There is deliberately NO
      * static fallback literal here.
      *
      * <p><b>强门控 (反「随手改」, 下策止血):</b> when {@code -Dkbox.requiretoken=true}
      * or env {@code KBOX_REQUIRE_TOKEN=1} is set, an absent/empty token is a hard
      * failure ({@link IllegalStateException}) instead of silently degrading to the
-     * hardware-factor-only derivation. This closes the "external token defaults to
+     * seed-only derivation. This closes the "external token defaults to
      * empty string → attacker pays zero cost" gap. Honest limit: the operator token
      * must also be derivable from the jar itself to keep build↔run agreement, so it
      * only defeats casual tampering, not a determined re-derivation (the real fix for
-     * that is the TPM/hardware track; see docs/SECURITY-HARDENING.md). Off by default
+     * that is an external key root — license file / server token; see
+     * docs/SECURITY-HARDENING.md). Off by default
      * so the pre-existing no-token workflow keeps working unchanged.
      */
     private static volatile byte[] _etc;
@@ -178,10 +181,11 @@ public final class KbnlKey {
     /**
      * One derived 32-byte seed per domain tag, assembled lazily on first use and
      * cached in a small bounded map. No base constant exists — the seed is
-     * hardware-rooted (+ optional external token) + the per-build random tag, so
-     * the same tag always yields the same seed on a given host (build↔run
-     * agreement), while a fresh random tag on each build de-staticizes the domain.
-     * The cache is capped to avoid unbounded growth from an enumeration flood.
+     * rooted in the per-build portable seed (+ optional external token) + the
+     * per-build random tag, so the same tag always yields the same seed on any
+     * host (build↔run agreement), while a fresh random tag on each build
+     * de-staticizes the domain. The cache is capped to avoid unbounded growth
+     * from an enumeration flood.
      */
     private static final int _MCT = 64;
     private static final java.util.HashMap<Integer, byte[]> _cs = new java.util.HashMap<>();
@@ -326,7 +330,7 @@ public final class KbnlKey {
     // A3 会话一次性密钥根 (per-session ephemeral root, extended to all blobs).
     //
     // Hard constraint (docs/SECURITY-HARDENING.md): the KBNL blob key — derived by
-    // derive(domainTag, blobSalt) from the hardware factor + stable tag — is baked at
+    // derive(domainTag, blobSalt) from the per-build portable seed + stable tag — is baked at
     // pack time and MUST re-derive identically at run time, so per-run entropy can
     // never enter THAT key. A3 therefore adds a SEPARATE session layer on top of the
     // stable region, never mixed into a domain seed:

@@ -122,22 +122,28 @@ public final class VmpRuntimeProtector {
             graph.getClasses().put(internal, cn);
             loaded++;
         }
-        if (loaded > 0) {
-            // Register decryption methods for VMP translation.
-            for (String spec : DECRYPT_METHODS) {
-                if (needsStringDecryptor && spec.startsWith("com.kbox.runtime.KBoxRuntime#")) {
-                    cfg.getVmpMethods().add(spec);
-                }
-                if (needsClassDecryptor && spec.contains("decryptClass")) {
-                    cfg.getVmpMethods().add(spec);
-                }
-                if (needsResourceDecryptor && spec.contains("decryptResource")) {
-                    cfg.getVmpMethods().add(spec);
-                }
+        // KBX-audit "补" (VmpRuntimeProtector:125): registration used to be gated
+        // on loaded > 0, which silently skipped it on self-protection builds where
+        // the runtime classes were ALREADY in the graph (loaded == 0). Register per
+        // spec whenever the owning class exists in the graph (freshly loaded or
+        // not); log visibly when a needed decryptor's owner is missing.
+        int registered = 0;
+        for (String spec : DECRYPT_METHODS) {
+            String ownerInternal = spec.substring(0, spec.indexOf('#')).replace('.', '/');
+            if (!graph.getClasses().containsKey(ownerInternal)) {
+                KBoxLog.warn(TAG, "VMP runtime decryptor owner missing from graph: "
+                        + ownerInternal + " (" + spec + " NOT registered)");
+                continue;
             }
-            KBoxLog.info(TAG, "Loaded " + loaded + " runtime decryption classes for VMP; "
-                    + "registered " + cfg.getVmpMethods().size() + " VMP methods");
+            boolean add =
+                    (needsStringDecryptor && spec.startsWith("com.kbox.runtime.KBoxRuntime#"))
+                    || (needsClassDecryptor && spec.contains("decryptClass"))
+                    || (needsResourceDecryptor && spec.contains("decryptResource"));
+            if (add && cfg.getVmpMethods().add(spec)) registered++;
         }
+        KBoxLog.info(TAG, "VMP runtime protection: loaded=" + loaded + " runtime class(es),"
+                + " registered=" + registered + "/" + DECRYPT_METHODS.length
+                + " decryptor spec(s); total vmpMethods=" + cfg.getVmpMethods().size());
         return loaded;
     }
 

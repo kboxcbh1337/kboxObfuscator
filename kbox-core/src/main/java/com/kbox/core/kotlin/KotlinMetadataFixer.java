@@ -25,7 +25,6 @@ import org.objectweb.asm.tree.ClassNode;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -68,7 +67,7 @@ public final class KotlinMetadataFixer {
     private final ProtectionConfig cfg;
     private final java.util.concurrent.atomic.AtomicInteger fixedClasses =
             new java.util.concurrent.atomic.AtomicInteger();
-    private int fixedModules;
+    private int skippedModules;
 
     public KotlinMetadataFixer(ClassGraph graph, ProtectionConfig cfg) {
         this.graph = graph;
@@ -81,8 +80,8 @@ public final class KotlinMetadataFixer {
             fixClassMetadata(mapping);
             fixModuleFiles(mapping);
         }
-        KBoxLog.info(TAG, "Fixed @Metadata on " + fixedClasses.get() + " classes, "
-                + fixedModules + " .kotlin_module files");
+        KBoxLog.info(TAG, "Fixed @Metadata on " + fixedClasses.get() + " classes; "
+                + skippedModules + " .kotlin_module file(s) left untouched (binary protobuf)");
     }
 
     @SuppressWarnings("unchecked")
@@ -463,29 +462,25 @@ public final class KotlinMetadataFixer {
     // ------------------------------------------------------------------
 
     private void fixModuleFiles(Mapping mapping) {
-        Map<String, byte[]> updated = new java.util.LinkedHashMap<>();
+        int skipped = 0;
         for (Map.Entry<String, byte[]> e : graph.getResources().entrySet()) {
-            String path = e.getKey();
-            if (!path.endsWith(KOTLIN_MODULE_SUFFIX)) continue;
-            String text = new String(e.getValue(), StandardCharsets.UTF_8);
-            String rewritten = rewriteAllClassRefs(text, mapping);
-            if (!rewritten.equals(text)) {
-                updated.put(path, rewritten.getBytes(StandardCharsets.UTF_8));
-                fixedModules++;
-            }
+            if (!e.getKey().endsWith(KOTLIN_MODULE_SUFFIX)) continue;
+            skipped++;
         }
-        updated.forEach((k, v) -> graph.getResources().put(k, v));
-    }
-
-    private String rewriteAllClassRefs(String text, Mapping mapping) {
-        String result = text;
-        for (Map.Entry<String, String> e : mapping.getClassMap().entrySet()) {
-            result = result.replace(e.getKey(), e.getValue());
-            String oldDotted = e.getKey().replace('/', '.');
-            String newDotted = e.getValue().replace('/', '.');
-            result = result.replace(oldDotted, newDotted);
+        if (skipped > 0) {
+            skippedModules = skipped;
+            // .kotlin_module files are kotlinx protobuf binaries (length-prefixed
+            // fields), NOT UTF-8 text. A text String.replace pass would rewrite the
+            // protobuf payload without fixing its length prefixes and would mangle
+            // any non-UTF-8 byte to U+FFFD — the file is then rejected by
+            // KotlinModuleMetadata.read on the consumer side. kotlinx-metadata-jvm
+            // ships no public writer for module files, so there is no safe rewrite;
+            // leave the bytes untouched and say so. This costs Kotlin module-level
+            // reflection (package facades) on renamed packages, but class-level
+            // reflection keeps working via fixClassMetadata above.
+            KBoxLog.warn(TAG, "Skipped rewriting " + skipped + " .kotlin_module file(s): "
+                    + "binary protobuf, text replacement would corrupt them");
         }
-        return result;
     }
 
     // ------------------------------------------------------------------

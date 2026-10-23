@@ -30,7 +30,6 @@ import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Conservative control-flow flattener. Rewrites an eligible method's body into a
@@ -86,7 +85,14 @@ final class Flattener {
         else KBoxLog.debug(TAG, msg);
     }
 
-    static boolean flatten(MethodNode mn, int strength) {
+    static boolean flatten(MethodNode mn, int strength, String owner) {
+        // KBX-CF-18: the transform-shape randomness (mix constants, pair
+        // draws, fake-key count, block order) comes from a deterministic
+        // stream derived from (buildSeed, pass, class#method) — never from
+        // ThreadLocalRandom — so builds are reproducible per seed and
+        // independent of thread scheduling.
+        java.util.Random rng = com.kbox.core.util.DetRandom.of("cf-flatten",
+                owner + "#" + mn.name + mn.desc);
         int insnSize = mn.instructions.size();
         int branches = countBranches(mn);
         String reason = checkEligibility(mn, strength);
@@ -97,7 +103,17 @@ final class Flattener {
             return false;
         }
         try {
-            int bc = doFlatten(mn, strength);
+            // CF-02 transaction: rewrite a DEEP CLONE; only a clean success is
+            // committed back. doFlatten mutates the instruction list in place,
+            // and an exception mid-way would otherwise leave a half-flattened
+            // body behind (frame-legal but wrong control flow) that ships.
+            MethodNode work = cloneForFlatten(mn);
+            int bc = doFlatten(work, strength, rng);
+            mn.instructions = work.instructions;
+            mn.maxLocals = work.maxLocals;
+            mn.maxStack = work.maxStack;
+            if (work.tryCatchBlocks != null) mn.tryCatchBlocks = work.tryCatchBlocks;
+            if (work.localVariables != null) mn.localVariables = work.localVariables;
             cfLog("      flat " + mn.name + mn.desc
                     + " insn=" + insnSize + "->" + mn.instructions.size()
                     + " blocks=" + bc + " branches=" + branches);
@@ -112,6 +128,44 @@ final class Flattener {
                     + ": " + e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Deep-copies a method body (instructions + labels + handlers + locals
+     * metadata) so the flattener can mutate the copy without corrupting the
+     * original list — instruction nodes carry single-linked next/prev pointers,
+     * so sharing nodes between two InsnLists is impossible.
+     */
+    private static MethodNode cloneForFlatten(MethodNode src) {
+        MethodNode dst = new MethodNode(src.access, src.name, src.desc,
+                src.signature, src.exceptions == null
+                        ? null : src.exceptions.toArray(new String[0]));
+        Map<LabelNode, LabelNode> labelMap = new HashMap<>();
+        for (AbstractInsnNode ins : src.instructions) {
+            if (ins instanceof LabelNode) labelMap.put((LabelNode) ins, new LabelNode());
+        }
+        for (AbstractInsnNode ins : src.instructions) {
+            dst.instructions.add(ins.clone(labelMap));
+        }
+        if (src.tryCatchBlocks != null) {
+            dst.tryCatchBlocks = new ArrayList<>();
+            for (org.objectweb.asm.tree.TryCatchBlockNode t : src.tryCatchBlocks) {
+                dst.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+                        labelMap.get(t.start), labelMap.get(t.end),
+                        labelMap.get(t.handler), t.type));
+            }
+        }
+        if (src.localVariables != null) {
+            dst.localVariables = new ArrayList<>();
+            for (org.objectweb.asm.tree.LocalVariableNode lv : src.localVariables) {
+                dst.localVariables.add(new org.objectweb.asm.tree.LocalVariableNode(
+                        lv.name, lv.desc, lv.signature,
+                        labelMap.get(lv.start), labelMap.get(lv.end), lv.index));
+            }
+        }
+        dst.maxLocals = src.maxLocals;
+        dst.maxStack = src.maxStack;
+        return dst;
     }
 
     // ---- local-slot normalization plan codes ----
@@ -583,7 +637,7 @@ final class Flattener {
         return 0; // unknown instruction: neutral (never reached for valid bytecode)
     }
 
-    private static int doFlatten(MethodNode mn, int strength) {
+    private static int doFlatten(MethodNode mn, int strength, java.util.Random rng) {
         // 条目 31: handler entry labels are leaders reached only by the JVM's
         // exception-dispatch edge — they must never become dispatcher cases.
         java.util.Set<LabelNode> handlerStarts = new java.util.HashSet<>();
@@ -639,45 +693,51 @@ final class Flattener {
             throw new SkipFlatten("local-state merge unsafe");
         }
 
-        // 2. Assign ids (optionally shuffled at strength>=2 so switch cases look random).
+        // 2. Assign ids. No id-list shuffle anymore: KBX-CF-04 physically
+        //    reorders the blocks (reorderBlocks below) and the case keys are
+        //    now nonlinear hashes of random (A, B) pairs, so neither the case
+        //    numbering nor the physical layout leaks the original order.
         Map<AbstractInsnNode, Integer> idOf = new HashMap<>();
-        List<Integer> ids = new ArrayList<>();
-        for (int i = 0; i < leadersRaw.size(); i++) {
+        int nBlocks = leadersRaw.size();
+        for (int i = 0; i < nBlocks; i++) {
             idOf.put(leadersRaw.get(i), i);
-            ids.add(i);
-        }
-        if (strength >= 2) {
-            ThreadLocalRandom r = ThreadLocalRandom.current();
-            for (int i = ids.size() - 1; i > 0; i--) {
-                int j = r.nextInt(i + 1);
-                int t = ids.get(i); ids.set(i, ids.get(j)); ids.set(j, t);
-            }
         }
 
-        // 3. Rewrite each block terminator: jumps become "s1 = id; s2 = mask; goto dispatch".
-        //    Multi-state dispatch: the dispatcher keys on (s1 ^ s2), where s2 is a
-        //    per-block rotation mask. Because s2 is fixed per block, the XOR always
-        //    resolves back to the s1 value the block stored, but the visible case
-        //    values are scrambled (blockId ^ mask) so a decompiler cannot statically
-        //    recognise a fixed case/src transition.
+        // 3. Rewrite each block terminator: jumps become "sA = A_i; sB = B_i;
+        //    goto dispatch". KBX-CF-04: the dispatcher no longer keys on the
+        //    XOR identity (s1 ^ s2 == id), where one pattern match on the
+        //    immediate pair rebuilt the whole CFG. Each block now stores a
+        //    random (A, B) immediate pair and the dispatcher evaluates a
+        //    per-method nonlinear mix  key = M(A, B)  (xor-shift + odd
+        //    multipliers + rotate, constants drawn per method). The immediates
+        //    alone are meaningless — recovering the case->block map statically
+        //    requires emulating M for every pair, and M differs per method.
         LabelNode dispatch = new LabelNode();
-        int stateLocal = mn.maxLocals;
-        int maskLocal = mn.maxLocals + 1;
+        int stateLocal = mn.maxLocals;     // slot A
+        int maskLocal = mn.maxLocals + 1;  // slot B
         mn.maxLocals += 2;
-        // Per-id rotation mask. mask[i] is derived deterministically so the build
-        // is reproducible run-to-run.
-        Map<Integer, Integer> idMask = new HashMap<>();
-        int seed = 0x9E3779B9;
+        // Per-method mix parameters. MUST stay in exact sync with mixEval().
+        int mixR1 = 1 + rng.nextInt(31);
+        int mixC1 = rng.nextInt() | 1;   // odd: IMUL stays bijective mod 2^32
+        int mixC2 = rng.nextInt();
+        boolean mixUshr = rng.nextBoolean();
+        int mixR2 = 1 + rng.nextInt(31);
+        int mixC3 = rng.nextInt() | 1;
+        int[] pairA = new int[nBlocks];
+        int[] pairB = new int[nBlocks];
+        int[] keyOf = new int[nBlocks];
         java.util.Set<Integer> usedKeys = new java.util.HashSet<>();
-        for (int i = 0; i < ids.size(); i++) {
-            int mid = ids.get(i);
-            int mask;
+        for (int i = 0; i < nBlocks; i++) {
             int guard = 0;
-            do {
-                mask = Integer.rotateLeft(seed ^ (mid * 0x85EBCA6B), i & 31);
-                guard++;
-            } while (!usedKeys.add(mid ^ mask) && guard < 32);
-            idMask.put(mid, mask);
+            while (!usedKeys.add(mixEval(
+                    pairA[i] = rng.nextInt(), pairB[i] = rng.nextInt(),
+                    mixR1, mixC1, mixC2, mixUshr, mixR2, mixC3))) {
+                if (++guard > 256) {
+                    // n^2 / 2^32 collisions needed to get here — never seen in
+                    // practice; refuse rather than emit a broken switch.
+                    throw new SkipFlatten("state-key space exhausted");
+                }
+            }
         }
         for (int bi = 0; bi < leadersRaw.size(); bi++) {
             AbstractInsnNode blockStart = leadersRaw.get(bi);
@@ -698,8 +758,9 @@ final class Flattener {
                 // predecessor is an unconditional terminator, so this is
                 // unreachable for valid code).
                 if (end != null && !(end instanceof LabelNode && handlerStarts.contains(end))) {
+                    int endId = idOf.get(end);
                     mn.instructions.insertBefore(end, exitStub(stateLocal, maskLocal, dispatch,
-                            idOf.get(end), idMask.get(idOf.get(end))));
+                            pairA[endId], pairB[endId]));
                 }
                 continue;
             }
@@ -708,7 +769,7 @@ final class Flattener {
                 JumpInsnNode g = (JumpInsnNode) term;
                 int targetId = idOf.get(g.label);
                 mn.instructions.insert(term, exitStub(stateLocal, maskLocal, dispatch,
-                        targetId, idMask.get(targetId)));
+                        pairA[targetId], pairB[targetId]));
                 mn.instructions.remove(term);
             } else if (isReturn(top)) {
                 // keep: return exits the state machine.
@@ -720,7 +781,7 @@ final class Flattener {
                 InsnList inverted = new InsnList();
                 inverted.add(new JumpInsnNode(invert(c.getOpcode()), skip));
                 InsnList stub = exitStub(stateLocal, maskLocal, dispatch,
-                        takenId, idMask.get(takenId));
+                        pairA[takenId], pairB[takenId]);
                 // InsnList.getFirst() does NOT unlink the node, so the previous
                 // "while (stub.size() > 0) inverted.add(stub.getFirst())" spun
                 // forever (same node re-added, size never shrank). add(InsnList)
@@ -735,54 +796,51 @@ final class Flattener {
                     Integer ftId = idOf.get(ftLab);
                     if (ftId != null) {
                         mn.instructions.insertBefore(ftLab, exitStub(stateLocal, maskLocal,
-                                dispatch, ftId, idMask.get(ftId)));
+                                dispatch, pairA[ftId], pairB[ftId]));
                     }
                 }
             }
         }
 
-        // 4. Prepend: store entry id+mask; dispatch label; LOOKUPSWITCH on (s1 ^ s2).
-        //    Add fake dispatch entries at strength >= 2 to bloat the switch table
-        //    and confuse static analysis.
-        ThreadLocalRandom rng = ThreadLocalRandom.current();
-        int fakeCount = (strength >= 3) ? rng.nextInt(8, 16) : (strength >= 2 ? rng.nextInt(3, 6) : 0);
+        // 3b. KBX-CF-04: physically shuffle the basic blocks. Every block now
+        //     ends in an explicit state transition (or exits), so the physical
+        //     order carries no control-flow meaning — but only re-order when
+        //     there are no exception handlers, whose label-delimited ranges a
+        //     reorder would tear apart.
+        reorderBlocks(mn, leadersRaw, rng);
+
+        // 4. Prepend: store entry (A, B) pair; dispatch label; LOOKUPSWITCH on
+        //    M(sA, sB). Add fake dispatch entries at strength >= 2 to bloat the
+        //    switch table and confuse static analysis.
+        int fakeCount = (strength >= 3) ? 8 + rng.nextInt(8)
+                : (strength >= 2 ? 3 + rng.nextInt(3) : 0);
         InsnList head = new InsnList();
         // 4a. Local-state normalization (see localInitPlan): gives every slot a
         //     definite verifier type before the dispatcher, so the merge with each
         //     block's real predecessor can never degrade to `top`.
         emitLocalInits(head, initPlan);
-        // The state a block stores before jumping to the dispatcher is idOf(block)
-        // (see every exitStub() call below), so the ENTRY state must be the state of
-        // the first block. It used to be `ids.get(0)`, i.e. an element of the
-        // shuffled id list, which denotes an arbitrary other block whenever the
-        // shuffle ran (strength >= 2).
+        // The state a block stores before jumping to the dispatcher is its own
+        // (A, B) pair (see every exitStub() call above), so the ENTRY state must
+        // be the pair of the first block.
         int entryId = idOf.get(leadersRaw.get(0));
-        pushInt(head, entryId);
+        pushInt(head, pairA[entryId]);
         head.add(new VarInsnNode(Opcodes.ISTORE, stateLocal));
-        pushInt(head, idMask.get(entryId));
+        pushInt(head, pairB[entryId]);
         head.add(new VarInsnNode(Opcodes.ISTORE, maskLocal));
         head.add(dispatch);
-        // Dispatch table: (state ^ mask) -> the block that owns that state.
+        // Dispatch table: M(state, mask) -> the block that owns that pair.
         //
         // Two invariants are mandatory and were both violated before:
         //
-        //  1. Pairing. exitStub() stores `idOf(block)`, so key `id ^ mask[id]` must
-        //     map to the block whose idOf() is `id`. The old code paired
-        //     `ids.get(i)` with `leadersRaw.get(i)`, which only coincides when the
-        //     id shuffle is the identity (strength < 2). At strength >= 2 control
-        //     flow was transferred to an unrelated block.
+        //  1. Pairing. exitStub() stores block i's (A, B) pair, so case key
+        //     keyOf[i] = M(A_i, B_i) must map to block i. Keys and pairs come
+        //     from the same arrays, so the pairing holds by construction.
         //
         //  2. Ordering. ASM's MethodWriter requires LOOKUPSWITCH keys to be
         //     strictly increasing and throws
         //       "The keys must be sorted in increasing order"
-        //     from visitLookupSwitchInsn otherwise. Because the ordering was
-        //     incidental (insertion order of a LinkedHashMap fed by the shuffled id
-        //     list, plus a second batch of fake keys), serialization failed, the
-        //     class had no valid protected form, and the packager rolled the WHOLE
-        //     class back to its untouched original bytes — silently dropping every
-        //     protection for it (observed on F03Ctrl/`tb`: full plaintext strings
-        //     and control flow after rollback). A TreeMap keyed by the final case
-        //     value satisfies both invariants by construction.
+        //     from visitLookupSwitchInsn otherwise. A TreeMap keyed by the final
+        //     case value satisfies both invariants by construction.
         LabelNode def = new LabelNode();
         java.util.TreeMap<Integer, LabelNode> byKey = new java.util.TreeMap<>();
         for (int i = 0; i < leadersRaw.size(); i++) {
@@ -791,19 +849,35 @@ final class Flattener {
             // may target them (the frame there carries the caught exception).
             if (leader instanceof LabelNode && handlerStarts.contains(leader)) continue;
             int id = idOf.get(leader);
-            Integer mask = idMask.get(id);
-            byKey.put(mask != null ? (id ^ mask) : id, (LabelNode) leader);
+            byKey.put(keyOf[id], (LabelNode) leader);
         }
         // Fake entries → default (defensive throw). They must not collide with a
         // real case value, or the real block would become unreachable.
         for (int i = 0; i < fakeCount; i++) {
             int fakeKey;
-            do { fakeKey = rng.nextInt(100, 100000); } while (byKey.containsKey(fakeKey));
+            do { fakeKey = rng.nextInt(); } while (byKey.containsKey(fakeKey));
             byKey.put(fakeKey, def);
         }
         head.add(new VarInsnNode(Opcodes.ILOAD, stateLocal));
         head.add(new VarInsnNode(Opcodes.ILOAD, maskLocal));
+        // KBX-CF-04: per-method nonlinear mix. MUST mirror mixEval() exactly:
+        //   t  = a ^ (b >>> r1)
+        //   t  = t * c1  (+ c2)
+        //   t ^= (ushr ? t >>> r2 : t << r2)
+        //   key = t * c3
+        pushInt(head, mixR1);
+        head.add(new InsnNode(Opcodes.ISHR));
         head.add(new InsnNode(Opcodes.IXOR));
+        pushInt(head, mixC1);
+        head.add(new InsnNode(Opcodes.IMUL));
+        pushInt(head, mixC2);
+        head.add(new InsnNode(Opcodes.IADD));
+        head.add(new InsnNode(Opcodes.DUP));
+        pushInt(head, mixR2);
+        head.add(new InsnNode(mixUshr ? Opcodes.IUSHR : Opcodes.ISHL));
+        head.add(new InsnNode(Opcodes.IXOR));
+        pushInt(head, mixC3);
+        head.add(new InsnNode(Opcodes.IMUL));
         int total = byKey.size();
         int[] keys = new int[total];
         LabelNode[] lbls = new LabelNode[total];
@@ -826,11 +900,72 @@ final class Flattener {
         head.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
                 "java/lang/IllegalStateException", "<init>", "()V", false));
         head.add(new InsnNode(Opcodes.ATHROW)); // unreachable in normal operation
-        // The dispatcher prologue pushes two ints before the switch; the default
-        // block pushes a reference and its dup. Both need two slots.
-        if (mn.maxStack < 2) mn.maxStack = 2;
+        // Dispatcher mix evaluation peaks at 3 operand slots ([a, b, r1]); the
+        // default block pushes a reference and its dup. Keep a 4-slot floor.
+        if (mn.maxStack < 4) mn.maxStack = 4;
         mn.instructions.insertBefore(mn.instructions.getFirst(), head);
         return leadersRaw.size();
+    }
+
+    /**
+     * Build-time mirror of the dispatcher's emitted mix sequence. MUST stay in
+     * exact sync with the instruction sequence emitted in {@link #doFlatten}
+     * (step 4): {@code t = a ^ (b >>> r1); t = t * c1 + c2;
+     * t ^= ushr ? t >>> r2 : t << r2; return t * c3;}.
+     */
+    private static int mixEval(int a, int b, int r1, int c1, int c2,
+                               boolean ushr, int r2, int c3) {
+        int t = a ^ (b >>> r1);
+        t = t * c1 + c2;
+        t ^= ushr ? (t >>> r2) : (t << r2);
+        return t * c3;
+    }
+
+    /**
+     * KBX-CF-04: physically shuffles the basic blocks in the instruction list
+     * so the case order, the original block order and the physical layout are
+     * three unrelated permutations. Safe only when the method has no exception
+     * handlers (handler ranges are label-delimited and a reorder would tear
+     * them apart) and every block ends in an explicit transition — which the
+     * terminator rewrite guarantees. Labels and jump targets are object
+     * references, so the rewrite is order-independent by construction.
+     */
+    private static void reorderBlocks(MethodNode mn, List<AbstractInsnNode> leaders,
+                                      java.util.Random rng) {
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return;
+        int n = leaders.size();
+        if (n < 3) return;
+        Map<AbstractInsnNode, Integer> pos = indexMap(mn);
+        int[] starts = new int[n];
+        for (int i = 0; i < n; i++) {
+            Integer p = pos.get(leaders.get(i));
+            if (p == null) return; // leader missing from the list: skip reorder
+            starts[i] = p;
+        }
+        for (int i = 1; i < n; i++) {
+            if (starts[i] <= starts[i - 1]) return; // not strictly increasing: skip
+        }
+        int total = mn.instructions.size();
+        AbstractInsnNode[] insns = mn.instructions.toArray();
+        Integer[] order = new Integer[n];
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int i = n - 1; i > 0; i--) {
+            int j = rng.nextInt(i + 1);
+            Integer t = order[i]; order[i] = order[j]; order[j] = t;
+        }
+        java.util.List<AbstractInsnNode> ordered = new ArrayList<>(total);
+        for (int i = 0; i < n; i++) {
+            int seg = order[i];
+            int from = starts[seg];
+            int to = (seg + 1 < n) ? starts[seg + 1] : total;
+            for (int k = from; k < to; k++) ordered.add(insns[k]);
+        }
+        // Detach through the InsnList API (remove() clears the node's own
+        // prev/next links); adding a node that is still linked to its old
+        // neighbours leaves a stale `next` pointer and creates a cycle that
+        // makes every later traversal of the list loop forever.
+        for (AbstractInsnNode node : ordered) mn.instructions.remove(node);
+        for (AbstractInsnNode node : ordered) mn.instructions.add(node);
     }
 
     /**
@@ -872,14 +1007,15 @@ final class Flattener {
         return n;
     }
 
-    /** {@code s1 = id; s2 = mask; goto dispatch;} */
+    /** {@code sA = a; sB = b; goto dispatch;} — the dispatcher resolves the
+     *  real case key as M(a, b) (see {@link #mixEval}); the immediates alone
+     *  are meaningless (KBX-CF-04). */
     private static InsnList exitStub(int stateLocal, int maskLocal,
-                                     LabelNode dispatch, int id, int mask) {
+                                     LabelNode dispatch, int a, int b) {
         InsnList l = new InsnList();
-        pushInt(l, id);
+        pushInt(l, a);
         l.add(new VarInsnNode(Opcodes.ISTORE, stateLocal));
-        // s2 = mask so later (s1 ^ s2) == id at the dispatcher.
-        pushInt(l, mask);
+        pushInt(l, b);
         l.add(new VarInsnNode(Opcodes.ISTORE, maskLocal));
         l.add(new JumpInsnNode(Opcodes.GOTO, dispatch));
         return l;

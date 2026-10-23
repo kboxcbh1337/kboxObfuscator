@@ -16,12 +16,14 @@ import java.security.MessageDigest;
  * </pre>
  *
  * <p><b>Hardware binding removed (2026-09-05):</b> this class no longer
- * enumerates MAC / wmic / DMI / ioreg / boot-disk identity. The factor feed
- * is a fixed constant, so every key is identical on every host — a protected
+ * enumerates MAC / wmic / DMI / ioreg / boot-disk identity. The factor feed is
+ * the per-build portable seed (pipeline-injected via {@link #attachBuildSeed},
+ * embedded in the product as {@code META-INF/kbox/seed.bin}; masked constant
+ * fallback when absent), so every key is identical on every host — a protected
  * jar runs on any machine, and the build (obfuscator) JVM and run (product)
- * JVM always agree on the same keys. Per-build randomized-seed injection is a
- * follow-up (the Packager would thread the seed through the blob contract);
- * the constant form guarantees build↔run agreement.
+ * JVM always agree on the same keys. Each build's seed is unique, but it ships
+ * inside the artifact: this is per-build randomization + dispersion, NOT an
+ * external key-keeping factor (audit R1 / KBX-NAT-15).</p>
  *
  * <p>An additional {@link #ephemeralKey()} is derived from the portable seed
  * combined with a per-launch salt (startup time + random). It is intentionally
@@ -192,14 +194,16 @@ public final class HardwareKeyRing {
     }
 
     // ------------------------------------------------------------------
-    //  VMP method-key wrapping (hardware-bound master)
+    //  VMP method-key wrapping (per-build-seed master)
     // ------------------------------------------------------------------
     // A per-method random 32-byte key K encrypts the VM instruction stream. K is
     // NEVER stored bare; it is wrapped (AES-256-GCM) under a master key derived
-    // from THIS machine's hardware feed. Only a host whose hardware computes the
-    // same master can unwrap K; anywhere else the authenicated decrypt fails and
-    // the interpreter silently falls back to a noise method. This replaces the old
-    // bare long $vmpkey constant with a hardware-bound envelope.
+    // from the per-build portable seed (build-injected / seed.bin — machine
+    // independent since hardware binding was removed, 2026-09-05). Every host can
+    // re-derive the same master from the product itself; the envelope's purpose is
+    // to keep K out of the constant pool (replacing the old bare long $vmpkey),
+    // NOT to bind to a machine. (KBX-NAT-15: this section previously claimed a
+    // hardware-bound envelope.)
 
     /** Fixed domain-separation salt; must be byte-identical on build & run JVMs.
      *  XOR-masked so no readable "KBox-VMP-KeyWrap-v1" string rests in the constant pool. */
@@ -254,8 +258,15 @@ public final class HardwareKeyRing {
         }
     }
 
-    /** Public HKDF-SHA256 (RFC 5869 extract+expand) with explicit salt + info.
-     *  Used to derive license-bound sub-keys (e.g. the session key). */
+    /** KDF-SHA256 used for license-bound sub-keys (e.g. the session key).
+     *  <p><b>KBX-NAT-15 naming note:</b> the expand stage follows RFC 5869, but the
+     *  extract stage deliberately deviates — {@code prk = HMAC(key=ikm, salt||ikm)}
+     *  instead of {@code HMAC(key=salt, ikm)}, and an empty salt keeps
+     *  {@code prk = ikm} instead of the RFC's zero-key HMAC. The output is
+     *  therefore NOT RFC 5869; the deviation is kept because the native
+     *  {@code kbox_vmp_crypto.c} mirrors it EXACTLY for build↔run key agreement,
+     *  and both sides must change together (a format-breaking re-key) to adopt the
+     *  real RFC. Do not advertise this as "RFC 5869 HKDF". */
     public static byte[] hkdfSha256(byte[] ikm, byte[] salt, String info, int len) {
         try {
             javax.crypto.Mac mac = javax.crypto.Mac.getInstance(HKDF_ALGO);
@@ -291,7 +302,7 @@ public final class HardwareKeyRing {
         }
     }
 
-    /** License-bound envelope key: HKDF(machineFeed, session, "lic:app.v1", 32).
+    /** License-bound envelope key: KDF(portableSeed, session, "lic:app.v1", 32).
      *  A bogus {@code session} (random key when the license is invalid) yields a
      *  different key from what the publisher signed against, so decryption of
      *  class/stream material produces noise instead of a clean boot. */
@@ -365,7 +376,7 @@ public final class HardwareKeyRing {
     }
 
     // ------------------------------------------------------------------
-    //  HKDF-SHA256 (RFC 5869 extract+expand)
+    //  KDF-SHA256 (RFC-5869-style expand; NON-RFC extract — see hkdfSha256)
     private static byte[] hkdf(byte[] ikm, String info, int length) {
         try {
             javax.crypto.Mac mac = javax.crypto.Mac.getInstance(HKDF_ALGO);

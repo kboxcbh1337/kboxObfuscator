@@ -6,6 +6,7 @@ import com.kbox.core.log.KBoxLog;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 
@@ -54,11 +55,13 @@ public final class JnicOrchestrator {
     /**
      * K-OTP 原生构建种子：只在本次构建的 JNIC 原生库内以常量形式存在。
      * 非 0 表示原生库已成功产出，K-OTP 阶段可以据此生成一次性程序 share。
+     * NAT-18: 实例字段而非进程级静态——并发构建各持各的 orchestrator，种子
+     * 不再互相覆盖（跨构建串扰由 PL-18 的 run() 互斥 + 本字段双重消除）。
      */
-    private static volatile long OTP_NATIVE_SEED;
+    private long otpNativeSeed;
 
     /** @return 本次构建可用的 K-OTP 原生种子；0 表示原生库未产出（K-OTP 应跳过）。 */
-    public static long getOtpNativeSeed() { return OTP_NATIVE_SEED; }
+    public long getOtpNativeSeed() { return otpNativeSeed; }
     private final ClassGraph graph;
     private final ProtectionConfig cfg;
     private final NativeCompiler compiler;
@@ -82,7 +85,7 @@ public final class JnicOrchestrator {
     }
 
     public Result run(Path workDir) throws IOException {
-        OTP_NATIVE_SEED = 0L;
+        otpNativeSeed = 0L;
         if (!cfg.isEnableJnic()) {
             return new Result(null, null, false, new HashMap<>());
         }
@@ -241,7 +244,7 @@ public final class JnicOrchestrator {
         }
         // K-OTP can only work when the native image that carries the seed is
         // actually shipped in the jar.
-        OTP_NATIVE_SEED = (blob != null) ? otpSeed : 0L;
+        otpNativeSeed = (blob != null) ? otpSeed : 0L;
         if (otpSeed != 0L && blob == null) {
             KBoxLog.warn(TAG, "K-OTP disabled: native blob was not produced");
         }
@@ -320,10 +323,19 @@ public final class JnicOrchestrator {
      *
      * <p>The C interpreter natively handles the full modern JVM instruction
      * set — including {@code TABLESWITCH}, {@code LOOKUPSWITCH},
-     * {@code MULTIANEWARRAY}, {@code INVOKEDYNAMIC} (via the injected
-     * {@code JnicIndy} bootstrap resolver), {@code WIDE} (emitted by the
-     * serializer for large local indices) and the exception table — so this
-     * guard only trips on the legacy JSR/RET/GOTO_W/JSR_W forms.
+     * {@code MULTIANEWARRAY}, {@code WIDE} (emitted by the serializer for
+     * large local indices) and the exception table — so this guard only trips
+     * on the legacy JSR/RET/GOTO_W/JSR_W forms.
+     *
+     * <p><b>KBX-NAT-16:</b> {@code INVOKEDYNAMIC} is <em>also rejected</em> (see
+     * the whitelist above): the {@code JnicIndy} resolver path (leaving native
+     * code, hand-boxing bootstrap arguments, calling back into Java) exists but
+     * is unreachable by design — it produced a hard JVM crash
+     * (EXCEPTION_ACCESS_VIOLATION) under a Mixin-heavy 1.8.9 Forge client.
+     * Lambda-heavy bodies stay ordinary Java; every other protection still
+     * applies to them. The JnicIndy machinery is retained dead code for a
+     * possible re-enable with end-to-end validation (audit R3: this javadoc
+     * previously advertised indy support, contradicting the whitelist).</p>
      */
     @SuppressWarnings("unchecked")
     static String checkUnsupportedInsns(MethodNode mn) {
@@ -332,6 +344,23 @@ public final class JnicOrchestrator {
             if (op < 0) continue; // labels / frames / line numbers
             if (UNSUPPORTED_JNIC_OPCODES.contains(op)) {
                 return opcodeName(op);
+            }
+            // LDC of MethodType (asm Type, sort METHOD), MethodHandle (asm Handle)
+            // or ConstantDynamic has no slot in the native sequential CP: the old
+            // path silently fell through to tag=0/string-index-0, pushing a WRONG
+            // object and corrupting the stack. Reject at selection time.
+            if (op == Opcodes.LDC) {
+                Object cst = ((LdcInsnNode) insn).cst;
+                if (cst instanceof org.objectweb.asm.Handle) {
+                    return "LDC MethodHandle constant";
+                }
+                if (cst instanceof org.objectweb.asm.ConstantDynamic) {
+                    return "LDC ConstantDynamic constant";
+                }
+                if (cst instanceof org.objectweb.asm.Type
+                        && ((org.objectweb.asm.Type) cst).getSort() == org.objectweb.asm.Type.METHOD) {
+                    return "LDC MethodType constant";
+                }
             }
         }
         return null;

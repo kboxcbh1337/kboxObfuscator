@@ -189,7 +189,16 @@ public final class ChaCha20 {
             deriveKeyNonce(secret, key, nonce);
         }
 
-        public byte at(int pos) {
+        /**
+         * KBX-VMP-04: the one-block cache is MUTABLE SHARED STATE — a VmpMethod's
+         * ksStatic/ksEph keystreams are used by every thread that executes the
+         * method, so two threads interleaving at() used to swap each other's
+         * cached blocks (opcode decrypt misalignment → RuntimeException("KBox")
+         * or silent wrong execution). Synchronize the cache: uncontended lock
+         * cost is negligible next to a block generation, and contention only
+         * arises when several threads run the SAME virtualized method.
+         */
+        public synchronized byte at(int pos) {
             if (pos < 0) return 0;
             long bc = pos >>> 6;
             if (bc != blockCtr) {

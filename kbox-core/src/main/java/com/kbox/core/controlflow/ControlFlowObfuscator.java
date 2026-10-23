@@ -311,6 +311,16 @@ public final class ControlFlowObfuscator {
         // The seed helper must stay predicate-free: a predicate inside mix()
         // that calls idh() would recurse (idh -> mix -> predicate -> idh ...).
         if (SEED.equals(cn.name)) return;
+        // PL-03: the exclusion gates MUST live here (single choke point). The
+        // parallel path calls obfuscateClass directly and previously skipped
+        // BOTH gates — excludeControlFlowPrefixes entries (Kotlin coroutine
+        // state machines written by ModernStackAdapter, library class names)
+        // were destructively flattened, while the log still reported them as
+        // excluded. The serial path pre-checks too; duplicating the check here
+        // makes every call site safe.
+        if (!cfg.shouldProtectClass(cn.name) || cfg.isExcludedFromControlFlow(cn.name)) {
+            return;
+        }
         // Count methods that actually have code bodies.
         int methodCount = 0;
         List<MethodNode> methods = (List<MethodNode>) cn.methods;
@@ -320,6 +330,11 @@ public final class ControlFlowObfuscator {
         }
         if (methodCount == 0) return;
         cfLog("  >> Processing class " + cn.name + " (" + methodCount + " methods with code)");
+        // KBX-CF-18: per-class deterministic randomness. Every transform-shape
+        // draw in this class comes from a stream derived from (buildSeed,
+        // "cf", className), so the artifact no longer depends on thread count
+        // or scheduling — the same input + config + seed reproduce it exactly.
+        com.kbox.core.util.DetRandom crng = com.kbox.core.util.DetRandom.of("cf", cn.name);
 
         // Lazy snapshot: clone a method's instruction list ONLY right before it
         // is first mutated. If COMPUTE_FRAMES validation fails after CF
@@ -364,7 +379,7 @@ public final class ControlFlowObfuscator {
                 // Here we substitute on the clean original body only.
                 if (!isCtor && cfg.getControlFlowStrength() >= 2) {
                     snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                    int n = substituteIAddMba(mn, cfg.getControlFlowStrength());
+                    int n = substituteIAddMba(mn, cfg.getControlFlowStrength(), crng);
                     substitutedThisClass += n;
                     if (n > 0) mutated = true;
                 }
@@ -403,7 +418,7 @@ public final class ControlFlowObfuscator {
                 // methods (the classic "EPL" bandwidth) and bounds the switch size.
                 if (!isCtor && !isVmpTarget && inFlattenWindow(mn)) {
                     snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                    flattened = Flattener.flatten(mn, cfg.getControlFlowStrength());
+                    flattened = Flattener.flatten(mn, cfg.getControlFlowStrength(), cn.name);
                     if (flattened) {
                         methodsFlattened++;
                         mutated = true;
@@ -423,13 +438,13 @@ public final class ControlFlowObfuscator {
                     int st = cfg.getControlFlowStrength();
                     if (st >= 3) {
                         snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                        int n = injectIrreducibleEdges(mn);
+                        int n = injectCrossJumps(mn, crng);
                         substitutedThisClass += n;
                         if (n > 0) mutated = true;
                     }
                     if (st >= 2) {
                         snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                        int n = injectCrossJumps(mn);
+                        int n = injectIrreducibleEdges(mn);
                         substitutedThisClass += n;
                         if (n > 0) mutated = true;
                         // Pseudo exception edges need handler-free methods and
@@ -443,7 +458,7 @@ public final class ControlFlowObfuscator {
                     }
                     if (st >= 3) {
                         snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                        int n = deformFrames(mn);
+                        int n = deformFrames(mn, crng);
                         substitutedThisClass += n;
                         if (n > 0) mutated = true;
                     }
@@ -460,19 +475,35 @@ public final class ControlFlowObfuscator {
                 if (!isJnicTarget) {
                     if (cfg.getControlFlowStrength() >= 2) {
                         snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                        int n = encryptSwitches(mn);
+                        int n = encryptSwitches(mn, crng);
                         substitutedThisClass += n;
                         if (n > 0) mutated = true;
                     }
                     if (cfg.getControlFlowStrength() >= 3) {
                         snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                        int n = encryptLoopCounters(mn);
+                        int n = encryptLoopCounters(mn, crng);
                         substitutedThisClass += n;
                         if (n > 0) mutated = true;
                     }
                 }
+                // KBX-CF-05: convert a few straight-line updates into a REAL
+                // two-armed branch where BOTH arms contain live code (the same
+                // update written in two different but equivalent encodings).
+                // The old opaque predicates were single-in/single-out diamonds
+                // whose dead arm had no observable effect and whose poison local
+                // was zeroed at the merge — a constant folder could therefore
+                // delete the dead edge in one pass. Here neither arm can be
+                // dropped: removing either changes the program unless the
+                // analyser first proves both arms equivalent.
+                if (!isCtor && !isVmpTarget && !isJnicTarget
+                        && cfg.getControlFlowStrength() >= 2) {
+                    snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
+                    int nLive = injectLiveOpaqueBranches(mn, crng);
+                    substitutedThisClass += nLive;
+                    if (nLive > 0) mutated = true;
+                }
                 snapshotIfNeeded(mn, originalInsns, originalMaxLocals, originalMaxStack);
-                injectOpaquePredicates(mn, isCtor ? 1 : cfg.getControlFlowStrength(), cn.name, cfg.getControlFlowStrength());
+                injectOpaquePredicates(mn, isCtor ? 1 : cfg.getControlFlowStrength(), cn.name, cfg.getControlFlowStrength(), crng);
                 if (predicatesInserted > predBefore) mutated = true;
                 cfLog("    << " + cn.name + "." + mn.name + mn.desc
                         + " insn=" + insnCount
@@ -576,7 +607,39 @@ public final class ControlFlowObfuscator {
             }
         }
         try {
-            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+            // CF-03: graph-aware writer. The default getCommonSuperClass loads
+            // types via the system classloader, so a branch join of two in-jar
+            // types (`Object o = flag ? new A() : new B()`) threw and rolled
+            // back the WHOLE class — the classic silent mass-no-protection
+            // path. Resolve in-graph types from the ClassGraph instead and
+            // only fall back to reflection for out-of-graph (JDK) types,
+            // mirroring the Packager's writer.
+            ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
+                @Override
+                protected String getCommonSuperClass(String type1, String type2) {
+                    if (type1.equals(type2)) return type1;
+                    ClassNode n1 = graph.getClasses().get(type1);
+                    ClassNode n2 = graph.getClasses().get(type2);
+                    if (n1 != null && n2 != null) {
+                        String a = type1, b = type2;
+                        while (a != null) {
+                            String t = b;
+                            while (t != null) {
+                                if (a.equals(t)) return a;
+                                ClassNode tn = graph.getClasses().get(t);
+                                t = tn == null ? null : tn.superName;
+                            }
+                            ClassNode an = graph.getClasses().get(a);
+                            a = an == null ? null : an.superName;
+                        }
+                    }
+                    try {
+                        return super.getCommonSuperClass(type1, type2);
+                    } catch (Throwable t) {
+                        return "java/lang/Object";
+                    }
+                }
+            };
             cn.accept(cw);
             cw.toByteArray();
             return true;
@@ -599,7 +662,8 @@ public final class ControlFlowObfuscator {
      * <p>Methods containing {@code NEW} instructions receive only simple
      * predicates to avoid uninitialized-object frame merge corruption.
      */
-    private void injectOpaquePredicates(MethodNode mn, int count, String owner, int strength) {
+    private void injectOpaquePredicates(MethodNode mn, int count, String owner, int strength,
+                                        com.kbox.core.util.DetRandom r) {
         int size = mn.instructions.size();
         if (size < 6) return;
 
@@ -609,7 +673,6 @@ public final class ControlFlowObfuscator {
             if (insn.getOpcode() == Opcodes.NEW) { hasAllocation = true; break; }
         }
 
-        ThreadLocalRandom r = ThreadLocalRandom.current();
         int tmp = mn.maxLocals;
         // tmp..tmp+2: predicate temps (POLY uses all three); tmp+3: poison
         // chain local (条目 35 interweaving — dead branches store into it and
@@ -651,7 +714,7 @@ public final class ControlFlowObfuscator {
             if (hasAllocation || strength < 3) {
                 // Simple predicate for methods with allocations, or low strength
                 int t = r.nextInt(1, 1000000);
-                block = buildSimplePredicate(t, tmp);
+                block = buildSimplePredicate(t, tmp, r);
             } else {
                 // Runtime-bound predicate, cycling through strategies
                 PredType type = types[typeIdx % types.length];
@@ -684,8 +747,7 @@ public final class ControlFlowObfuscator {
      * (a &gt; 0, monotone) which preserves the contiguous range
      * {@code [a*min+b, a*max+b]}.
      */
-    private int encryptSwitches(MethodNode mn) {
-        ThreadLocalRandom r = ThreadLocalRandom.current();
+    private int encryptSwitches(MethodNode mn, com.kbox.core.util.DetRandom r) {
         int n = 0;
         for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; ) {
             AbstractInsnNode next = insn.getNext();
@@ -711,23 +773,36 @@ public final class ControlFlowObfuscator {
             } else if (insn instanceof TableSwitchInsnNode) {
                 TableSwitchInsnNode ts = (TableSwitchInsnNode) insn;
                 try {
-                    int range = ts.max - ts.min + 1;
-                    if (range > 0 && range <= 64) {
+                    // KBX-CF-06 / hang fix: compute the span in long. With
+                    // min=Integer.MIN_VALUE and max=Integer.MAX_VALUE the int
+                    // expression overflows to a small positive value, so the
+                    // "range <= 64" branch was taken for a 2^32-entry switch and
+                    // the per-key loop below ran ~4 billion times (observed as a
+                    // build that spins at 100% CPU inside encryptSwitches).
+                    long rangeL = (long) ts.max - (long) ts.min + 1L;
+                    if (rangeL > 0 && rangeL <= 64) {
                         int m1 = r.nextInt(1, Integer.MAX_VALUE);
                         int a = r.nextInt(1, 1 << 20) * 2 + 1;
                         int b = r.nextInt(-1048576, 1048576);
                         java.util.TreeMap<Integer, LabelNode> map = new java.util.TreeMap<>();
                         for (int k = ts.min; k <= ts.max; k++) {
                             map.put(tKey(k, m1, a, b), ts.labels.get(k - ts.min));
+                            if (map.size() > 64) break; // defensive: never loop huge
                         }
                         mn.instructions.insertBefore(insn, keyTransformSeq(m1, a, b, mn));
                         mn.instructions.insert(insn, toLookupSwitch(ts.dflt, map));
                         mn.instructions.remove(insn);
                         n++;
-                    } else if (range > 0) {
+                    } else if (rangeL > 0 && rangeL <= 65536) {
                         // Large table: affine-only (a odd & > 0), no XOR — the
                         // key range stays contiguous: [a*min+b, a*max+b].
-                        int a = r.nextInt(1, 255) * 2 + 1;
+                        // CF-06: the transformed table holds a*range entries —
+                        // an unrestricted a (up to 509) on a 65k switch emitted
+                        // a 33M-entry table -> MethodTooLargeException -> the
+                        // WHOLE class rolled back, losing all protection. Cap
+                        // the blow-up at 4096 entries; beyond that a=1.
+                        int aCap = Math.max(1, 4096 / (int) rangeL);
+                        int a = aCap == 1 ? 1 : r.nextInt(0, aCap) * 2 + 1;
                         int b = r.nextInt(-1048576, 1048576);
                         long minP = (long) a * ts.min + b;
                         long maxP = (long) a * ts.max + b;
@@ -799,8 +874,7 @@ public final class ControlFlowObfuscator {
      * CSE / pattern matchers read a non-linear counter update. Semantics are
      * bit-exact int arithmetic (no overflow hazard: the f-terms cancel).
      */
-    private int encryptLoopCounters(MethodNode mn) {
-        ThreadLocalRandom r = ThreadLocalRandom.current();
+    private int encryptLoopCounters(MethodNode mn, com.kbox.core.util.DetRandom r) {
         int n = 0;
         for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; ) {
             AbstractInsnNode next = insn.getNext();
@@ -859,7 +933,7 @@ public final class ControlFlowObfuscator {
      * walk), every label travels with its instructions, and no try/catch may
      * be present (a moved range would silently change the protected region).
      */
-    private int injectCrossJumps(MethodNode mn) {
+    private int injectCrossJumps(MethodNode mn, com.kbox.core.util.DetRandom r) {
         if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return 0;
         int total = mn.instructions.size();
         if (total < 12 || total > 900) return 0;
@@ -885,7 +959,6 @@ public final class ControlFlowObfuscator {
             }
         }
         if (sources.isEmpty() || hosts.isEmpty()) return 0;
-        ThreadLocalRandom r = ThreadLocalRandom.current();
         for (int attempt = 0; attempt < 12; attempt++) {
             int[] src = sources.get(r.nextInt(sources.size()));
             int firstReal = src[0], lastReal = src[1];
@@ -965,6 +1038,71 @@ public final class ControlFlowObfuscator {
     }
 
     /**
+     * KBX-CF-05: real (live) opaque branches.
+     *
+     * <p>The classic opaque predicate is a diamond whose dead arm has no
+     * observable effect and whose poison local is reset at the merge point, so
+     * a single constant-folding pass can delete the dead edge — the predicate
+     * inflates the byte count without changing the recoverable CFG.
+     *
+     * <p>This transform instead rewrites a straight-line local update
+     * ({@code IINC var, c}) into a genuinely two-armed branch selected by a
+     * run-time condition, where BOTH arms perform the same update using
+     * different encodings:
+     * <pre>
+     *   if (_KboxCfSeed.now() & 1 == 0) goto A
+     *   var = var + c          // arm B (ILOAD/IADD/ISTORE)
+     *   goto join
+     * A: IINC var, c           // arm A (original encoding)
+     * join:
+     * </pre>
+     * Neither edge can be removed by dead-code elimination (both carry live
+     * writes) and the two encodings must be proven equivalent before the arms
+     * can be merged, which is exactly the data-flow participation the audit
+     * asked for. Restricted to handler-free methods, stack-neutral sites, and a
+     * small budget so hot loops do not explode.
+     */
+    private int injectLiveOpaqueBranches(MethodNode mn, com.kbox.core.util.DetRandom r) {
+        if (mn.tryCatchBlocks != null && !mn.tryCatchBlocks.isEmpty()) return 0;
+        int total = mn.instructions.size();
+        if (total < 10 || total > 1200) return 0;
+        List<IincInsnNode> sites = new ArrayList<>();
+        for (AbstractInsnNode ins = mn.instructions.getFirst(); ins != null; ins = ins.getNext()) {
+            if (ins instanceof IincInsnNode && ((IincInsnNode) ins).incr != 0) {
+                sites.add((IincInsnNode) ins);
+            }
+        }
+        if (sites.isEmpty()) return 0;
+        int budget = Math.min(2, sites.size());
+        int done = 0;
+        for (int attempt = 0; attempt < budget * 3 && done < budget; attempt++) {
+            IincInsnNode inc = sites.get(r.nextInt(sites.size()));
+            if (inc.getOpcode() != Opcodes.IINC) continue; // already rewritten
+            LabelNode armA = new LabelNode();
+            LabelNode join = new LabelNode();
+            InsnList pre = new InsnList();
+            // Run-time bound selector: 50/50 at run time, opaque statically.
+            pre.add(new MethodInsnNode(Opcodes.INVOKESTATIC, SEED, "now", "()I", false));
+            pre.add(new InsnNode(Opcodes.ICONST_1));
+            pre.add(new InsnNode(Opcodes.IAND));
+            pre.add(new JumpInsnNode(Opcodes.IFEQ, armA));
+            // Arm B: same update, additive encoding.
+            pre.add(new VarInsnNode(Opcodes.ILOAD, inc.var));
+            pushInt(pre, inc.incr);
+            pre.add(new InsnNode(Opcodes.IADD));
+            pre.add(new VarInsnNode(Opcodes.ISTORE, inc.var));
+            pre.add(new JumpInsnNode(Opcodes.GOTO, join));
+            pre.add(armA);
+            mn.instructions.insertBefore(inc, pre);
+            mn.instructions.insert(inc, join);
+            if (mn.maxStack < 2) mn.maxStack = 2;
+            done++;
+        }
+        if (done > 0) cfLog("      live-opaque: " + done + " two-armed update branch(es)");
+        return done;
+    }
+
+    /**
      * 条目 32: irreducible CFG. Prepends a small, genuinely executed
      * two-entry loop:
      *
@@ -1038,14 +1176,13 @@ public final class ControlFlowObfuscator {
      * and {@code break}/{@code continue} structure for it, while the runtime
      * executes one extra resolved branch.
      */
-    private int deformFrames(MethodNode mn) {
+    private int deformFrames(MethodNode mn, com.kbox.core.util.DetRandom r) {
         int total = mn.instructions.size();
         if (total < 10 || total > 1200) return 0;
         int[] hgt = stackHeights(mn);
         if (hgt == null) return 0;
         AbstractInsnNode[] insns = mn.instructions.toArray();
         List<int[]> blocks = basicBlocks(mn, insns);
-        ThreadLocalRandom r = ThreadLocalRandom.current();
         int budget = 2;
         int done = 0;
         for (int attempt = 0; attempt < 8 && done < budget; attempt++) {
@@ -1220,7 +1357,7 @@ public final class ControlFlowObfuscator {
      *   <li>Between ALOAD and follow-up instruction — erases loaded value</li>
      * </ul>
      */
-    private AbstractInsnNode pickInsertionPoint(MethodNode mn, ThreadLocalRandom r) {
+    private AbstractInsnNode pickInsertionPoint(MethodNode mn, com.kbox.core.util.DetRandom r) {
         int size = mn.instructions.size();
         int start = size / 3;
         int end = (size * 2) / 3;
@@ -1488,8 +1625,7 @@ public final class ControlFlowObfuscator {
      * that are too small to absorb the runtime-bound patterns. 条目 42: the
      * modulus / non-residue pair is randomized from the QR table above.
      */
-    private InsnList buildSimplePredicate(int t, int tmp) {
-        ThreadLocalRandom rr = ThreadLocalRandom.current();
+    private InsnList buildSimplePredicate(int t, int tmp, com.kbox.core.util.DetRandom rr) {
         int[] pair = QR_PAIRS[rr.nextInt(QR_PAIRS.length)];
         int mod = pair[0], nonResidue = pair[1];
         InsnList l = new InsnList();
@@ -1540,9 +1676,8 @@ public final class ControlFlowObfuscator {
      * @param budget   maximum number of IADD sites to substitute
      * @return the number of substitutions actually performed
      */
-    private int substituteIAddMba(MethodNode mn, int budget) {
+    private int substituteIAddMba(MethodNode mn, int budget, com.kbox.core.util.DetRandom r) {
         if (budget <= 0 || mn.instructions == null || mn.instructions.size() < 8) return 0;
-        ThreadLocalRandom r = ThreadLocalRandom.current();
         int done = 0;
         // Reserve one pair of fresh locals for the MBA temporaries. Use the
         // highest locals so they never alias the method's own variables.

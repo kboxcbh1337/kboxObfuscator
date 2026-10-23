@@ -6,6 +6,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import com.kbox.core.log.KBoxLog;
+
 /**
  * Immutable protection configuration. Built either from the YAML-ish config
  * file (see {@link ConfigLoader}) or programmatically by the CLI/Maven plugin.
@@ -231,6 +233,21 @@ public final class ProtectionConfig {
      * deeper trees = larger methods.</p>
      */
     private int mbaRewrite = 0;
+    /**
+     * SED-VX semantic-evidence diffusion level, 0..2 (0 = off).
+     *
+     * <p>Restricted first implementation of the SED-VX architecture: builds a
+     * semantic atlas, selects critical slices (sensitive methods and their
+     * 1-2-hop neighbours), and rewrites their value evidence through the
+     * equivalent-realization pool, seeded per build. Only verified rewrites are
+     * committed; anything that fails analysis is reverted. Reports are written
+     * as {@code sedvx-report.json/.md} into the build work directory.
+     */
+    private int sedVx = 0;
+    /** Maximum number of critical slices the SED-VX pass will consider (default 200). */
+    private int sedVxMaxSlices = 200;
+    /** Maximum rewritten evidence sites per method (default 6). */
+    private int sedVxBudget = 6;
     /**
      * S4 honeypot bait level, 0..3 (0=off).
      * {@code kboxDedeobfShieldV1} static bait: inject synthetic classes packed
@@ -722,6 +739,32 @@ public final class ProtectionConfig {
     public void setRenameIdentifiers(boolean v) { renameIdentifiers = v; }
     public boolean isEncryptStrings() { return encryptStrings; }
     public void setEncryptStrings(boolean v) { encryptStrings = v; }
+
+    /**
+     * PL-07: the three string-protection modes are dispatched by a fixed
+     * priority chain — AES (encryptStrings && strength>=3) &gt; whitebox &gt;
+     * scatter &gt; XOR — so enabling several at once silently drops the losers
+     * (allMax used to turn on all three and only AES ever ran). Warn exactly
+     * which requested mode(s) will not execute instead of staying silent.
+     * Call once after config load / applyMaxStrength, before the pipeline runs.
+     */
+    public void warnStringModeOverlap() {
+        boolean aes = encryptStrings && stringEncryptionStrength >= 3;
+        if (aes && whiteboxStrings) {
+            KBoxLog.warn("config", "whiteboxStrings=true will NOT run: AES string encryption "
+                    + "takes priority (encryptStrings=true, strength=" + stringEncryptionStrength
+                    + "). Disable one of the two to pick a mode explicitly.");
+        }
+        if (aes && scatterStrings) {
+            KBoxLog.warn("config", "scatterStrings=true will NOT run: AES string encryption "
+                    + "takes priority. Disable encryptStrings (or lower strength below 3) to use it.");
+        }
+        if (!aes && whiteboxStrings && scatterStrings) {
+            KBoxLog.warn("config", "scatterStrings=true will NOT run: whiteboxStrings "
+                    + "takes priority. Disable one of the two to pick a mode explicitly.");
+        }
+    }
+
     public boolean isObfuscateControlFlow() { return obfuscateControlFlow; }
     public void setObfuscateControlFlow(boolean v) { obfuscateControlFlow = v; }
     public boolean isObfuscateEntryPoint() { return obfuscateEntryPoint; }
@@ -842,6 +885,12 @@ public final class ProtectionConfig {
     /** @see #mbaRewrite */
     public int getMbaRewrite() { return mbaRewrite; }
     public void setMbaRewrite(int v) { mbaRewrite = Math.max(0, Math.min(5, v)); }
+    public int getSedVx() { return sedVx; }
+    public void setSedVx(int v) { sedVx = Math.max(0, Math.min(2, v)); }
+    public int getSedVxMaxSlices() { return sedVxMaxSlices; }
+    public void setSedVxMaxSlices(int v) { sedVxMaxSlices = Math.max(1, Math.min(100000, v)); }
+    public int getSedVxBudget() { return sedVxBudget; }
+    public void setSedVxBudget(int v) { sedVxBudget = Math.max(1, Math.min(64, v)); }
     public int getHoneypotLevel() { return honeypotLevel; }
     public void setHoneypotLevel(int v) { honeypotLevel = Math.max(0, Math.min(3, v)); }
     public int getOpaqueStateMachine() { return opaqueStateMachine; }
@@ -1240,6 +1289,9 @@ public final class ProtectionConfig {
         c.obfuscateConstants = obfuscateConstants;
         c.mbaConstants = mbaConstants;
         c.mbaRewrite = mbaRewrite;
+        c.sedVx = sedVx;
+        c.sedVxMaxSlices = sedVxMaxSlices;
+        c.sedVxBudget = sedVxBudget;
         c.parallelThreads = parallelThreads;
         c.gpuAccel = gpuAccel;
         c.silentShield = silentShield;
@@ -1332,8 +1384,12 @@ public final class ProtectionConfig {
     public void applyMaxStrength() {
         allMax = true;
         // ---- naming / strings ----
+        // PL-08: renamePackages is deliberately NOT forced by allMax. Moving
+        // classes into random packages breaks Spring classpath* component
+        // scanning (basePackage refers to original names), File-based service
+        // discovery and any ClassLoader.getResource probing; the default is
+        // false exactly for that reason. Users who want it set it explicitly.
         renameIdentifiers = true;
-        renamePackages = true;
         obfuscateEntryPoint = true;
         encryptStrings = true;
         stringEncryptionStrength = 3;

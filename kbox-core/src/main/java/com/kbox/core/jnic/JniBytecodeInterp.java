@@ -208,7 +208,11 @@ public final class JniBytecodeInterp {
         String cRet = JniCTranslator.cType(retType);
         String[] cArgs = new String[argTypes.length + 2];
         cArgs[0] = "JNIEnv* env";
-        cArgs[1] = mn.name.equals("<init>") ? "jclass _cls" : "jobject _recv";
+        // The JVM passes (env, receiver-or-jclass, args...): a jobject for
+        // instance methods AND constructors (<init> receives the newly
+        // allocated object), a jclass for static methods. The name/type is
+        // ABI-identical, so a uniform "jobject _recv" is correct for all.
+        cArgs[1] = "jobject _recv";
         for (int i = 0; i < argTypes.length; i++)
             cArgs[i + 2] = JniCTranslator.cType(argTypes[i]) + " _a" + i;
 
@@ -385,7 +389,30 @@ public final class JniBytecodeInterp {
         body.append("  if (_mutBC) memcpy(_mutBC,").append(symbol)
                 .append("_bc,").append(raw.length).append(");\n");
 
-        body.append("  static int _init=0;\n");
+        body.append("  static volatile jint _init=0;\n");
+        // NAT-09: the one-time CP initialization must be atomic. A plain int
+        // flag raced under concurrent first calls: both threads ran the init
+        // block and the loser's NewGlobalRef results leaked over the winner's.
+        // CAS once-guard (GCC __sync builtin / Win32 Interlocked — LONG is
+        // 32-bit on Windows so the jint* cast is size-correct).
+        body.append("  if (_init != 2) {\n")
+            .append("    for (;;) {\n")
+            .append("      jint _prev =\n")
+            .append("#if defined(__GNUC__)\n")
+            .append("        __sync_val_compare_and_swap(&_init, 0, 1);\n")
+            .append("#else\n")
+            .append("        (jint)InterlockedCompareExchange((volatile LONG*)&_init, 1, 0);\n")
+            .append("#endif\n")
+            .append("      if (_prev == 0 || _prev == 2) break;\n")
+            .append("      /* another thread is initializing: yield and re-check */\n")
+            .append("#if defined(_WIN32)\n")
+            .append("      Sleep(1);\n")
+            .append("#else\n")
+            .append("      sched_yield();\n")
+            .append("#endif\n")
+            .append("    }\n")
+            .append("  }\n")
+            .append("  if (_init != 2) {\n");
         // The class that declared this native method: a jclass for static methods,
         // the receiver for instance methods. Used as the anchor loader when
         // resolving referenced classes (see kbox_find_class in the interpreter).
@@ -419,9 +446,19 @@ public final class JniBytecodeInterp {
                     .append("if (c) { ")
                     .append(st ? "_cpfldR[" + i + "]=(*env)->GetStaticFieldID(env,c,\"" + f[1] + "\",\"" + f[2] + "\");"
                                 : "_cpfldR[" + i + "]=(*env)->GetFieldID(env,c,\"" + f[1] + "\",\"" + f[2] + "\");")
-                    .append(" if (!_cpfldR[").append(i).append("]) { fprintf(stderr,\"[JNIC] FIELDFAIL ")
+                    .append(" if (!_cpfldR[").append(i).append("]) { ")
+                    // NAT-10: diagnostic line leaks the field topology to any
+                    // user of the binary — only emit under a compile-time flag.
+                    .append("#ifdef KBOX_DEBUG\n")
+                    .append("fprintf(stderr,\"[JNIC] FIELDFAIL ")
                     .append((st ? "STATIC " : "INST  ")).append(f[0]).append("\\t").append(f[1]).append("\\t").append(f[2]).append("\\n\"); ")
-                    .append("if ((*env)->ExceptionCheck(env)) (*env)->ExceptionDescribe(env), (*env)->ExceptionClear(env); } }\n");
+                    .append("#endif\n")
+                    // Keep the pending GetFieldID exception (it propagates on
+                    // return); only if none is pending (NULL id without thrown
+                    // exception — should not happen) throw a proper one, so the
+                    // interpreter never runs on with a NULL fieldID silently.
+                    .append("if (!(*env)->ExceptionCheck(env)) { jclass _nfe=(*env)->FindClass(env,\"java/lang/NoSuchFieldError\"); if (_nfe) (*env)->ThrowNew(env,_nfe,\"")
+                    .append(f[0]).append(".").append(f[1]).append(" ").append(f[2]).append("\"); } } }\n");
             body.append("    }\n");
         }
         // Pre-resolve method IDs.
@@ -437,7 +474,7 @@ public final class JniBytecodeInterp {
                 body.append("_cpmidR[").append(i).append("]=(*env)->GetMethodID(env,c,\"")
                         .append(m[1]).append("\",\"").append(m[2]).append("\"); } }\n");
         }
-        body.append("    _init=1;\n  }\n");
+        body.append("    _init=2;\n  }\n");
 
         // Build _args[] with CP arrays + sizes.
         body.append("  void* _a[]={ ");
@@ -476,9 +513,11 @@ public final class JniBytecodeInterp {
         body.append("NULL };\n");
 
         // The interpreter occupies local[0] for the receiver ONLY when it's non-NULL.
-        // For static methods and constructors, we pass NULL so locals start at slot 0.
+        // For static methods we pass NULL so locals start at slot 0. Constructors
+        // are instance methods: <init> receives the newly allocated object and
+        // MUST land in locals[0] (this + instance field access depend on it).
         boolean isStatic = (mn.access & Opcodes.ACC_STATIC) != 0;
-        String recvExpr = (mn.name.equals("<init>") || isStatic) ? "NULL" : "_recv";
+        String recvExpr = isStatic ? "NULL" : "_recv";
         int localsCount = mn.maxLocals;  // no override needed when receiver=NULL for static
         // Clamp the frame the interpreter allocates into its fixed-size
         // locals[]/stack[] arrays (KBOX_MAX_SLOTS=256); selection already rejects
@@ -565,10 +604,15 @@ public final class JniBytecodeInterp {
                         idxMap.floatIdx.put(v, seq);
                         rcp.floats.put(seq, v);
                     }
-                } else if (ldc.cst instanceof Type) {
+                } else if (ldc.cst instanceof Type
+                        && ((Type) ldc.cst).getSort() != Type.METHOD) {
                     // Class literal (Foo.class / int[].class): register the class
                     // name/descriptor so the native interpreter can FindClass it
                     // and push the resolved jclass as a reference on the stack.
+                    // A MethodType constant is also an asm Type (sort METHOD) but
+                    // is NOT a class literal — selection rejects it upstream;
+                    // guard here too so it can never be mangled into a FindClass
+                    // of a method descriptor.
                     Type t = (Type) ldc.cst;
                     String name = t.getSort() == Type.ARRAY ? t.getDescriptor() : t.getInternalName();
                     if (!idxMap.clsIdx.containsKey(name)) {
@@ -667,7 +711,7 @@ public final class JniBytecodeInterp {
         for (AbstractInsnNode insn = mn.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (insn instanceof FrameNode || insn instanceof LineNumberNode) continue;
             if (insn instanceof LabelNode) continue;
-            writeInsn(bos, insn, labelOffsets, idxMap);
+            writeInsn(bos, insn, labelOffsets, idxMap, mn);
         }
         return bos.toByteArray();
     }
@@ -675,7 +719,8 @@ public final class JniBytecodeInterp {
     private static void writeInsn(java.io.ByteArrayOutputStream bos,
                                   AbstractInsnNode insn,
                                   Map<LabelNode, Integer> labelOffsets,
-                                  CPIdxMap idxMap) {
+                                  CPIdxMap idxMap,
+                                  MethodNode mn) {
         int op = insn.getOpcode();
         if (op < 0) return;
         bos.write(op);
@@ -758,12 +803,19 @@ public final class JniBytecodeInterp {
                 tag = K_LDC_TAG_DOUBLE; seq = idxMap.doubleIdx.get((Double) ldc.cst);
             } else if (ldc.cst instanceof Float) {
                 tag = K_LDC_TAG_FLOAT; seq = idxMap.floatIdx.get((Float) ldc.cst);
-            } else if (ldc.cst instanceof Type) {
+            } else if (ldc.cst instanceof Type
+                    && ((Type) ldc.cst).getSort() != Type.METHOD) {
                 Type t = (Type) ldc.cst;
                 String name = t.getSort() == Type.ARRAY ? t.getDescriptor() : t.getInternalName();
                 tag = K_LDC_TAG_CLASS; seq = idxMap.clsIdx.get(name);
             } else {
-                tag = 0; seq = null;
+                // MethodType / MethodHandle / ConstantDynamic LDC has no native CP
+                // slot. NEVER fall through to tag=0 (string): that would push
+                // string index 0 and corrupt the interpreter stack. Selection
+                // rejects these upstream; fail loudly here as defense-in-depth.
+                throw new IllegalStateException(
+                        "unsupported LDC constant " + ldc.cst.getClass().getSimpleName()
+                                + " (" + ldc.cst + ") in method " + mn.name + mn.desc);
             }
             int raw = tag | (seq != null ? seq : 0);
             writeShort(bos, (short) raw);

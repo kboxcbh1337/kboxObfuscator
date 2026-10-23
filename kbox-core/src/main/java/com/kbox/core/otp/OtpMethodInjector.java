@@ -4,7 +4,6 @@ import com.kbox.core.analysis.ClassGraph;
 import com.kbox.core.bfvm.BfVmException;
 import com.kbox.core.bfvm.compile.BfMethodCompiler;
 import com.kbox.core.config.ProtectionConfig;
-import com.kbox.core.jnic.JnicOrchestrator;
 import com.kbox.core.log.KBoxLog;
 import com.kbox.runtime.KotpRuntime;
 import org.objectweb.asm.Opcodes;
@@ -56,11 +55,19 @@ public final class OtpMethodInjector {
      */
     private final Set<String> engineClasses;
 
+    /** K-OTP 原生种子（来自本次构建的 JnicOrchestrator 实例，0 = 跳过）。 */
+    private final long otpNativeSeed;
+
+    /** NAT-18: the seed is passed EXPLICITLY from the pipeline (which holds the
+     *  JnicOrchestrator instance) instead of being pulled from process-wide
+     *  static state, so concurrent builds cannot clobber each other's K-OTP key. */
     public OtpMethodInjector(ClassGraph graph, ProtectionConfig cfg,
                              Set<String> vmpMethods, Set<String> nativeMethods,
-                             Set<String> bfvmMethods, Set<String> engineClasses) {
+                             Set<String> bfvmMethods, Set<String> engineClasses,
+                             long otpNativeSeed) {
         this.graph = graph;
         this.cfg = cfg;
+        this.otpNativeSeed = otpNativeSeed;
         this.claimed = new LinkedHashSet<>();
         if (vmpMethods != null) claimed.addAll(vmpMethods);
         if (nativeMethods != null) claimed.addAll(nativeMethods);
@@ -84,7 +91,7 @@ public final class OtpMethodInjector {
             KBoxLog.info(TAG, "K-OTP disabled (requires enableOtp + enableJnic)");
             return r;
         }
-        long raw = JnicOrchestrator.getOtpNativeSeed();
+        long raw = otpNativeSeed;
         if (raw == 0L) {
             KBoxLog.warn(TAG, "K-OTP skipped: native seed unavailable (JNIC native build did not run)");
             return r;

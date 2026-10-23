@@ -102,9 +102,15 @@ public final class IntegrityChecker {
                         java.nio.charset.StandardCharsets.UTF_8).trim();
                 if (!want.isEmpty() && !signedBy(jar, want)) tampered = true;
             }
+        } catch (java.io.IOException io) {
+            // KBX-NAT-06: a verification PROCESS failure (transient IO error,
+            // nested-jar CodeSource quirk, read-only fs) is NOT proof of
+            // tampering. Treating it as such permanently corrupted every
+            // protected string on such environments. Skip this round; the
+            // periodic re-check will retry. A genuinely modified jar produces
+            // a hash MISMATCH above, which still flips the flag.
         } catch (Throwable t) {
-            // Don't fail loudly; just mark tampered so downstream corrupts.
-            tampered = true;
+            // Unexpected internal error: also skip (not evidence of tampering).
         }
     }
 

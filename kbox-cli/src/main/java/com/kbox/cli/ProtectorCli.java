@@ -39,6 +39,12 @@ public final class ProtectorCli {
             launchGui(null, null, null, false);
             return;
         }
+        // kboXShield 独立产品入口（导入/导出契约 + 导出表校验 + 矩阵测试）。
+        // 与 JAR 保护流水线完全分离：只做 PE 输入 -> PE 输出。
+        if (hasShieldFlag(args)) {
+            System.exit(com.kbox.core.shield.ShieldCli.run(args));
+            return;
+        }
         // kboXShield 独立功能线（PE 加壳）：--shield <in.exe> <out.exe>
         if ("--shield".equals(args[0])) {
             String[] rest = new String[args.length - 1];
@@ -54,6 +60,9 @@ public final class ProtectorCli {
         String mcPreset = null;
         boolean autoMc = false;
         boolean gui = false, verbose = false, debugCf = false;
+        boolean guiHtml = false;
+        int guiPort = 8712;
+        int sedVxLevel = 0;
         java.util.List<String> includePatterns = new java.util.ArrayList<>();
         java.util.List<String> excludePatterns = new java.util.ArrayList<>();
         String scope = null;
@@ -67,7 +76,10 @@ public final class ProtectorCli {
         boolean dontObfuscate = false, dontOptimize = false;
         Boolean useDefaultLibPrefixes = null;
         Boolean shieldNativeOutput = null; // --shield-native-output <true|false>
-        boolean neverFail = true; // safe default
+        // PL-09: null = the CLI flag was not given, so a value coming from the
+        // config file must survive. Unconditionally overwriting it with a
+        // hardcoded default silently disabled `neverFail=false` CI gating.
+        Boolean neverFail = null;
         String logFile = null;    // optional UTF-8 log tap (fixes console mojibake)
         String mainClass = null;  // --main-class: explicit application entry point
         for (int i = 0; i < args.length; i++) {
@@ -77,6 +89,10 @@ public final class ProtectorCli {
                 case "--config": case "-c": cfgPath = next(args, i++); break;
                 case "--mapping": case "-mapping": mappingPath = next(args, i++); break;
                 case "--gui": gui = true; break;
+                case "--gui-html": case "--guiHtml": guiHtml = true; break;
+                case "--port": guiPort = Integer.parseInt(next(args, i++).trim()); break;
+                case "--sedvx": sedVxLevel = 1; break;
+                case "--sedvx-level": sedVxLevel = Integer.parseInt(next(args, i++).trim()); break;
                 case "--verbose": case "-v": verbose = true; break;
                 case "--debug-cf": debugCf = true; break;
                 case "--mc-preset": mcPreset = next(args, i++); break;
@@ -144,6 +160,11 @@ public final class ProtectorCli {
         // Enable control-flow per-file debug output to stdout (works in both GUI and CLI mode).
         ControlFlowObfuscator.setVerboseCf(debugCf);
 
+        if (guiHtml) {
+            // --gui-html is an alias for the HTML UI (single obfuscation console).
+            launchGui(in, out, cfgPath, verbose);
+            return;
+        }
         if (gui) {
             // Launch GUI directly (kbox-gui is now a dependency of kbox-cli).
             launchGui(in, out, cfgPath, verbose);
@@ -204,7 +225,17 @@ public final class ProtectorCli {
             }
             // Apply fine-grained file selection flags.
             if (scope != null) {
-                cfg.setObfuscationScope(ProtectionConfig.ObfuscationScope.valueOf(scope.toUpperCase()));
+                // PL-11: explicit validation -> exit 2 (usage error) so CI can
+                // distinguish a bad argument from a protection failure (exit 1);
+                // Locale.ROOT so Turkish locales don't break ASCII enum names.
+                try {
+                    cfg.setObfuscationScope(ProtectionConfig.ObfuscationScope
+                            .valueOf(scope.toUpperCase(java.util.Locale.ROOT)));
+                } catch (IllegalArgumentException bad) {
+                    System.err.println("Invalid --scope value: " + scope
+                            + " (expected ALL, SELECTIVE or EXCLUDE)");
+                    System.exit(2);
+                }
             }
             for (String p : includePatterns) cfg.getIncludePatterns().add(p);
             for (String p : excludePatterns) cfg.getExcludePatterns().add(p);
@@ -253,7 +284,8 @@ public final class ProtectorCli {
                 cfg.getLibraryClassifier().setUseDefaultPrefixes(useDefaultLibPrefixes);
                 if (!useDefaultLibPrefixes) cfg.getLibraryClassifier().clearDefaults();
             }
-            cfg.setNeverFail(neverFail);
+            if (neverFail != null) cfg.setNeverFail(neverFail);
+            if (sedVxLevel > 0) cfg.setSedVx(sedVxLevel);
             if (dontWarn) cfg.setSuppressWarnings(true);
             if (dontNote) cfg.setQuiet(true);
             if (dontObfuscate) cfg.setRenameIdentifiers(false);
@@ -272,6 +304,17 @@ public final class ProtectorCli {
         }
     }
 
+    /** True when any standalone kboXShield flag is present. */
+    private static boolean hasShieldFlag(String[] args) {
+        for (String a : args) {
+            if ("--shield-dll".equals(a) || "--shield-in".equals(a)
+                    || "--shield-matrix".equals(a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean bool(String v) {
         return "true".equalsIgnoreCase(v) || "1".equals(v) || "yes".equalsIgnoreCase(v);
     }
@@ -288,7 +331,8 @@ public final class ProtectorCli {
     private static void applyMcPreset(ProtectionConfig cfg, String name) {
         try {
             com.kbox.core.minecraft.MinecraftModPresets.ModLoader loader =
-                    com.kbox.core.minecraft.MinecraftModPresets.ModLoader.valueOf(name.toUpperCase());
+                    com.kbox.core.minecraft.MinecraftModPresets.ModLoader.valueOf(
+                            name.toUpperCase(java.util.Locale.ROOT));
             com.kbox.core.minecraft.MinecraftModPresets.applyPreset(cfg, loader);
             System.out.println("[kbox] Applied Minecraft preset: " + name);
         } catch (IllegalArgumentException e) {
@@ -324,7 +368,10 @@ public final class ProtectorCli {
         System.out.println("  --mapping PATH          Write a ProGuard-compatible deobfuscation mapping file");
         System.out.println("                          (reverse obfuscation for stack traces; overrides mappingFile in config)");
         System.out.println("  --config, -c PATH       Protection config file (optional)");
-        System.out.println("  --gui                   Launch the KBox desktop UI (Swing)");
+        System.out.println("  --gui                   Launch the KBox HTML UI (single obfuscation console)");
+        System.out.println("  --gui-html              Alias of --gui (single HTML obfuscation console)");
+        System.out.println("  --sedvx                 Enable SED-VX semantic-evidence diffusion");
+        System.out.println("  --sedvx-level N         SED-VX level 1..2 (deeper expression trees)");
         System.out.println("  --verbose, -v           Enable DEBUG logging (full progress + stack traces)");
         System.out.println("  --debug-cf              Per-file control-flow debug to stdout (always visible)");
         System.out.println("  --log PATH              Also write every log line to PATH as UTF-8");
@@ -377,9 +424,12 @@ public final class ProtectorCli {
         System.out.println("Adaptive example: java -jar kbox.jar -i app.jar -o out.jar -keep com.example.Main -dontwarn");
     }
 
-    /** 启动 KBox 桌面界面（{@code com.kbox.gui.DesktopGui}，反射调用）。 */
+    /** 启动 KBox HTML UI（{@code com.kbox.gui.ProtectorGui}，反射调用）。 */
     private static void launchGui(String in, String out, String cfgPath, boolean verbose) {
-        String cls = "com.kbox.gui.DesktopGui";
+        // 3.0.4: restored the v2 single-page HTML console (obfuscation controls
+        // only). The Swing DesktopGui remains in the tree but is no longer the
+        // --gui entry point.
+        String cls = "com.kbox.gui.ProtectorGui";
         // The GUI module is compiled for Java 17+; on Java 8-16 the JVM would
         // throw UnsupportedClassVersionError while loading it. Fail with an
         // actionable message instead (CLI still works on Java 8).

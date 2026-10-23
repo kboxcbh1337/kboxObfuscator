@@ -5,8 +5,11 @@ import com.kbox.core.config.ProtectionConfig;
 import com.kbox.core.log.KBoxLog;
 import org.objectweb.asm.Attribute;
 import org.objectweb.asm.ByteVector;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.util.CheckClassAdapter;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
@@ -146,6 +149,10 @@ public final class AntiDecompiler {
                 injectMalformedMethodHandle(sink);
             }
 
+            // Self-check BEFORE declaring success (acceptance: sink classes
+            // pass COMPUTE_FRAMES 100% at packaging time).
+            verifySinkMethods(sink);
+
             KBoxLog.info(TAG, "Applied anti-decompiler level " + level
                     + " (goto=" + gotoLabels + " labels, ex-bomb=" + (level >= 2 ? (level >= 3 ? 10000 : 500) : 0)
                     + " entries, fields=" + (level >= 2 ? (level >= 3 ? 5000 : 1000) : 0)
@@ -154,6 +161,23 @@ public final class AntiDecompiler {
                     + (level >= 3 ? ", procyon-id-trap, jdgui-overflow, bad-mh" : "") + ")");
         } catch (Throwable t) {
             KBoxLog.warn(TAG, "Anti-decompiler pass failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Build-time data-flow self-check of every sink method: an illegal trap
+     * must fail loudly HERE instead of silently breaking COMPUTE_FRAMES at
+     * packaging time (where the class would be dropped or downgraded).
+     */
+    private static void verifySinkMethods(ClassNode sink) {
+        ClassWriter cw = new ClassWriter(0);
+        sink.accept(cw);
+        java.io.StringWriter sw = new java.io.StringWriter();
+        CheckClassAdapter.verify(new ClassReader(cw.toByteArray()), false,
+                new java.io.PrintWriter(sw));
+        if (sw.getBuffer().length() > 0) {
+            throw new IllegalStateException("anti-decompiler sink "
+                    + sink.name + " failed bytecode verification:\n" + sw);
         }
     }
 
@@ -595,8 +619,15 @@ public final class AntiDecompiler {
         l.add(new JumpInsnNode(Opcodes.GOTO, l1)); // back-edge to L1
         l.add(l3);
         l.add(new InsnNode(Opcodes.RETURN));
-        // Add a self-referencing try/catch for extra confusion
-        mn.tryCatchBlocks.add(new TryCatchBlockNode(l1, l3, l2, null));
+        // Catch-all handler on a DEDICATED label that pops the Throwable before
+        // joining l2: pointing the handler straight at l2 would merge the
+        // "[Throwable]" handler edge with l2's empty-stack GOTO edge and the
+        // verifier would reject the inconsistent frame.
+        LabelNode hnd = new LabelNode();
+        l.add(hnd);
+        l.add(new InsnNode(Opcodes.POP));
+        l.add(new JumpInsnNode(Opcodes.GOTO, l2));
+        mn.tryCatchBlocks.add(new TryCatchBlockNode(l1, l3, hnd, null));
         cn.methods.add(mn);
     }
 
@@ -657,43 +688,52 @@ public final class AntiDecompiler {
         // CFR's stack simulation is the weakest link — it uses a fixed-size
         // stack with no underflow protection.
 
-        // Pattern A: SWAP on single-element stack (CFR: StackSim.getEntry(1) fails)
+        // Pattern A: opaque-predicate-guarded SWAP block.
         for (int m = 0; m < 3; m++) {
             MethodNode mn = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                     "_cfru" + m + "a", "()V", null, null);
             InsnList l = mn.instructions;
             LabelNode dead = new LabelNode();
-            LabelNode end = new LabelNode();
             // Reachable path: just return.
-            l.add(new InsnNode(Opcodes.ICONST_0));   // push int
-            l.add(new JumpInsnNode(Opcodes.IFEQ, dead)); // always true (0==0) — never taken
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new JumpInsnNode(Opcodes.IFNE, dead)); // 0 != 0 → never taken
             l.add(new InsnNode(Opcodes.RETURN));
-            // Dead path: stack has 0 elements. SWAP expects 2 → CFR underrun.
+            // A branch TARGET is statically reachable, so the JVM verifier
+            // checks it even though the predicate never fires at runtime —
+            // the block must be stack-balanced or the sink class VerifyErrors.
             l.add(dead);
-            l.add(new InsnNode(Opcodes.SWAP));       // CFR: StackSim.getEntry(1) → ConfusedCFRException
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new InsnNode(Opcodes.ICONST_1));
+            l.add(new InsnNode(Opcodes.SWAP));
+            l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.RETURN));
             cn.methods.add(mn);
         }
 
-        // Pattern B: DUP2_X1 on 1-element stack (CFR analyzes ALL branches)
+        // Pattern B: DUP2_X1 guarded by an always-false predicate.
         for (int m = 0; m < 3; m++) {
             MethodNode mn = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                     "_cfru" + m + "b", "()V", null, null);
             InsnList l = mn.instructions;
             LabelNode dead = new LabelNode();
             l.add(new InsnNode(Opcodes.ACONST_NULL));
-            l.add(new JumpInsnNode(Opcodes.IFNONNULL, dead)); // null -> never taken
+            l.add(new JumpInsnNode(Opcodes.IFNONNULL, dead)); // null → never taken
             l.add(new InsnNode(Opcodes.RETURN));
             l.add(dead);
-            l.add(new InsnNode(Opcodes.DUP2_X1));  // needs ≥3 stack entries; CFR underruns
+            l.add(new InsnNode(Opcodes.ACONST_NULL));
+            l.add(new InsnNode(Opcodes.ACONST_NULL));
+            l.add(new InsnNode(Opcodes.ACONST_NULL));
+            l.add(new InsnNode(Opcodes.DUP2_X1));
+            l.add(new InsnNode(Opcodes.POP));
+            l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.RETURN));
             cn.methods.add(mn);
         }
 
-        // Pattern C: POP2 on 1-element stack
+        // Pattern C: POP2 guarded by an always-false predicate.
         for (int m = 0; m < 2; m++) {
             MethodNode mn = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                     "_cfru" + m + "c", "()V", null, null);
@@ -701,28 +741,40 @@ public final class AntiDecompiler {
             LabelNode dead = new LabelNode();
             l.add(new InsnNode(Opcodes.ICONST_1));
             l.add(new InsnNode(Opcodes.ICONST_1));
-            l.add(new JumpInsnNode(Opcodes.IF_ICMPNE, dead)); // 1==1 → never taken
+            l.add(new JumpInsnNode(Opcodes.IF_ICMPNE, dead)); // 1 != 1 → never taken
             l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.RETURN));
             l.add(dead);
-            l.add(new InsnNode(Opcodes.POP2));     // needs ≥2 wide; stack has 0 → underrun
-            l.add(new InsnNode(Opcodes.SWAP));     // double underrun for extra confusion
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new InsnNode(Opcodes.ICONST_1));
+            l.add(new InsnNode(Opcodes.POP2));
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new InsnNode(Opcodes.ICONST_1));
+            l.add(new InsnNode(Opcodes.SWAP));
+            l.add(new InsnNode(Opcodes.POP));
+            l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.RETURN));
             cn.methods.add(mn);
         }
 
-        // Pattern D: DUP2 on 1-element stack (only 1 slot, DUP2 needs 2)
+        // Pattern D: DUP2 guarded by an always-false predicate.
         for (int m = 0; m < 2; m++) {
             MethodNode mn = new MethodNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
                     "_cfru" + m + "d", "()V", null, null);
             InsnList l = mn.instructions;
             LabelNode dead = new LabelNode();
             l.add(new InsnNode(Opcodes.ICONST_0));
-            l.add(new JumpInsnNode(Opcodes.IFNE, dead)); // 0!=0 → never taken
+            l.add(new JumpInsnNode(Opcodes.IFNE, dead)); // 0 != 0 → never taken
             l.add(new InsnNode(Opcodes.RETURN));
             l.add(dead);
-            l.add(new InsnNode(Opcodes.DUP2));    // stack: empty → CFR underrun
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new InsnNode(Opcodes.ICONST_0));
+            l.add(new InsnNode(Opcodes.DUP2));
+            l.add(new InsnNode(Opcodes.POP));
+            l.add(new InsnNode(Opcodes.POP));
+            l.add(new InsnNode(Opcodes.POP));
+            l.add(new InsnNode(Opcodes.POP));
             l.add(new InsnNode(Opcodes.RETURN));
             cn.methods.add(mn);
         }
@@ -789,7 +841,7 @@ public final class AntiDecompiler {
             l.add(end);
 
             l.add(handler);
-            l.add(new InsnNode(Opcodes.POP2));   // JVM pushes 1 Throwable; CFR stack sim expects 1, we pop 2
+            l.add(new InsnNode(Opcodes.POP));   // pop the Throwable (POP2 would underflow)
             l.add(new InsnNode(Opcodes.RETURN));
 
             l.add(after);
@@ -821,8 +873,8 @@ public final class AntiDecompiler {
         InsnList l = mn.instructions;
         LabelNode dead = new LabelNode();
         // Reachable path: just return
-        l.add(new InsnNode(Opcodes.ICONST_0));
-        l.add(new JumpInsnNode(Opcodes.IFEQ, dead)); // 0==0 → always taken → skip dead code
+        l.add(new InsnNode(Opcodes.ICONST_1));
+        l.add(new JumpInsnNode(Opcodes.IFEQ, dead)); // 1 == 0 false → never taken
         l.add(new InsnNode(Opcodes.RETURN));
         // Dead path: INVOKEDYNAMIC with invalid BSM index
         l.add(dead);
@@ -899,8 +951,8 @@ public final class AntiDecompiler {
                 "_badmh", "()V", null, null);
         InsnList l = mn.instructions;
         LabelNode dead = new LabelNode();
-        l.add(new InsnNode(Opcodes.ICONST_1));
-        l.add(new JumpInsnNode(Opcodes.IFNE, dead)); // 1!=0 → always taken → skip dead code
+        l.add(new InsnNode(Opcodes.ICONST_0));
+        l.add(new JumpInsnNode(Opcodes.IFNE, dead)); // 0 != 0 false → never taken
         l.add(new InsnNode(Opcodes.RETURN));
         l.add(dead);
         // Load 50 MethodHandles with various invalid tag combinations

@@ -95,6 +95,15 @@ public final class RetentionDecision {
         //     method, the override here must keep the same name. We approximate
         //     by walking super chain; the NameObfuscator refines this precisely.
         if (overridesKeptMethod(cn, name, desc)) return true;
+        // 10b. Override of a JDK *class* method whose class is outside the jar
+        //      (e.g. java/lang/Thread#run). The interface walk below deliberately
+        //      skips java/* classes to avoid pinning everything via Object, but a
+        //      renamed Thread#run silently breaks the override contract:
+        //      Thread.start() invokes the empty Thread.run(), so the subclass body
+        //      never executes (observed as a game whose worker threads never run).
+        //      Resolve the JDK superclass reflectively and keep only methods it
+        //      actually declares (walking up its superclass chain).
+        if (overridesJdkClassMethod(cn, name, desc)) return true;
         // 11. The declaring class extends/implements a type that lives OUTSIDE the
         //     analysed jar (Forge, LaunchWrapper, Minecraft, Mixin, ...). Its method
         //     table is not on the obfuscation classpath, so we cannot tell which of
@@ -167,6 +176,64 @@ public final class RetentionDecision {
             if (node.interfaces != null) {
                 for (Object i : node.interfaces) queue.add(String.valueOf(i));
             }
+        }
+        return false;
+    }
+
+    /**
+     * True when {@code cn.name(name,desc)} overrides a method declared by a JDK
+     * <b>class</b> in its superclass chain (the chain leaves the jar at a
+     * {@code java/*} class such as {@code java/lang/Thread}).
+     *
+     * <p>Only methods the JDK class actually declares are kept, so this cannot
+     * pin every method in the jar the way treating {@code Object} as external
+     * would. Static/private methods never override and are ignored.
+     */
+    private boolean overridesJdkClassMethod(ClassNode cn, String name, String desc) {
+        if (name.charAt(0) == '<') return false;
+        if ((cn.access & 0x0200) != 0) return false;           // ACC_INTERFACE
+        int access = 0;
+        if (cn.methods != null) {
+            for (Object o : cn.methods) {
+                org.objectweb.asm.tree.MethodNode mn = (org.objectweb.asm.tree.MethodNode) o;
+                if (mn.name.equals(name) && mn.desc.equals(desc)) { access = mn.access; break; }
+            }
+        }
+        if ((access & (0x0008 | 0x0002)) != 0) return false;    // static / private
+        String cur = cn.superName;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        while (cur != null && seen.add(cur)) {
+            ClassNode inJar = graph.getClasses().get(cur);
+            if (inJar != null) {
+                cur = inJar.superName;
+                continue;
+            }
+            if (!cur.startsWith("java/")) return false;        // non-JDK external: rule 11
+            if (cur.equals("java/lang/Object")) return false;  // every class extends Object
+            if (jdkDeclaresMethod(cur, name, desc)) return true;
+            try {
+                Class<?> c = Class.forName(cur.replace('/', '.'), false, null);
+                Class<?> sup = c.getSuperclass();
+                cur = sup == null ? null : sup.getName().replace('.', '/');
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** Does the JDK class declare a non-static, non-private method with this exact signature? */
+    private static boolean jdkDeclaresMethod(String internal, String name, String desc) {
+        try {
+            Class<?> c = Class.forName(internal.replace('/', '.'), false, null);
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals(name)) continue;
+                if (java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                if (java.lang.reflect.Modifier.isPrivate(m.getModifiers())) continue;
+                if (org.objectweb.asm.Type.getMethodDescriptor(m).equals(desc)) return true;
+            }
+        } catch (Throwable ignored) {
+            // Unresolvable JDK class: fall back to the other rules.
         }
         return false;
     }

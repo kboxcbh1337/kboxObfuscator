@@ -107,7 +107,7 @@ public class KBoxClassDecryptTweaker {
             java.security.MessageDigest md = MessageDigest.getInstance("SHA-256");
             md.update(KEY_DOMAIN);
             md.update(seed);
-            md.update(HardwareKeyRing.fingerprint()); // S3: bind to run machine (true HW ring, matches encrypt side)
+            md.update(HardwareKeyRing.fingerprint()); // per-build portable seed factor (matches encrypt side)
             byte[] lm = licMaterial();
             if (lm != null) md.update(lm);           // license gate (matches build)
             byte[] fullKey = md.digest();

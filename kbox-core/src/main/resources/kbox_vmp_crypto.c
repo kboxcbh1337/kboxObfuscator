@@ -184,16 +184,17 @@ static void kbox_hmac(const uint8_t* key, size_t klen, const uint8_t* msg, size_
 }
 
 /* ============================================================ */
-/*  HKDF-SHA256 (RFC 5869 extract+expand), Java-compatible      */
+/*  KDF-SHA256 (RFC-5869-style expand, NON-RFC extract), Java-compatible */
 /* ============================================================ */
 
 /*
  * Mirrors HardwareKeyRing.hkdfSha256(ikm, salt, info, len) EXACTLY.
+ * NOT RFC 5869: the extract stage deviates (see the Java javadoc) —
  * Java branch (salt non-empty):
  *   prk = HMAC(key=ikm, msg = salt || ikm)
  * else:
  *   prk = ikm
- * Then expand:
+ * Then expand (this stage does follow RFC 5869):
  *   okm = HMAC(prk, T || info || ctr)  for ctr=1,2,...
  *   T starts empty and advances.
  *

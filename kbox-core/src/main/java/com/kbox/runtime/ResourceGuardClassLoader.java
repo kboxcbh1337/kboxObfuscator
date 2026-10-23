@@ -34,7 +34,10 @@ public final class ResourceGuardClassLoader extends ClassLoader {
     private final ClassLoader delegate;
     private final Map<String, Entry> map = new HashMap<>();
     private final byte[] seed;
-    private final Map<String, byte[]> cache = new HashMap<>();
+    // ConcurrentHashMap: class loading is concurrent by nature (app threads +
+    // parallel class init can all trigger getResource/findClass), and the
+    // decrypt-on-first-use cache below is mutated lazily at load time.
+    private final Map<String, byte[]> cache = new java.util.concurrent.ConcurrentHashMap<>();
 
     // Anti-Dump state
     private byte[] classSeed;
@@ -395,7 +398,7 @@ public final class ResourceGuardClassLoader extends ClassLoader {
         java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
         md.update("KBox-ClassGuard-v1:".getBytes(StandardCharsets.UTF_8));
         md.update(classSeed);
-        md.update(HardwareKeyRing.fingerprint()); // S3: bind to run machine (true HW ring, matches encrypt side)
+        md.update(HardwareKeyRing.fingerprint()); // per-build portable seed factor (matches encrypt side)
         if (LIC_MATERIAL != null) md.update(LIC_MATERIAL); // license gate (matches build)
         byte[] key = md.digest();
         javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");

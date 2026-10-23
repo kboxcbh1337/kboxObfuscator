@@ -104,7 +104,9 @@ public final class AutoJnicVmpSelector {
                 ? Math.max(JNIC_MIN_SIZE, JNIC_LAYER_MIN)
                 : (cfg.isJnicFullCoverage() ? 1 : JNIC_MIN_SIZE);
         int maxCount = cfg.isJnicFullCoverage() ? Integer.MAX_VALUE : JNIC_MAX;
-        List<MethodEntry> candidates = collectCandidates(minSize, -1, true);
+        java.util.LinkedHashMap<String, Integer> jnicSkips = new java.util.LinkedHashMap<>();
+        List<MethodEntry> candidates = collectCandidates(minSize, -1, true, jnicSkips);
+        logSkipHistogram("JNIC", jnicSkips);
         // VMP selects FIRST; a method already virtualized by VMP must never be
         // sunk to native afterwards — otherwise it ends up BOTH marked native AND
         // re-wrapped with a VMP execute stub (a native method carrying a Code
@@ -173,7 +175,9 @@ public final class AutoJnicVmpSelector {
         int maxSize = layered ? JNIC_LAYER_MIN - 1
                 : (cfg.isVmpFullCoverage() ? -1 : VMP_MAX_SIZE);
         int maxCount = cfg.isVmpFullCoverage() ? Integer.MAX_VALUE : VMP_MAX;
-        List<MethodEntry> candidates = collectCandidates(minSizePlus0, maxSize, false);
+        java.util.LinkedHashMap<String, Integer> vmpSkips = new java.util.LinkedHashMap<>();
+        List<MethodEntry> candidates = collectCandidates(minSizePlus0, maxSize, false, vmpSkips);
+        logSkipHistogram("VMP", vmpSkips);
         if (candidates.isEmpty()) {
             KBoxLog.warn(TAG, "VMP auto-select: no eligible methods found");
             return;
@@ -285,7 +289,8 @@ public final class AutoJnicVmpSelector {
 
     // ---- Candidate collection ----
 
-    private List<MethodEntry> collectCandidates(int minSize, int maxSize, boolean forJnic) {
+    private List<MethodEntry> collectCandidates(int minSize, int maxSize, boolean forJnic,
+                                                java.util.LinkedHashMap<String, Integer> skipReasons) {
         List<MethodEntry> out = new ArrayList<>();
         for (ClassNode cn : graph.getClasses().values()) {
             // VMP/JNIC only replace a method's BODY; they never rename the class
@@ -294,29 +299,52 @@ public final class AutoJnicVmpSelector {
             // single-class app whose only class is the auto-kept Main would get
             // zero VMP/JNIC coverage. Still excluded here: library, out-of-scope
             // and KBox-runtime classes (see shouldProtectClass).
-            if (!cfg.shouldProtectClass(cn.name)) continue;
+            if (!cfg.shouldProtectClass(cn.name)) { bump(skipReasons, "class kept/library"); continue; }
             // Split eligibility: JNIC honours jnicExcludePrefixes, VMP honours
             // vmpExcludePrefixes; both honour the shared native blacklist.
             boolean eligible = forJnic ? cfg.isJnicEligible(cn.name) : cfg.isVmpEligible(cn.name);
-            if (!eligible) continue;
+            if (!eligible) { bump(skipReasons, forJnic ? "jnic-exclude-prefix" : "vmp-exclude-prefix"); continue; }
             for (MethodNode mn : cn.methods) {
-                if (!isEligible(cn.name, mn)) continue;
+                String why = isEligibleReason(cn.name, mn, forJnic);
+                if (why != null) { bump(skipReasons, why); continue; }
                 int size = countInstructions(mn);
-                if (size < minSize) continue;
-                if (maxSize > 0 && size > maxSize) continue;
+                if (size < minSize) { bump(skipReasons, "below size floor"); continue; }
+                if (maxSize > 0 && size > maxSize) { bump(skipReasons, "above size cap"); continue; }
                 out.add(new MethodEntry(cn.name, mn.name, mn.desc, size));
             }
         }
         return out;
     }
 
+    private static void bump(java.util.LinkedHashMap<String, Integer> m, String reason) {
+        m.merge(reason, 1, Integer::sum);
+    }
+
+    /** VMP-19: print the skip-reason histogram at INFO so operators can see
+     *  exactly why methods were NOT selected (previously DEBUG-only / absent). */
+    private static void logSkipHistogram(String selector,
+                                         java.util.LinkedHashMap<String, Integer> skips) {
+        if (skips.isEmpty()) return;
+        StringBuilder sb = new StringBuilder("skip reasons: ");
+        boolean first = true;
+        for (java.util.Map.Entry<String, Integer> e : skips.entrySet()) {
+            if (!first) sb.append(", ");
+            sb.append(e.getKey()).append("=").append(e.getValue());
+            first = false;
+        }
+        KBoxLog.info(TAG, selector + " auto-select " + sb);
+    }
+
     /**
-     * Checks whether a method is eligible for JNIC/VMP.
+     * Checks whether a method is eligible for JNIC/VMP. Returns {@code null}
+     * when eligible, otherwise the skip reason (for the coverage histogram —
+     * VMP-19: previously every below reason was silently swallowed and the
+     * coverage report over-counted).
      * Excludes: abstract, native, bridge, init, clinit, kept members,
      * methods with unsupported bytecode patterns.
      */
     @SuppressWarnings("unchecked")
-    private boolean isEligible(String owner, MethodNode mn) {
+    private String isEligibleReason(String owner, MethodNode mn, boolean forJnic) {
         // Interfaces and annotation types may only declare `public static final`
         // fields, so neither VMP nor JNIC can inject the state they need
         // (VMP's `$vmp_*` fields are private|static -> ClassFormatError: Illegal
@@ -325,23 +353,23 @@ public final class AutoJnicVmpSelector {
         ClassNode ownerNode = graph.getClasses().get(owner);
         if (ownerNode != null
                 && (ownerNode.access & (Opcodes.ACC_INTERFACE | 0x2000 /* ACC_ANNOTATION */)) != 0) {
-            return false;
+            return "interface/annotation owner";
         }
         // Skip abstract/native/bridge — no body to protect
         int acc = mn.access;
         if ((acc & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) != 0)
-            return false;
+            return "abstract/native/bridge";
         // Skip constructors and static init — protecting them rarely adds value
-        if ("<init>".equals(mn.name) || "<clinit>".equals(mn.name)) return false;
+        if ("<init>".equals(mn.name) || "<clinit>".equals(mn.name)) return "ctor/clinit";
         // Skip javac synthetic lambda impl methods (lambda$N). They are the
         // MethodHandles referenced by invokedynamic bootstraps (LambdaMetafactory);
         // marking them native would clear their bodies and make the JVM fail to
         // build a lambda ("MethodHandle is not direct"), and no JNI binding is
         // registered for them. They stay as ordinary Java methods.
-        if (mn.name.startsWith("lambda$")) return false;
+        if (mn.name.startsWith("lambda$")) return "lambda synthetic";
         // Skip kept members
         String key = ProtectionConfig.memberKey(owner, mn.name, mn.desc);
-        if (cfg.getKeepMembers().contains(key)) return false;
+        if (cfg.getKeepMembers().contains(key)) return "kept member";
         // MULTIANEWARRAY (multi-dimensional array allocation) is not yet safe in
         // the native interpreter when the array is subsequently iterated by an
         // interpreter loop (EXCEPTION_ACCESS_VIOLATION). Single allocation +
@@ -349,7 +377,7 @@ public final class AutoJnicVmpSelector {
         // methods as ordinary Java (the pre-change, always-correct behaviour).
         // tableswitch/lookupswitch/invokedynamic are fully supported natively.
         for (AbstractInsnNode insn : mn.instructions) {
-            if (insn.getOpcode() == Opcodes.MULTIANEWARRAY) return false;
+            if (insn.getOpcode() == Opcodes.MULTIANEWARRAY) return "multianewarray";
         }
         // String/IO safety: the JNIC C interpreter's string & console handling is
         // not byte-faithful to the JVM for non-trivial bodies, so methods that
@@ -357,16 +385,23 @@ public final class AutoJnicVmpSelector {
         // (the documented "JNIC sinks pure logic" boundary). Without this,
         // nativeCoverage=full would sink Greeter-like methods and produce a
         // silently wrong (null/blank) entry point.
-        for (AbstractInsnNode insn : mn.instructions) {
-            if (insn instanceof LdcInsnNode) {
-                LdcInsnNode l = (LdcInsnNode) insn;
-                if (l.cst instanceof String) return false;
-            } else if (insn instanceof MethodInsnNode) {
-                MethodInsnNode mi = (MethodInsnNode) insn;
-                if (mi.owner.equals("java/io/PrintStream")) return false;
+        // VMP-19: this gate is JNIC-SPECIFIC. The VMP interpreter is a Java
+        // implementation with full String/PrintStream support — sharing the
+        // gate silently excluded most real business methods (they log or carry
+        // messages) from VMP while the coverage report still claimed high
+        // coverage. VMP applies the structural checks above only.
+        if (forJnic) {
+            for (AbstractInsnNode insn : mn.instructions) {
+                if (insn instanceof LdcInsnNode) {
+                    LdcInsnNode l = (LdcInsnNode) insn;
+                    if (l.cst instanceof String) return "string constant (JNIC IO gate)";
+                } else if (insn instanceof MethodInsnNode) {
+                    MethodInsnNode mi = (MethodInsnNode) insn;
+                    if (mi.owner.equals("java/io/PrintStream")) return "PrintStream (JNIC IO gate)";
+                }
             }
         }
-        return true;
+        return null;
     }
 
     /**

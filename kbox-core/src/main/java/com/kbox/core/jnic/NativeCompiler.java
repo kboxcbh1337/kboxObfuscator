@@ -102,6 +102,44 @@ public final class NativeCompiler {
         return out;
     }
 
+    // NAT-11: hardening flags shared by ALL native compile entry points — they
+    // used to be hand-copied per entry and the sharded/multi paths silently
+    // lost RELRO and the MSVC stack cookie.
+    private static final String[] GCC_HARDEN_CFLAGS = {
+            "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2", "-fno-plt" };
+    private static final String[] GCC_HARDEN_LDFLAGS = { "-Wl,-z,relro,-z,now" };
+    private static final String[] MSVC_HARDEN_FLAGS = { "/GS", "/guard:cf" };
+
+    private static boolean isMsvc(String cc) {
+        String s = cc.toLowerCase(Locale.ROOT);
+        return s.endsWith("cl.exe") || s.endsWith("cl");
+    }
+
+    /**
+     * NAT-14: emits the K-OTP nativeSeed() export with the seed XOR-split into
+     * three per-build random .rdata immediates, recombined in registers at
+     * call time. A single 64-bit immediate previously sat in .rdata where one
+     * disassembly pass extracted the whole JNIC bytecode-decryption key root.
+     * The three constants are individually meaningless; the recombination
+     * happens only in registers, so the product contains no contiguous seed.
+     */
+    private static void appendKotpSeedExport(StringBuilder out, long otpSeed) {
+        java.util.concurrent.ThreadLocalRandom r = java.util.concurrent.ThreadLocalRandom.current();
+        long c2 = r.nextLong();
+        long c3 = r.nextLong();
+        long c1 = otpSeed ^ c2 ^ c3;   // s = c1 ^ c2 ^ c3
+        out.append("/* === K-OTP native build seed (one-time-program key root). === */\n");
+        out.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed\n");
+        out.append("    (JNIEnv* env, jclass cls) {\n");
+        out.append("  (void)env; (void)cls;\n");
+        out.append("  const uint64_t _p1 = 0x").append(String.format("%016x", c1)).append("ULL;\n");
+        out.append("  const uint64_t _p2 = 0x").append(String.format("%016x", c2)).append("ULL;\n");
+        out.append("  const uint64_t _p3 = 0x").append(String.format("%016x", c3)).append("ULL;\n");
+        out.append("  uint64_t s = (_p1 ^ _p2) ^ _p3;\n");
+        out.append("  return (jlong)(s ^ (s >> 33) ^ 0xA24BAED4963EE407ULL);\n");
+        out.append("}\n\n");
+    }
+
     private Result compileWith(String cc, Path cSource, Path outputDir, String libName) {
         List<String> cmd = new ArrayList<>();
         Path libOut = outputDir.resolve(libFileName(libName));
@@ -115,11 +153,8 @@ public final class NativeCompiler {
         // interpreter's dispatch frames intact under smash attempts, FORTIFY
         // turns unchecked libc calls into checked ones, and -fno-plt removes
         // the PLT indirection that hooking tools patch first.
-        if (!cc.toLowerCase(Locale.ROOT).endsWith("cl.exe")
-                && !cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
-            cmd.add("-fstack-protector-strong");
-            cmd.add("-D_FORTIFY_SOURCE=2");
-            cmd.add("-fno-plt");
+        if (!isMsvc(cc)) {
+            for (String f : GCC_HARDEN_CFLAGS) cmd.add(f);
         }
         cmd.add("-I"); cmd.add(normalizeJdkInclude());
         String plat = platformInclude();
@@ -128,13 +163,12 @@ public final class NativeCompiler {
             cmd.add("-I"); cmd.add(p.toString());
         }
         // MSVC uses different syntax; detect and switch.
-        if (cc.toLowerCase(Locale.ROOT).endsWith("cl.exe") || cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
+        if (isMsvc(cc)) {
             cmd.clear();
             cmd.add(cc);
             cmd.add("/LD");                 // build DLL
             cmd.add("/O1");                 // /O2 was the JNIC gcc bottleneck; /O1 keeps interp throughput
-            cmd.add("/GS");                 // stack cookie (MSVC equivalent of stack-protector)
-            cmd.add("/guard:cf");           // control-flow guard on indirect calls
+            for (String f : MSVC_HARDEN_FLAGS) cmd.add(f);   // stack cookie + CFG
             cmd.add("/I"); cmd.add(normalizeJdkInclude());
             if (plat != null) cmd.add("/I:" + normalizeJdkInclude() + "/" + plat);
             cmd.add(cSource.toString());
@@ -143,7 +177,7 @@ public final class NativeCompiler {
             // ELF-only link hardening: RELRO + immediate binding removes the
             // writable GOT window used by PLT/GOT hijack hooks.
             if (!isWindows()) {
-                cmd.add("-Wl,-z,relro,-z,now");
+                for (String f : GCC_HARDEN_LDFLAGS) cmd.add(f);
             }
             cmd.add("-o"); cmd.add(libOut.toString());
             cmd.add(cSource.toString());
@@ -289,8 +323,10 @@ public final class NativeCompiler {
      * @param otpSeed K-OTP 原生种子（0 = 不生成）。非 0 时额外导出
      *                {@code Java_com_kbox_runtime_KotpRuntime_nativeSeed}，并在
      *                {@code registerNatives0} 中把它绑定到
-     *                {@code com.kbox.runtime.KotpRuntime.nativeSeed()J}。种子只存在于
-     *                该原生库内（库本身还会被 KBNL + kboXShield 加壳），Java 侧无法静态获得。
+     *                {@code com.kbox.runtime.KotpRuntime.nativeSeed()J}。种子以
+     *                XOR 三段拆分形式存在于该原生库内（库本身还会被 KBNL +
+     *                kboXShield 加壳），重组仅在寄存器中瞬时完成，产物中不含
+     *                连续的 64 位种子立即数（NAT-14）。
      */
     public static String assembleInterpSource(List<JniBytecodeInterp.InterpFn> fns,
                                               java.util.Map<String, java.util.Map<String, Integer>> classMethodCounts,
@@ -367,14 +403,10 @@ public final class NativeCompiler {
         sb.append("}\n\n");
 
         if (otpSeed != 0L) {
-            // The K-OTP seed exists only here (inside the packed native image).
-            sb.append("/* === K-OTP native build seed (one-time-program key root). === */\n");
-            sb.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed\n");
-            sb.append("    (JNIEnv* env, jclass cls) {\n");
-            sb.append("  (void)env; (void)cls;\n");
-            sb.append("  uint64_t s = 0x").append(String.format("%016x", otpSeed)).append("ULL;\n");
-            sb.append("  return (jlong)(s ^ (s >> 33) ^ 0xA24BAED4963EE407ULL);\n");
-            sb.append("}\n\n");
+            // The K-OTP seed root lives only inside the packed native image;
+            // it is XOR-split into per-build random segments (NAT-14) so a
+            // single .rdata immediate no longer yields the key offline.
+            appendKotpSeedExport(sb, otpSeed);
         }
 
         // === JNI-named exports with correct parameter types. ===
@@ -401,8 +433,16 @@ public final class NativeCompiler {
             String shortSym = "Java_" + mangleJni(fn.javaClass) + "_" + mangleJni(fn.javaName);
             String longSym = shortSym + jniSigSuffix(fn.javaDesc);
             String bodySym = overloaded ? longSym : shortSym;
+            // KBX-NAT-02: forward the JVM-provided 2nd argument instead of NULL.
+            // Via dynamic JNI lookup the JVM passes the receiver (jobject) for
+            // instance methods and the declaring jclass for static methods —
+            // exactly what the interpreter stub expects in _recv for each case
+            // (owner anchor via GetObjectClass / (jclass) cast, and locals[0]
+            // for instance methods). Forwarding NULL crashed instance methods
+            // (GetObjectClass(env,NULL) → NULL owner) and broke static-method
+            // class resolution in plain-launch / third-party-loader products.
             StringBuilder cParams = new StringBuilder("JNIEnv* env, jclass cls");
-            StringBuilder callArgs = new StringBuilder("env, NULL");
+            StringBuilder callArgs = new StringBuilder("env, cls");
             int argIdx = 0;
             if (fn.javaDesc != null && fn.javaDesc.startsWith("(")) {
                 int endIdx = fn.javaDesc.indexOf(')');
@@ -487,7 +527,10 @@ public final class NativeCompiler {
         sb.append("#include <stdio.h>\n");
         // <math.h> supplies the NAN / INFINITY macros used by generated hex-float
         // and special-value constant arrays (NaN, +-Infinity LDC constants).
-        sb.append("#include <math.h>\n\n");
+        sb.append("#include <math.h>\n");
+        // NAT-09: generated stubs spin with sched_yield() while another thread
+        // runs the one-time CP initialization (POSIX only; Windows uses Sleep).
+        sb.append("#if !defined(_WIN32)\n#include <sched.h>\n#endif\n\n");
         // Forward-declare the v3 interpreter (encrypted bytecode + execution erasure).
         sb.append("typedef union { jint i; jlong l; jfloat f; jdouble d; } kbox_value_t;\n");
         sb.append("kbox_value_t kbox_jvm_interp_v3(JNIEnv*, jobject, const unsigned char*, int, void**, int, int, uint8_t*);\n\n");
@@ -604,13 +647,7 @@ public final class NativeCompiler {
         }
         main.append("}\n\n");
         if (otpSeed != 0L) {
-            main.append("/* === K-OTP native build seed (one-time-program key root). === */\n");
-            main.append("JNIEXPORT jlong JNICALL Java_com_kbox_runtime_KotpRuntime_nativeSeed\n");
-            main.append("    (JNIEnv* env, jclass cls) {\n");
-            main.append("  (void)env; (void)cls;\n");
-            main.append("  uint64_t s = 0x").append(String.format("%016x", otpSeed)).append("ULL;\n");
-            main.append("  return (jlong)(s ^ (s >> 33) ^ 0xA24BAED4963EE407ULL);\n");
-            main.append("}\n\n");
+            appendKotpSeedExport(main, otpSeed);
         }
         out.add(main.toString());
 
@@ -797,8 +834,8 @@ public final class NativeCompiler {
     /**
      * JNI signature suffix used in the LONG export symbol for overloaded
      * methods: {@code __} + the JNI-mangled parameter list (primitive letters
-     * kept, reference types as the mangled class name without the leading 'L'
-     * and with the trailing ';' encoded as '_2', arrays as '_3' + element).
+     * kept, reference types as {@code 'L' + mangled class name + "_2"} for the
+     * trailing ';', arrays as '_3' + element).
      * Returns "" for a descriptor with no parameters — the long name of a
      * no-arg method is the bare symbol.
      */
@@ -813,7 +850,11 @@ public final class NativeCompiler {
                 sb.append("_3");
                 p++;
             } else if (ch == 'L') {
-                p++; // consume 'L' (omitted from the mangled form)
+                sb.append('L'); // JNI long names KEEP the leading 'L' of an
+                                // object type: e.g. (Ljava/lang/String;I) is
+                                // mangled as __Ljava_lang_String_2I. Dropping
+                                // it made every overloaded export unresolvable.
+                p++;
                 int start = p;
                 while (p < endIdx && desc.charAt(p) != ';') p++;
                 sb.append(mangleJni(desc.substring(start, p)));
@@ -973,6 +1014,7 @@ public final class NativeCompiler {
         cmd.add("-fvisibility=hidden"); // hide non-JNIEXPORT symbols
         cmd.add("-s");                 // strip .symtab: no static identifier names
         cmd.add("-O1");                // -O1 vs -O2: ~2-3x faster gcc, ~same throughput
+        for (String f : GCC_HARDEN_CFLAGS) cmd.add(f);   // NAT-11: keep parity with compileWith
         cmd.add("-I"); cmd.add(normalizeJdkInclude());
         String plat = platformInclude();
         if (plat != null) {
@@ -980,10 +1022,11 @@ public final class NativeCompiler {
             cmd.add("-I"); cmd.add(p.toString());
         }
         // MSVC path
-        if (cc.toLowerCase(Locale.ROOT).endsWith("cl.exe") || cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
+        if (isMsvc(cc)) {
             cmd.clear();
             cmd.add(cc);
             cmd.add("/LD"); cmd.add("/O1");
+            for (String f : MSVC_HARDEN_FLAGS) cmd.add(f);   // NAT-11: stack cookie + CFG
             cmd.add("/I"); cmd.add(normalizeJdkInclude());
             if (plat != null) { String p = normalizeJdkInclude() + "\\" + plat; cmd.add("/I"); cmd.add(p); }
             for (Path s : sources) cmd.add(s.toString());
@@ -995,6 +1038,9 @@ public final class NativeCompiler {
             cmd.add("/OPT:REF");
             cmd.add("/OPT:ICF");
         } else {
+            if (!isWindows()) {
+                for (String f : GCC_HARDEN_LDFLAGS) cmd.add(f);   // NAT-11: RELRO
+            }
             cmd.add("-o"); cmd.add(libOut.toString());
             for (Path s : sources) cmd.add(s.toString());
         }
@@ -1041,7 +1087,7 @@ public final class NativeCompiler {
         if (cc == null) {
             return new Result(false, null, "No C compiler found.");
         }
-        if (cc.toLowerCase(Locale.ROOT).endsWith("cl.exe") || cc.toLowerCase(Locale.ROOT).endsWith("cl")) {
+        if (isMsvc(cc)) {
             return compileMulti(cFiles, outputDir, libName);
         }
         Path libOut = outputDir.resolve(libFileName(libName));
@@ -1050,6 +1096,7 @@ public final class NativeCompiler {
         base.add("-O1");
         base.add("-fPIC");
         base.add("-fvisibility=hidden");
+        for (String f : GCC_HARDEN_CFLAGS) base.add(f);   // NAT-11: keep parity with compileWith
         base.add("-I"); base.add(normalizeJdkInclude());
         String plat = platformInclude();
         if (plat != null) {
@@ -1119,6 +1166,9 @@ public final class NativeCompiler {
         link.add("-shared");
         link.add("-O1");
         link.add("-s");
+        if (!isWindows()) {
+            for (String f : GCC_HARDEN_LDFLAGS) link.add(f);   // NAT-11: RELRO
+        }
         for (Path o : objs) link.add(o.toString());
         link.add("-o"); link.add(libOut.toString());
         KBoxLog.info(TAG, "Linking native lib from " + objs.size() + " objects: "

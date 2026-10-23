@@ -177,6 +177,9 @@ textarea:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
 .console-bar .clear{margin-left:auto;cursor:pointer;color:var(--text-dim);transition:color .3s;background:none;border:none;font-size:12px}
 .console-bar .clear:hover{color:var(--green-2)}
 #log{height:268px;overflow-y:auto;padding:12px 15px;font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;line-height:1.7}
+#shLog{height:268px;overflow-y:auto;padding:12px 15px;font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;line-height:1.7}
+#shLog .ln{white-space:pre-wrap;word-break:break-all}
+#shLog .l-debug{color:var(--text-faint)}#shLog .l-info{color:var(--text-dim)}#shLog .l-warn{color:#fbbf24}#shLog .l-error{color:var(--danger)}
 #log .ln{white-space:pre-wrap;word-break:break-all;animation:lineIn .3s ease both}
 #log .ln b{font-weight:600}
 #log .l-debug{color:var(--text-faint)}#log .l-info{color:var(--text-dim)}#log .l-warn{color:#fbbf24}#log .l-error{color:var(--danger)}
@@ -200,6 +203,14 @@ textarea:focus{border-color:var(--green-2);box-shadow:0 0 0 3px var(--glow)}
 .err-box{display:none;margin-top:14px;padding:15px 17px;border-radius:14px;border:1px solid var(--danger);
   background:color-mix(in srgb,var(--danger) 8%,transparent);font-size:13px;color:var(--danger);white-space:pre-wrap;word-break:break-all}
 .err-box.show{display:block;animation:rise .6s}
+.head-right{display:flex;align-items:center;gap:12px}
+.prod-switch{display:flex;padding:4px;border-radius:12px;border:1px solid var(--border);
+  background:color-mix(in srgb,var(--surface-2) 72%,transparent)}
+.prod-btn{background:transparent;border:0;border-radius:9px;padding:8px 14px;cursor:pointer;
+  color:var(--text-dim);font-weight:700;font-size:12.5px;letter-spacing:.03em;transition:all .2s}
+.prod-btn:hover{color:var(--text)}
+.prod-btn.active{background:color-mix(in srgb,var(--green-3) 22%,transparent);color:var(--green-2);
+  box-shadow:0 0 18px color-mix(in srgb,var(--green-3) 26%,transparent)}
 footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26px;letter-spacing:.06em}
 @media(max-width:720px){.file-row{flex-direction:column;align-items:stretch}.file-row label{width:auto}}
 </style>
@@ -221,10 +232,18 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
         <p>ZKM-LEVEL · JNIC NATIVE · VMP VIRTUALIZATION</p>
       </div>
     </div>
-    <button class="theme-btn" id="themeBtn" title="切换主题">
-      <span class="sun">☀</span><span class="moon">☾</span>
-    </button>
+    <div class="head-right">
+      <div class="prod-switch" id="prodSwitch">
+        <button class="prod-btn active" data-prod="obf" onclick="switchProduct('obf')">kboxObf</button>
+        <button class="prod-btn" data-prod="shield" onclick="switchProduct('shield')">kboXShield</button>
+      </div>
+      <button class="theme-btn" id="themeBtn" title="切换主题">
+        <span class="sun">☀</span><span class="moon">☾</span>
+      </button>
+    </div>
   </header>
+
+  <div id="pageObf">
 
   <!-- 目标文件 -->
   <section class="card">
@@ -396,6 +415,63 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
     <div class="summary" id="summary"></div>
     <div class="err-box" id="errBox"></div>
   </section>
+  </div><!-- /pageObf -->
+
+  <!-- ============ kboXShield（独立 PE 保护） ============ -->
+  <div id="pageShield" style="display:none">
+    <section class="card">
+      <div class="sec-title"><span class="dot"></span>PE 保护目标 <small>DLL / EXE · 独立于 JAR 流水线</small></div>
+      <div class="file-row"><label>输入 PE</label>
+        <input id="shIn" placeholder="D:\path\to\lib.dll" spellcheck="false">
+        <button class="btn btn-ghost" onclick="browse('open','shIn')">浏览…</button></div>
+      <div class="file-row"><label>输出 PE</label>
+        <input id="shOut" placeholder="D:\path\to\lib-protected.dll" spellcheck="false">
+        <button class="btn btn-ghost" onclick="browse('save','shOut')">浏览…</button></div>
+      <div class="hint" style="margin-top:10px;color:var(--text-dim);font-size:12px">
+        导出表在打包前后逐项校验：任何具名导出丢失即判定失败（退出码 4），且不会留下输出文件。
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="sec-title"><span class="dot"></span>壳选项 <small>SHIELD OPTIONS</small></div>
+      <div class="row">
+        <div class="field"><label>架构</label>
+          <select id="shArch"><option value="0">auto · 跟随输入</option><option value="64">x64</option><option value="32">x86</option></select></div>
+        <div class="field"><label>运行期防御 defFlags</label>
+          <input id="shDefFlags" value="0" spellcheck="false" placeholder="0（AV 安全）或 0x3FFFF"></div>
+        <div class="field"><label>IR 变异等级</label>
+          <input id="shIr" value="1" spellcheck="false"></div>
+        <div class="field"><label>SROX 等级</label>
+          <select id="shSrox"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></div>
+        <div class="field"><label>SROX 轮数</label>
+          <input id="shRounds" value="4" spellcheck="false"></div>
+        <div class="field" style="flex:1;min-width:200px"><label>构建种子（可选）</label>
+          <input id="shSeed" placeholder="0x1111（留空=随机）" spellcheck="false"></div>
+      </div>
+      <div class="grid" style="margin-top:14px">
+        <label class="toggle"><input type="checkbox" id="shNoCfg"><span class="sw"></span><span class="lbl">关闭 CFG 平坦化<span class="sub">--shield-no-cfg</span></span></label>
+        <label class="toggle"><input type="checkbox" id="shNoVirt"><span class="sw"></span><span class="lbl">关闭函数级虚拟化<span class="sub">--shield-no-virtualize</span></span></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="sec-title"><span class="dot"></span>执行 <small>KBOXSHIELD</small></div>
+      <div class="run-zone">
+        <button class="btn btn-run" id="shRunBtn">开始加壳</button>
+      </div>
+      <div class="status-head" style="margin-top:22px">
+        <span class="status-dot" id="shDot"></span>
+        <div class="status-txt" id="shTxt">就绪<small id="shSub">等待执行</small></div>
+      </div>
+      <div class="console">
+        <div class="console-bar"><span class="led"></span>SHIELD LOG
+          <button class="clear" onclick="document.getElementById('shLog').innerHTML=''">清空</button></div>
+        <div id="shLog"></div>
+      </div>
+      <div class="summary" id="shSummary"></div>
+      <div class="err-box" id="shErr"></div>
+    </section>
+  </div><!-- /pageShield -->
 
   <footer>KBox Obfuscator · 白绿 / 黑绿 双主题 · HTML UI</footer>
 </div>
@@ -554,6 +630,54 @@ async function protect(){
 function flash(msg){const s=$('summary');s.textContent='⚠ '+msg;s.classList.add('show');setTimeout(()=>s.classList.remove('show'),2600);}
 function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 $('runBtn').addEventListener('click',protect);
+
+/* ---------- 产品切换：kboxObf / kboXShield ---------- */
+function switchProduct(p){
+  document.querySelectorAll('.prod-btn').forEach(b=>b.classList.toggle('active', b.dataset.prod===p));
+  $('pageObf').style.display = (p==='obf') ? '' : 'none';
+  $('pageShield').style.display = (p==='shield') ? '' : 'none';
+}
+
+/* ---------- kboXShield（独立 PE 加壳） ---------- */
+let shSince=0, shTimer=null;
+async function runShield(){
+  const i=$('shIn').value.trim(), o=$('shOut').value.trim();
+  if(!i||!o){ flash('请填写输入与输出 PE 路径'); return; }
+  shSince=0; $('shLog').innerHTML=''; $('shSummary').classList.remove('show'); $('shErr').classList.remove('show');
+  $('shTxt').innerHTML='加壳中…<small>kboXShield</small>';
+  const body={ input:i, output:o, arch:+$('shArch').value, defFlags:$('shDefFlags').value.trim(),
+    ir:+$('shIr').value, sroxLevel:+$('shSrox').value, rounds:+$('shRounds').value,
+    seed:$('shSeed').value.trim(), noCfg:$('shNoCfg').checked, noVirt:$('shNoVirt').checked };
+  try{
+    const j=await (await fetch('/api/shield',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)})).json();
+    if(!j.ok){ $('shTxt').textContent='启动失败'; $('shErr').textContent=j.error||'启动失败';
+      $('shErr').classList.add('show'); return; }
+  }catch(e){ $('shTxt').textContent='无法连接后端'; return; }
+  pollShield();
+}
+async function pollShield(){
+  try{
+    const j=await (await fetch('/api/shield/state?since='+shSince)).json();
+    for(const e of (j.entries||[])){
+      shSince=e.s;
+      const d=document.createElement('div');
+      d.className='ln l-'+(e.lvl||'info');
+      d.textContent=e.l;
+      $('shLog').appendChild(d);
+      $('shLog').scrollTop=$('shLog').scrollHeight;
+    }
+    if(j.status==='done'){
+      $('shTxt').innerHTML='完成<small>输出：'+escapeHtml(j.summary||'')+'</small>';
+      $('shSummary').textContent=j.summary||'完成'; $('shSummary').classList.add('show'); return;
+    }
+    if(j.status==='error'){
+      $('shTxt').textContent='失败'; $('shErr').textContent=j.error||''; $('shErr').classList.add('show'); return;
+    }
+    shTimer=setTimeout(pollShield,400);
+  }catch(e){ shTimer=setTimeout(pollShield,900); }
+}
+$('shRunBtn').addEventListener('click',runShield);
 </script>
 </body>
 </html>

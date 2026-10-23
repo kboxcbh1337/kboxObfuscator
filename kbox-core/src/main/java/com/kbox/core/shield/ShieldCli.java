@@ -198,6 +198,22 @@ public final class ShieldCli {
             return r;
         }
         byte[] outBytes = Files.readAllBytes(out);
+        // A packed DLL keeps its original sections as encrypted payload, so the
+        // inherited .edata points at ciphertext and the loader cannot resolve
+        // any export. Rebuild a cleartext export directory in a fresh section
+        // whose EAT entries point at the shifted function RVAs.
+        if (before.isDll && !before.exports.isEmpty()) {
+            byte[] fixed = PeExports.rebuild(inBytes, outBytes);
+            if (fixed == null) {
+                r.ok = false;
+                r.exportsPreserved = false;
+                r.error = "导出表重建失败（节映射不完整或表结构异常）";
+                try { Files.deleteIfExists(out); } catch (IOException ignored) { }
+                return r;
+            }
+            Files.write(out, fixed);
+            outBytes = fixed;
+        }
         r.outputSha256 = sha256(outBytes);
         PeInfo after = PeInfo.parse(outBytes);
         if (!after.valid) {

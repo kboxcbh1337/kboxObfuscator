@@ -20,11 +20,15 @@ java -jar kboxObfuscator.jar --shield-matrix samples\shield\ --shield-out shield
 - `matrix.json`：逐样本 `ok`、`error`、`exportsPreserved`、`missingExports`、前后 SHA-256；
 - `matrix.md`：下表的人工可读版本（工具直接生成，不手填）。
 
-| 样本 | 类型 | 架构 | 具名导出数 | 导出保留 | 结果 | 备注 |
+| 样本 | 类型 | 架构 | 具名导出数 | 导出保留 | 结构校验 | 运行时验证 |
 |---|---|---|---|---|---|---|
-| `kbox-shield-test-x64.dll` | DLL | x64 | 2 | 否 | **FAIL** | 打包后导出目录为空（`exportsAfter=[]`），工具按约定拒绝并删除输出（退出码 4） |
+| `kbox-shield-test-x64.dll` | DLL | x64 | 2 | 是 | PASS | **PASS**（LoadLibrary + GetProcAddress + 调用） |
+| `kbox-shield-tls-x64.dll` | DLL（TLS 回调） | x64 | 1 | 是 | PASS | **PASS**（TLS 回调 + 导出调用） |
+| `kbox-shield-seh-x64.dll` | DLL（C++ 异常） | x64 | 2 | 是 | PASS | **FAIL**（抛异常时 “has no image-section”） |
+| `host.exe` | EXE | x64 | 0 | — | PASS | 未单独执行 |
 
-> 结论（3.0.4）：**DLL 导出表保留尚未实现**。矩阵工具与失败判定已就绪，等导出表重建实现后此行才可能变为 PASS。
+> 结论（3.0.4）：导出表重建已实现，x64 具名导出与 TLS 用例运行时通过；
+> **C++ 异常展开仍失败**，属于已知限制（见 `docs/KBOXSHEID.md` 第 5 节）。
 > 新增样本后请重新运行矩阵并提交 `shield-matrix.json`，不要手工编辑结果。
 
 ---
@@ -33,21 +37,21 @@ java -jar kboxObfuscator.jar --shield-matrix samples\shield\ --shield-out shield
 
 | 维度 | 用例 | 状态 | 证据 / 备注 |
 |---|---|---|---|
-| 架构 | x64 (PE32+) | **FAIL** | 入口可用，但导出表未保留 → 拒绝打包 |
-| 架构 | x86 (PE32) | **未测试** | 缺少 x86 样本；不标支持 |
+| 架构 | x64 (PE32+) | 已测 | 见上表 |
+| 架构 | x86 (PE32) | **未测试** | 缺少 x86 工具链/样本；不标支持 |
 | 编译器 | MSVC | **未测试** | 需 VS 构建样本 |
-| 编译器 | mingw-w64 (GCC) | **FAIL** | 见上表（导出丢失） |
+| 编译器 | mingw-w64 (GCC) | 已测 | 见上表 |
 | 编译器 | Clang/LLVM | **未测试** | — |
-| 导出 | 具名导出 | **未实现** | 打包后目录为空 |
-| 导出 | 序号导出（无名） | **未实现** | 依赖导出表保留 |
+| 导出 | 具名导出 | 已测 | 重建 `.kbxed` 明文节，EAT 指向移位 RVA |
+| 导出 | 序号导出（无名） | **部分** | 仅条目数量保留 |
 | 导出 | `__stdcall` 名字修饰 | **未测试** | 需 C++ 样本 |
 | 加载 | 静态导入（宿主 EXE） | **未测试** | 需真实宿主 |
 | 加载 | `LoadLibrary` + `GetProcAddress` | **未测试** | 需运行时验证 |
 | 加载 | 延迟导入 (delay-load) | **未测试** | — |
-| 运行时 | TLS 回调 | **未测试** | 需 TLS 样本 |
-| 运行时 | SEH / C++ 异常展开 | **未测试** | 需 `/EHsc` 样本 |
+| 运行时 | TLS 回调 | 已测 | x64 样本 PASS |
+| 运行时 | SEH / C++ 异常展开 | **FAIL** | 已重建 .pdata/.xdata，仍报 no image-section |
 | 运行时 | 多线程并发调用导出 | **未测试** | — |
-| 运行时 | 反病毒/EDR 共存 | **未测试（已知风险）** | 默认 `defFlags=0x3FFFF` 在部分 AV 下加载失败；建议 `--shield-def-flags 0` 对照 |
+| 运行时 | 反病毒/EDR 共存 | **未测试（已知风险）** | 默认 `defFlags` 已改为 `0`；需要防御时显式开启并自测 |
 | 打包形态 | 独立 DLL 加壳 | 已测 | `--shield-dll` |
 | 打包形态 | JAR 内 `.dll` 原生库加壳 | 已测 | 混淆配置 `protectNativeLibs=true`（不同能力，勿混用） |
 
@@ -55,10 +59,13 @@ java -jar kboxObfuscator.jar --shield-matrix samples\shield\ --shield-out shield
 
 ## 3. 已知失败与限制
 
-1. **AV 活动期加载失败**：默认运行期防御会与部分实时防护冲突，表现为加载即退出。对照方法：`--shield-def-flags 0` 重测；结果需记录在 `matrix.json` 的 `error` 中。
-2. **序号导出**：只比较条目数量，未验证序号连续性。
-3. **x86**：未实测，不在发布说明中宣称支持。
-4. **导出表校验是静态的**：不覆盖"导出存在但调用即崩溃"的情形；这类问题必须在运行时矩阵中暴露。
+1. **AV 活动期加载失败（已缓解）**：默认 `defFlags` 已从 `0x3FFFF` 改为 `0`，发布默认优先保证可加载；
+   需要主动防御时用 `--shield-def-flags 0x3FFFF` 显式开启，并在目标 AV 环境自测。
+2. **C++ 异常展开 FAIL**：已重建 `.pdata` 与 `.xdata` 副本并翻译全部 RVA，抛异常时 mingw 运行时仍报
+   “has no image-section”。该用例不得标注为支持。
+3. **序号导出**：只比较条目数量，未验证序号连续性。
+4. **x86**：未实测，不在发布说明中宣称支持。
+5. **导出表校验是静态的**：不覆盖"导出存在但调用即崩溃"的情形；这类问题必须在运行时矩阵中暴露。
 
 ---
 

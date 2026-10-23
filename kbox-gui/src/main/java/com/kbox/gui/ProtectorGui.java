@@ -4,6 +4,10 @@ import com.kbox.core.ProtectionPipeline;
 import com.kbox.core.config.ConfigLoader;
 import com.kbox.core.config.ProtectionConfig;
 import com.kbox.core.log.KBoxLog;
+import com.kbox.core.shield.ShieldCli;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -55,6 +59,14 @@ public final class ProtectorGui {
     private volatile String summary = "";
     private volatile String error = "";
 
+    // ---- kboXShield 状态（独立产品页）----
+    private volatile String shStatus = "idle";
+    private volatile String shSummary = "";
+    private volatile String shError = "";
+    private volatile boolean shRunning;
+    private final ConcurrentLinkedQueue<LogEntry> shRing = new ConcurrentLinkedQueue<>();
+    private final AtomicLong shSeq = new AtomicLong();
+
     /** 本轮日志：seq 单调递增，客户端用 since 拉增量。每轮开始时清空。 */
     private final ConcurrentLinkedQueue<LogEntry> ring = new ConcurrentLinkedQueue<>();
     private final AtomicLong seq = new AtomicLong();
@@ -101,8 +113,11 @@ public final class ProtectorGui {
                 System.out.print(line);
                 if (!line.isEmpty()) {
                     ring.add(new LogEntry(seq.incrementAndGet(), levelOf(line), line));
+                    // 同一行也进入 shield 日志环（kboXShield 页每轮开始时清空）。
+                    shRing.add(new LogEntry(shSeq.incrementAndGet(), levelOf(line), line));
                     // 只保留最近 4000 行，防止无限增长。
                     while (ring.size() > 4000) ring.poll();
+                    while (shRing.size() > 4000) shRing.poll();
                 }
             }
         }));
@@ -132,6 +147,8 @@ public final class ProtectorGui {
         server.createContext("/api/state", this::routeState);
         server.createContext("/api/protect", this::routeProtect);
         server.createContext("/api/browse", this::routeBrowse);
+        server.createContext("/api/shield", this::routeShield);
+        server.createContext("/api/shield/state", this::routeShieldState);
         server.createContext("/favicon.ico", ex -> send(ex, 204, "no-cache", ""));
     }
 
@@ -211,6 +228,120 @@ public final class ProtectorGui {
         t.start();
         send(ex, 202, "application/json; charset=utf-8",
                 "{\"ok\":true,\"runId\":" + curRunId + "}");
+    }
+
+    /** 启动 kboXShield（独立 PE 保护，与 JAR 流水线无共享状态）。 */
+    private void routeShield(HttpExchange ex) throws IOException {
+        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+            send(ex, 405, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"POST required\"}");
+            return;
+        }
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        String in = jstr(body, "input");
+        String out = jstr(body, "output");
+        if (in.isEmpty() || out.isEmpty()) {
+            send(ex, 400, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"error\":\"输入与输出 PE 均为必填\"}");
+            return;
+        }
+        if (shRunning) {
+            send(ex, 409, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"error\":\"已有加壳任务正在执行\"}");
+            return;
+        }
+        shRunning = true;
+        shStatus = "running";
+        shSummary = "";
+        shError = "";
+        shRing.clear();
+        shSeq.set(0);
+        final String b = body;
+        Thread t = new Thread(() -> runShield(in, out, b), "kbox-shield");
+        t.setDaemon(false);
+        t.start();
+        send(ex, 202, "application/json; charset=utf-8", "{\"ok\":true}");
+    }
+
+    /** 后台执行一次 kboXShield，状态通过 /api/shield/state 轮询。 */
+    private void runShield(String in, String out, String body) {
+        try {
+            List<String> a = new ArrayList<>();
+            a.add("--shield-dll");
+            a.add(in);
+            a.add("--shield-out");
+            a.add(out);
+            a.add("--shield-report");
+            a.add(out + ".report.json");
+            int arch = jint(body, "arch", 0);
+            if (arch == 32 || arch == 64) {
+                a.add("--shield-arch");
+                a.add(arch == 32 ? "x86" : "x64");
+            }
+            String df = jstr(body, "defFlags");
+            if (!df.isEmpty()) {
+                a.add("--shield-def-flags");
+                a.add(df);
+            }
+            int ir = jint(body, "ir", -1);
+            if (ir >= 0) {
+                a.add("--shield-ir");
+                a.add(String.valueOf(ir));
+            }
+            int srox = jint(body, "sroxLevel", -1);
+            if (srox >= 0) {
+                a.add("--shield-srox-level");
+                a.add(String.valueOf(srox));
+            }
+            int rounds = jint(body, "rounds", -1);
+            if (rounds > 0) {
+                a.add("--shield-srox-rounds");
+                a.add(String.valueOf(rounds));
+            }
+            String seed = jstr(body, "seed");
+            if (!seed.isEmpty()) {
+                a.add("--shield-seed");
+                a.add(seed);
+            }
+            if (jbool(body, "noCfg", false)) a.add("--shield-no-cfg");
+            if (jbool(body, "noVirt", false)) a.add("--shield-no-virtualize");
+            int rc = ShieldCli.run(a.toArray(new String[0]));
+            if (rc == 0) {
+                shStatus = "done";
+                shSummary = out;
+            } else {
+                shStatus = "error";
+                shError = "kboXShield 退出码 " + rc + "（导出表未保留或输入不支持，详见日志）";
+            }
+        } catch (Throwable t) {
+            shStatus = "error";
+            shError = String.valueOf(t);
+            KBoxLog.error("gui", "kboXShield failed", t);
+        } finally {
+            shRunning = false;
+        }
+    }
+
+    /** kboXShield 状态轮询（独立日志环）。 */
+    private void routeShieldState(HttpExchange ex) throws IOException {
+        String q = ex.getRequestURI().getQuery() == null ? "" : ex.getRequestURI().getQuery();
+        long since = paramLong(q, "since", 0);
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"status\":\"").append(shStatus).append('"')
+          .append(",\"summary\":").append(esc(shSummary))
+          .append(",\"error\":").append(esc(shError))
+          .append(",\"running\":").append(shRunning)
+          .append(",\"entries\":[");
+        boolean first = true;
+        for (LogEntry e : shRing) {
+            if (e.s <= since) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"s\":").append(e.s)
+              .append(",\"lvl\":").append(esc(e.lvl))
+              .append(",\"l\":").append(esc(e.line)).append('}');
+        }
+        sb.append("]}");
+        send(ex, 200, "application/json; charset=utf-8", sb.toString());
     }
 
     /** 原生文件选择对话框（EDT）。 */

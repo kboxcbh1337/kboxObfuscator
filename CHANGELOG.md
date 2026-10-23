@@ -14,6 +14,12 @@
 - **兼容性矩阵工具**：一次跑完目录内 DLL/EXE，生成 `matrix.json` / `matrix.md`，未覆盖项明确列为"未测试"。
 - **SED-VX 语义证据扩散（受限首版）**：语义地图 → 关键切片 → 等价实现池 → 构建种子编排 → 逐方法验证，
   配置键 `sedVx` / `sedVxMaxSlices` / `sedVxBudget`，报告 `kbox-work/sedvx-report.json|.md`。
+- **kboXShield DLL 导出表重建**：打包后新增明文 `.kbxed` 节重建导出目录，EAT 指向移位后的函数 RVA；
+  同时重建 x64 `.pdata` 与 `.xdata` 副本并翻译 RVA。宿主实测 `LoadLibrary` + `GetProcAddress` 通过。
+- **kboXShield 默认安全化**：`defFlags` 默认从 `0x3FFFF` 改为 `0`（AV 活动期可加载）；
+  需要主动防御时显式 `--shield-def-flags 0x3FFFF`。
+- **HTML UI 产品切换**：右上角新增 `kboxObf` / `kboXShield` 切换，kboXShield 页真实接入
+  `/api/shield`（架构、defFlags、IR、SROX、种子、CFG/虚拟化开关）并输出实时日志。
 - **长期 MBA**：交织表达式常量支持 `long`；新增变量绑定恒等式（`v == ((v^k)+2*(v&k))-k`）。
 - **确定性构建随机源**（`DetRandom`）：CF / 常量 / SED-VX 的形态选择改为按
   (buildSeed, pass, class) 派生，构建可复现且不随线程数变化。
@@ -41,11 +47,10 @@
 
 ### 已知问题
 
-- **kboXShield 的 DLL 导出表尚未保留**：3.0.4 实测打包后导出目录为空，工具会以退出码 4 拒绝产出
-  （见 `docs/reports/shield-matrix.md`）。因此当前版本不支持"可用"的 DLL 加壳；
-- x86 / TLS / 延迟导入 / SEH 未实测；
-- 默认 `defFlags=0x3FFFF` 在部分反病毒活动期间可能导致加壳产物加载失败，
-  可用 `--shield-def-flags 0` 对照；
+- **C++ 异常展开（SEH）仍不通过**：已重建 `.pdata`/`.xdata`，抛异常时仍报 “has no image-section”；
+  x64 具名导出与 TLS 用例已通过（见 `docs/reports/shield-matrix.md` 与兼容性文档）；
+- x86 / 延迟导入未实测；序号导出只校验数量；
+- 默认 `defFlags` 已改为 `0`（AV 活动期可加载）；如需主动防御请显式开启并自测。
 - 客户端密钥仍无产物外因子，不构成"密钥保密"。
 
 ---

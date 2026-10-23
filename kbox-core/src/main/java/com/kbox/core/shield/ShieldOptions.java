@@ -22,8 +22,12 @@ public final class ShieldOptions {
     /**
      * 启用的运行期检测位掩码（{@link KboxFormat#KBOX_DEF_PEB_DEBUG} 等 18 位）。
      * 0 表示关闭全部运行期防御检查。
+     *
+     * <p>3.0.4 起默认值改为 {@code 0}（AV 安全）：实测在卡巴斯基/火绒等活动期间，
+     * {@code 0x3FFFF} 全防御包会在加载阶段失败（进程直接退出）。发布默认必须"能加载"，
+     * 需要主动防御时显式设置 {@code --shield-def-flags 0x3FFFF} 并自行验证 AV 共存。
      */
-    public int defFlags = 0x0003FFFF;
+    public int defFlags = 0;
 
     /**
      * 分级响应策略位：bit0 = 弱信号延迟后继续、bit1 = 转诱饵路径、

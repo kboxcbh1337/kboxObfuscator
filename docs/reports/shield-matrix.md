@@ -2,7 +2,10 @@
 
 | 样本 | 类型 | 架构 | 导出数 | 导出保留 | 结果 | 备注 |
 |---|---|---|---|---|---|---|
-| `d:\kboxobf\_shieldtest\kbox-shield-test-x64.dll` | DLL | x64 | 2 | 否 | FAIL | 导出表未保留（缺失 2 项） |
+| `d:\kboxobf\_shieldtest\host.exe` | EXE/未知 | x64 | 0 | 是 | PASS | — |
+| `d:\kboxobf\_shieldtest\kbox-shield-seh-x64.dll` | DLL | x64 | 2 | 是 | PASS | — |
+| `d:\kboxobf\_shieldtest\kbox-shield-test-x64.dll` | DLL | x64 | 2 | 是 | PASS | — |
+| `d:\kboxobf\_shieldtest\kbox-shield-tls-x64.dll` | DLL | x64 | 1 | 是 | PASS | — |
 
 ## 未测试（不标注为支持）
 

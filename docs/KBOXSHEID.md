@@ -89,20 +89,22 @@ java -jar kboxObfuscator.jar --shield-matrix samples\ --shield-out shield-out\ \
 
 | 项 | 状态 |
 |---|---|
-| 独立 DLL 入口 + 契约 + 导出表校验 | ✅ 已实现（失败即拒绝，不产出坏 DLL） |
-| DLL 导出表保留（打包后仍可 `GetProcAddress`） | ⛔ **未实现**：3.0.4 实测导出目录丢失，工具以退出码 4 拒绝 |
-| x64 EXE | 已实现，实测样本有限 |
-| x86 (PE32) | 已实现，**未充分实测** |
-| TLS 回调 | 未验证 |
-| 延迟导入 | 未验证 |
-| SEH / C++ 异常展开 | 未验证 |
-| 序号导出 | 未验证（依赖导出表保留） |
-| 反病毒共存 | 已知：默认 `defFlags=0x3FFFF` 在部分 AV 活动期间会导致加载失败；可用 `--shield-def-flags 0` 复测 |
+| 独立 DLL 入口 + 契约 + 导出表校验 | ✅ 已实现 |
+| DLL 导出表重建（打包后仍可 `GetProcAddress`） | ✅ 已实现：新增明文 `.kbxed` 节承载导出目录，EAT 指向移位后的函数 RVA |
+| x64 DLL 运行时加载 + 导出调用 | ✅ 实测 PASS（LoadLibrary + GetProcAddress + 调用返回值正确） |
+| TLS 回调 | ✅ x64 实测 PASS（回调在 OEP 前由 stub 触发） |
+| x64 EXE | 🟡 可打包，样本有限 |
+| C++ 异常展开（SEH / `.pdata`+`.xdata`） | ⛔ 仍失败：已重建 `.pdata` 与 `.xdata` 副本并翻译 RVA，但抛异常时 mingw 运行时仍报 “has no image-section” |
+| x86 (PE32) | 🟡 未实测（本机无 x86 工具链） |
+| 延迟导入 | 🟡 未实测 |
+| 序号导出（无名） | 🟡 部分：条目数量保留，未做名字级验证 |
+| 反病毒共存 | 默认 `defFlags` 已改为 `0`（AV 安全）；需要主动防御时显式 `--shield-def-flags 0x3FFFF` |
 
-> **3.0.4 实测结论**：`docs/reports/shield-matrix.md` 中 x64 DLL 用例为 FAIL，
-> 原因是打包后导出目录为空（`exportsAfter=[]`）。因此当前版本**不能**把"独立 DLL 保护"宣传为可用能力；
-> 它已经具备入口、契约与安全检查，但导出表保留仍待实现。
-> 未列出的组合一律视为**未验证**，不得在发布说明中写成"支持"。
+> **3.0.4 实测结论**（`docs/reports/shield-matrix.md` + 宿主运行时验证）：
+> x64 具名导出 DLL、TLS 回调 DLL 均为 PASS；C++ 异常展开 DLL 为 FAIL（未通过），
+> 该用例已列入已知问题，不得写成“支持”。
+
+未列出的组合一律视为**未验证**，不得在发布说明中写成“支持”。
 
 ---
 

@@ -23,8 +23,9 @@
 | 独立 DLL 加壳入口（`--shield-dll`） | ✅ | `shield/ShieldCli` | CLI + 契约文档 |
 | 输入输出契约 / 退出码 / JSON 报告 | ✅ | `shield/ShieldCli` | `docs/KBOXSHEID.md` |
 | 导出表保留**校验**（静态，失败即拒绝） | ✅ | `shield/ShieldCli.PeInfo` | 缺失即退出码 4 |
-| DLL **导出表重建/保留**（打包后可用） | ⛔ | `shield/ShieldPacker` | 3.0.4 实测 FAIL（`docs/reports/shield-matrix.md`） |
-| x64 DLL 加壳（可被宿主加载） | ⛔ | `shield/ShieldPacker` | 依赖上一项，当前不可用 |
+| DLL **导出表重建**（明文 `.kbxed` 节） | ✅ | `shield/PeExports` | 运行期 GetProcAddress 通过 |
+| x64 DLL 加壳（可被宿主加载） | ✅ | `shield/ShieldPacker` | 宿主测试 PASS |
+| C++ 异常展开（SEH） | ⛔ | — | 实测 FAIL（重建 .pdata/.xdata 仍未通过） |
 | x64 EXE 加壳 | 🟡 | 同上 | 样本有限 |
 | x86 (PE32) | 🟡 | 同上 | 未实测 |
 | TLS 回调 / 延迟导入 / SEH | 🟡 | 同上 | 未验证 |

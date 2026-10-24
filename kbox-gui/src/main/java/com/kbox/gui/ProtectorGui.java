@@ -13,6 +13,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import javax.swing.JFileChooser;
+import javax.swing.JFrame;
 import javax.swing.SwingUtilities;
 import java.awt.Desktop;
 import java.awt.HeadlessException;
@@ -282,6 +283,21 @@ public final class ProtectorGui {
                 a.add("--shield-def-flags");
                 a.add(df);
             }
+            int policy = jint(body, "defPolicy", -1);
+            if (policy >= 0) {
+                a.add("--shield-def-policy");
+                a.add(String.valueOf(policy));
+            }
+            int delay = jint(body, "delay", -1);
+            if (delay >= 0) {
+                a.add("--shield-def-delay");
+                a.add(String.valueOf(delay));
+            }
+            int ticks = jint(body, "ticks", -1);
+            if (ticks > 0) {
+                a.add("--shield-def-ticks");
+                a.add(String.valueOf(ticks));
+            }
             int ir = jint(body, "ir", -1);
             if (ir >= 0) {
                 a.add("--shield-ir");
@@ -297,6 +313,16 @@ public final class ProtectorGui {
                 a.add("--shield-srox-rounds");
                 a.add(String.valueOf(rounds));
             }
+            int verifyRuns = jint(body, "verify", -1);
+            if (verifyRuns > 0) {
+                a.add("--shield-srox-verify");
+                a.add(String.valueOf(verifyRuns));
+            }
+            int maxIr = jint(body, "maxIr", -1);
+            if (maxIr > 0) {
+                a.add("--shield-srox-max-ir");
+                a.add(String.valueOf(maxIr));
+            }
             String seed = jstr(body, "seed");
             if (!seed.isEmpty()) {
                 a.add("--shield-seed");
@@ -304,6 +330,8 @@ public final class ProtectorGui {
             }
             if (jbool(body, "noCfg", false)) a.add("--shield-no-cfg");
             if (jbool(body, "noVirt", false)) a.add("--shield-no-virtualize");
+            if (jbool(body, "noMarked", false)) a.add("--shield-no-marked-sections");
+            if (jbool(body, "noSrox", false)) a.add("--shield-no-srox");
             int rc = ShieldCli.run(a.toArray(new String[0]));
             if (rc == 0) {
                 shStatus = "done";
@@ -344,37 +372,80 @@ public final class ProtectorGui {
         send(ex, 200, "application/json; charset=utf-8", sb.toString());
     }
 
-    /** 原生文件选择对话框（EDT）。 */
+    /**
+     * 原生文件选择对话框。
+     *
+     * <p>修复要点：
+     * <ul>
+     *   <li>先做 {@code GraphicsEnvironment.isHeadless()} 判定，headless 环境直接返回
+     *       可读错误，不再静默返回 null（旧行为表现为“点浏览没反应”）；</li>
+     *   <li>显式 {@code Toolkit.getDefaultToolkit()}：{@code main()}-&gt;launch() 返回后
+     *       AWT 可能尚未初始化，直接 invokeAndWait 会抛
+     *       “Toolkit not initialized”；</li>
+     *   <li>对话框挂到一个 1×1 的常驻透明 owner 上并置顶，避免被浏览器窗口挡住；</li>
+     *   <li>任何异常都写入 {@code error} 字段返回给前端，而不是只打日志。</li>
+     * </ul>
+     */
     private void routeBrowse(HttpExchange ex) throws IOException {
         if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
-            send(ex, 405, "application/json; charset=utf-8", "{\"path\":null}");
+            send(ex, 405, "application/json; charset=utf-8", "{\"path\":null,\"error\":\"POST required\"}");
             return;
         }
         String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
         String mode = jstr(body, "mode");
         String current = jstr(body, "current");
+        if (java.awt.GraphicsEnvironment.isHeadless()) {
+            send(ex, 200, "application/json; charset=utf-8",
+                    "{\"path\":null,\"error\":\"当前为无图形界面环境，请手动输入路径\"}");
+            return;
+        }
         final String[] picked = {null};
+        final String[] err = {null};
         try {
+            java.awt.Toolkit.getDefaultToolkit(); // 确保 AWT 已初始化
             SwingUtilities.invokeAndWait(() -> {
                 try {
                     JFileChooser fc = new JFileChooser();
+                    fc.setDialogTitle("open".equals(mode) ? "选择文件" : "保存到");
                     if (!current.isEmpty()) {
                         try { fc.setSelectedFile(Paths.get(current).toFile()); } catch (Exception ignore) {}
                     }
-                    int r = "open".equals(mode) ? fc.showOpenDialog(null) : fc.showSaveDialog(null);
+                    int r = "open".equals(mode) ? fc.showOpenDialog(dialogOwner()) : fc.showSaveDialog(dialogOwner());
                     if (r == JFileChooser.APPROVE_OPTION && fc.getSelectedFile() != null) {
                         picked[0] = fc.getSelectedFile().getAbsolutePath();
                     }
-                } catch (HeadlessException he) {
-                    KBoxLog.warn("gui", "browse: headless environment");
+                } catch (Throwable t) {
+                    err[0] = String.valueOf(t.getMessage() == null ? t : t.getMessage());
                 }
             });
-        } catch (Exception e) {
-            KBoxLog.warn("gui", "browse dialog failed: " + e.getMessage());
+        } catch (Throwable t) {
+            err[0] = String.valueOf(t.getCause() == null ? t : t.getCause());
+            KBoxLog.warn("gui", "browse dialog failed: " + err[0]);
         }
         send(ex, 200, "application/json; charset=utf-8",
-                "{\"path\":" + (picked[0] == null ? "null" : esc(picked[0])) + "}");
+                "{\"path\":" + (picked[0] == null ? "null" : esc(picked[0]))
+                        + ",\"error\":" + (err[0] == null ? "null" : esc(err[0])) + "}");
     }
+
+    /** 对话框 owner：1×1 置顶透明窗口，防止对话框跑到浏览器后面。 */
+    private static JFrame dialogOwner() {
+        if (dialogOwner == null) {
+            JFrame f = new JFrame("KBox");
+            f.setUndecorated(true);
+            f.setSize(1, 1);
+            try { f.setBackground(new java.awt.Color(0, 0, 0, 0)); } catch (Throwable ignored) { }
+            f.setAlwaysOnTop(true);
+            f.setAutoRequestFocus(true);
+            f.setLocationRelativeTo(null);
+            f.setVisible(true);
+            f.toFront();
+            dialogOwner = f;
+        }
+        return dialogOwner;
+    }
+
+    /** 常驻 owner（仅 EDT 访问）。 */
+    private static volatile JFrame dialogOwner;
 
     // ============================================================
     // 管线执行（后台线程）

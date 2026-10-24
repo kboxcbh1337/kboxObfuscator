@@ -57,11 +57,17 @@ public final class ShieldCli {
         public int arch = ShieldOptions.ARCH_AUTO;
         public Integer defFlags;
         public Integer defPolicy;
+        public Integer defDelayLoops;
+        public Integer defTimingTicks;
+        public Boolean virtualizeMarkedSections;
         public Integer irMutation;
         public Boolean cfgFlatten;
         public Boolean virtualizeFunctions;
+        public Boolean srox;
         public Integer sroxLevel;
         public Integer sroxRounds;
+        public Integer sroxVerifyRuns;
+        public Integer sroxMaxIrInsns;
         public String sroxReport;
         public Long sroxSeed;
         public boolean matrix;
@@ -175,17 +181,27 @@ public final class ShieldCli {
         if (a.arch != ShieldOptions.ARCH_AUTO) opt.arch = a.arch;
         if (a.defFlags != null) opt.defFlags = a.defFlags;
         if (a.defPolicy != null) opt.defPolicy = a.defPolicy;
+        if (a.defDelayLoops != null) opt.defDelayLoops = a.defDelayLoops;
+        if (a.defTimingTicks != null) opt.defTimingTicks = a.defTimingTicks;
+        if (a.virtualizeMarkedSections != null) opt.virtualizeMarkedSections = a.virtualizeMarkedSections;
         if (a.irMutation != null) opt.irMutation = a.irMutation;
         if (a.cfgFlatten != null) opt.cfgFlatten = a.cfgFlatten;
         if (a.virtualizeFunctions != null) opt.virtualizeFunctions = a.virtualizeFunctions;
+        if (a.srox != null) opt.srox = a.srox;
         if (a.sroxLevel != null) opt.sroxLevel = a.sroxLevel;
         if (a.sroxRounds != null) opt.sroxRounds = a.sroxRounds;
+        if (a.sroxVerifyRuns != null) opt.sroxVerifyRuns = a.sroxVerifyRuns;
+        if (a.sroxMaxIrInsns != null) opt.sroxMaxIrInsns = a.sroxMaxIrInsns;
         if (a.sroxReport != null) opt.sroxReport = a.sroxReport;
         if (a.sroxSeed != null) opt.sroxSeed = a.sroxSeed;
         r.options = "arch=" + opt.arch + ",defFlags=0x" + Integer.toHexString(opt.defFlags)
-                + ",defPolicy=" + opt.defPolicy + ",irMutation=" + opt.irMutation
+                + ",defPolicy=" + opt.defPolicy + ",delay=" + opt.defDelayLoops
+                + ",ticks=" + opt.defTimingTicks
+                + ",marked=" + opt.virtualizeMarkedSections
+                + ",irMutation=" + opt.irMutation
                 + ",cfgFlatten=" + opt.cfgFlatten + ",virtualizeFunctions=" + opt.virtualizeFunctions
-                + ",srox=" + opt.srox + "/" + opt.sroxLevel + "/rounds=" + opt.sroxRounds;
+                + ",srox=" + opt.srox + "/" + opt.sroxLevel + "/rounds=" + opt.sroxRounds
+                + "/verify=" + opt.sroxVerifyRuns + "/maxIr=" + opt.sroxMaxIrInsns;
         if (out.getParent() != null) Files.createDirectories(out.getParent());
         StringBuilder log = new StringBuilder();
         boolean packed = ShieldPacker.pack(in.toString(), out.toString(), opt, log);
@@ -460,11 +476,17 @@ public final class ShieldCli {
                 }
                 case "--shield-def-flags": a.defFlags = parseHex(next(argv, i++)); break;
                 case "--shield-def-policy": a.defPolicy = Integer.parseInt(next(argv, i++)); break;
+                case "--shield-def-delay": a.defDelayLoops = Integer.parseInt(next(argv, i++)); break;
+                case "--shield-def-ticks": a.defTimingTicks = Integer.parseInt(next(argv, i++)); break;
+                case "--shield-no-marked-sections": a.virtualizeMarkedSections = false; break;
                 case "--shield-ir": a.irMutation = Integer.parseInt(next(argv, i++)); break;
                 case "--shield-no-cfg": a.cfgFlatten = false; break;
                 case "--shield-no-virtualize": a.virtualizeFunctions = false; break;
+                case "--shield-no-srox": a.srox = false; break;
                 case "--shield-srox-level": a.sroxLevel = Integer.parseInt(next(argv, i++)); break;
                 case "--shield-srox-rounds": a.sroxRounds = Integer.parseInt(next(argv, i++)); break;
+                case "--shield-srox-verify": a.sroxVerifyRuns = Integer.parseInt(next(argv, i++)); break;
+                case "--shield-srox-max-ir": a.sroxMaxIrInsns = Integer.parseInt(next(argv, i++)); break;
                 case "--shield-srox-report": a.sroxReport = next(argv, i++); break;
                 case "--shield-seed": a.sroxSeed = (long) parseHex(next(argv, i++)); break;
                 default:
@@ -493,13 +515,19 @@ public final class ShieldCli {
         System.out.println("  --shield-report <file.json>    write the JSON report here");
         System.out.println("  --shield-matrix <dir|file>     run the compatibility matrix and report");
         System.out.println("  --shield-arch auto|x86|x64     architecture preference");
-        System.out.println("  --shield-def-flags 0xNNNN      runtime defence flags (0 disables)");
-        System.out.println("  --shield-def-policy N          defence policy id");
+        System.out.println("  --shield-def-flags 0xNNNN      runtime defence flags (0 = AV-safe default)");
+        System.out.println("  --shield-def-policy N          defence policy bits (1=delay 2=decoy 4=terminate)");
+        System.out.println("  --shield-def-delay N           weak-signal delay loop count");
+        System.out.println("  --shield-def-ticks N           rdtsc threshold for anti-debug/anti-VM");
+        System.out.println("  --shield-no-marked-sections    skip .textvm* marked-section virtualization");
         System.out.println("  --shield-ir 0..N               IR mutation level");
         System.out.println("  --shield-no-cfg                disable CFG flattening");
         System.out.println("  --shield-no-virtualize         disable function-level virtualization");
+        System.out.println("  --shield-no-srox               disable the SROX build-time search");
         System.out.println("  --shield-srox-level 0..3       SROX level");
-        System.out.println("  --shield-srox-rounds N         SROX rounds");
+        System.out.println("  --shield-srox-rounds N         SROX candidate rounds per function");
+        System.out.println("  --shield-srox-verify N         differential verification runs");
+        System.out.println("  --shield-srox-max-ir N         skip SROX above this IR size");
         System.out.println("  --shield-srox-report <file>    per-build SROX report (differentiation evidence)");
         System.out.println("  --shield-seed 0xNNNN           deterministic build seed");
         System.out.println();

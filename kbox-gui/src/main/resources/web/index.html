@@ -435,22 +435,41 @@ footer{text-align:center;color:var(--text-faint);font-size:11.5px;margin-top:26p
     <section class="card">
       <div class="sec-title"><span class="dot"></span>壳选项 <small>SHIELD OPTIONS</small></div>
       <div class="row">
+        <div class="field"><label>预设</label>
+          <select id="shPreset" onchange="applyShieldPreset(this.value)">
+            <option value="standard" selected>标准（AV 安全）</option>
+            <option value="defense">主动防御（defFlags=0x3FFFF）</option>
+            <option value="pack">仅加壳（不虚拟化 / 不 SROX）</option>
+            <option value="max">最强（更多轮次 + IR2）</option>
+          </select></div>
         <div class="field"><label>架构</label>
           <select id="shArch"><option value="0">auto · 跟随输入</option><option value="64">x64</option><option value="32">x86</option></select></div>
         <div class="field"><label>运行期防御 defFlags</label>
           <input id="shDefFlags" value="0" spellcheck="false" placeholder="0（AV 安全）或 0x3FFFF"></div>
+        <div class="field"><label>防御策略 defPolicy</label>
+          <input id="shPolicy" value="7" spellcheck="false" placeholder="1延迟 2诱饵 4终止"></div>
+        <div class="field"><label>弱信号延迟循环</label>
+          <input id="shDelay" value="20000000" spellcheck="false"></div>
+        <div class="field"><label>rdtsc 阈值</label>
+          <input id="shTicks" value="100000" spellcheck="false"></div>
         <div class="field"><label>IR 变异等级</label>
           <input id="shIr" value="1" spellcheck="false"></div>
         <div class="field"><label>SROX 等级</label>
           <select id="shSrox"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></div>
         <div class="field"><label>SROX 轮数</label>
           <input id="shRounds" value="4" spellcheck="false"></div>
+        <div class="field"><label>SROX 验证轮数</label>
+          <input id="shVerify" value="4" spellcheck="false"></div>
+        <div class="field"><label>SROX 最大 IR</label>
+          <input id="shMaxIr" value="4000" spellcheck="false"></div>
         <div class="field" style="flex:1;min-width:200px"><label>构建种子（可选）</label>
           <input id="shSeed" placeholder="0x1111（留空=随机）" spellcheck="false"></div>
       </div>
       <div class="grid" style="margin-top:14px">
         <label class="toggle"><input type="checkbox" id="shNoCfg"><span class="sw"></span><span class="lbl">关闭 CFG 平坦化<span class="sub">--shield-no-cfg</span></span></label>
         <label class="toggle"><input type="checkbox" id="shNoVirt"><span class="sw"></span><span class="lbl">关闭函数级虚拟化<span class="sub">--shield-no-virtualize</span></span></label>
+        <label class="toggle"><input type="checkbox" id="shNoMarked"><span class="sw"></span><span class="lbl">跳过 .textvm* 标记节<span class="sub">--shield-no-marked-sections</span></span></label>
+        <label class="toggle"><input type="checkbox" id="shNoSrox"><span class="sw"></span><span class="lbl">关闭 SROX 自研究<span class="sub">--shield-no-srox</span></span></label>
       </div>
     </section>
 
@@ -503,10 +522,23 @@ document.addEventListener('click',e=>{
 
 /* ---------- 浏览（后端 JFileChooser） ---------- */
 async function browse(mode,field){
-  const res=await fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mode,current:$(field).value})});
-  const j=await res.json();
-  if(j.path)$(field).value=j.path;
+  try{
+    const res=await fetch('/api/browse',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode,current:$(field).value})});
+    const j=await res.json();
+    if(j.path){ $(field).value=j.path; return; }
+    if(j.error){
+      if(field.indexOf('sh')===0){
+        $('shErr').textContent='浏览失败：'+j.error; $('shErr').classList.add('show');
+      }else{
+        flash('浏览失败：'+j.error);
+      }
+    }
+  }catch(e){
+    if(field.indexOf('sh')===0){
+      $('shErr').textContent='浏览失败：'+e; $('shErr').classList.add('show');
+    }else{ flash('浏览失败：'+e); }
+  }
 }
 
 /* ---------- 状态轮询 ---------- */
@@ -638,6 +670,28 @@ function switchProduct(p){
   $('pageShield').style.display = (p==='shield') ? '' : 'none';
 }
 
+/* ---------- kboXShield 预设 ---------- */
+function applyShieldPreset(p){
+  const set=(id,v)=>{$(id).value=v;};
+  const chk=(id,v)=>{$(id).checked=v;};
+  if(p==='standard'){
+    set('shDefFlags','0'); set('shPolicy','7'); set('shDelay','20000000'); set('shTicks','100000');
+    set('shIr','1'); set('shSrox','3'); set('shRounds','4'); set('shVerify','4'); set('shMaxIr','4000');
+    chk('shNoCfg',false); chk('shNoVirt',false); chk('shNoMarked',false); chk('shNoSrox',false);
+  }else if(p==='defense'){
+    set('shDefFlags','0x3FFFF'); set('shPolicy','7'); set('shDelay','20000000'); set('shTicks','100000');
+    set('shIr','1'); set('shSrox','3'); set('shRounds','4'); set('shVerify','4'); set('shMaxIr','4000');
+    chk('shNoCfg',false); chk('shNoVirt',false); chk('shNoMarked',false); chk('shNoSrox',false);
+  }else if(p==='pack'){
+    set('shDefFlags','0'); set('shIr','0'); set('shSrox','0');
+    chk('shNoCfg',true); chk('shNoVirt',true); chk('shNoMarked',true); chk('shNoSrox',true);
+  }else if(p==='max'){
+    set('shDefFlags','0x3FFFF'); set('shPolicy','7'); set('shDelay','40000000'); set('shTicks','50000');
+    set('shIr','2'); set('shSrox','3'); set('shRounds','6'); set('shVerify','6'); set('shMaxIr','8000');
+    chk('shNoCfg',false); chk('shNoVirt',false); chk('shNoMarked',false); chk('shNoSrox',false);
+  }
+}
+
 /* ---------- kboXShield（独立 PE 加壳） ---------- */
 let shSince=0, shTimer=null;
 async function runShield(){
@@ -646,8 +700,12 @@ async function runShield(){
   shSince=0; $('shLog').innerHTML=''; $('shSummary').classList.remove('show'); $('shErr').classList.remove('show');
   $('shTxt').innerHTML='加壳中…<small>kboXShield</small>';
   const body={ input:i, output:o, arch:+$('shArch').value, defFlags:$('shDefFlags').value.trim(),
+    defPolicy:+$('shPolicy').value, delay:+$('shDelay').value, ticks:+$('shTicks').value,
     ir:+$('shIr').value, sroxLevel:+$('shSrox').value, rounds:+$('shRounds').value,
-    seed:$('shSeed').value.trim(), noCfg:$('shNoCfg').checked, noVirt:$('shNoVirt').checked };
+    verify:+$('shVerify').value, maxIr:+$('shMaxIr').value,
+    seed:$('shSeed').value.trim(),
+    noCfg:$('shNoCfg').checked, noVirt:$('shNoVirt').checked,
+    noMarked:$('shNoMarked').checked, noSrox:$('shNoSrox').checked };
   try{
     const j=await (await fetch('/api/shield',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)})).json();

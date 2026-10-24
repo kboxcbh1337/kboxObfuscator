@@ -51,17 +51,17 @@ public final class BlobLayout {
         }
 
         public static final int BLOB_ENTRY_OFF = 256;
-        public static final int BLOB_CHACHA_OFF = 3825;
+        public static final int BLOB_CHACHA_OFF = 3857;
         public static final int BLOB_IAT_OFF = 24576;
         /** secA（代码，RX）/ secB（数据，RWX）切分点。 */
         public static final int BLOB_CODE_END_OFF = 20480;
         /** x86 stub 未导出独立 dispatch 桩（与原始构建一致）。 */
         public static final int BLOB_DISPATCH_OFF = 0;
-        public static final int BLOB_STRPOOL_OFF = 3576;
-        public static final int BLOB_DEFENSE_END_OFF = 3825;
-        public static final int BLOB_CFGROOT_OFF = 1336;
-        public static final int BLOB_JUNK_START_OFF = 12704;
-        public static final int BLOB_JUNK_END_OFF = 18848;
+        public static final int BLOB_STRPOOL_OFF = 3608;
+        public static final int BLOB_DEFENSE_END_OFF = 3857;
+        public static final int BLOB_CFGROOT_OFF = 1368;
+        public static final int BLOB_JUNK_START_OFF = 12736;
+        public static final int BLOB_JUNK_END_OFF = 18880;
         public static final int BLOB_SIZE = 28672;
     }
 

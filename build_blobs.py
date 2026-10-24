@@ -49,6 +49,8 @@ NM = os.path.join(MSYS_BIN, "nm.exe")
 STUB_SRC = os.path.join(HERE, "kbox-shield", "stub")
 ENGINE_OUT = os.path.join(HERE, "kbox-core", "src", "main", "resources", "shield")
 LAYOUT_OUT = os.path.join(STUB_SRC, "build")
+JAVA_LAYOUT = os.path.join(HERE, "kbox-core", "src", "main", "java",
+                           "com", "kbox", "core", "shield", "BlobLayout.java")
 # mingw as 无法处理含非 ASCII 字符的路径，中间文件统一放到 ASCII 临时目录
 WORK = os.path.join(tempfile.gettempdir(), "kbox_blobs")
 
@@ -155,6 +157,34 @@ def build_engine(arch):
           % (arch, arch, os.path.getsize(binout), syms.get("kbox_meta_run", 0)))
 
 
+def verify_java_layout(arch, layout):
+    """校验 BlobLayout.java 中对应架构的常量与本次汇编结果一致。
+
+    Java 侧这些偏移是硬编码常量；stub 任何指令增删都会让后续符号整体漂移。
+    一旦失步，packer 会把配置种子/字符串池 XOR 应用到错误偏移，产物在目标
+    机上表现为 .Ldead 静默死循环（无异常、无日志），极难定位。故设为构建闸门。
+    """
+    if not os.path.exists(JAVA_LAYOUT):
+        return
+    text = open(JAVA_LAYOUT, "r", encoding="utf-8", errors="replace").read()
+    cls = "X64" if arch == "x64" else "X86"
+    m = re.search(r"final class %s \{(.*?)\n    \}" % cls, text, re.S)
+    if not m:
+        raise SystemExit("BlobLayout.java 未找到 %s 内部类" % cls)
+    body = m.group(1)
+    bad = []
+    for name, value in layout:
+        mm = re.search(r"int %s = (-?\d+);" % name, body)
+        if not mm:
+            bad.append("%s 缺失" % name)
+        elif int(mm.group(1)) != value:
+            bad.append("%s: BlobLayout.%s=%s 实际=%d" % (name, cls, mm.group(1), value))
+    if bad:
+        raise SystemExit("BlobLayout.%s 与 stub 汇编结果不一致，请同步：\n  %s"
+                         % (cls, "\n  ".join(bad)))
+    print("[layout/%s] BlobLayout.%s 校验通过" % (arch, cls))
+
+
 def build_stub(arch):
     src = os.path.join(STUB_SRC, "stub_%s.S" % arch)
     pp = os.path.join(WORK, "stub_%s_coff.S" % arch)
@@ -199,6 +229,7 @@ def build_stub(arch):
 
     print("[stub/%s] blob_%s.bin = %d bytes  entry=0x%X  .iat@0x%X"
           % (arch, arch, len(blob), syms.get("kbox_entry", 0), iat_off))
+    verify_java_layout(arch, layout)
 
 
 def main():

@@ -193,7 +193,16 @@
 kbox_entry:
     pushl %ebp
     movl %esp, %ebp
-    subl $96, %esp               # 局部变量区（[ebp-4..-96]）
+    subl $112, %esp              # 局部变量区（[ebp-4..-96]）+ 非易失寄存器保存区
+    # 非易失寄存器必须跨调用保留。EXE 入口无返回方，但 **DLL 入口是被 loader
+    # 直接 call 的**（ntdll!LdrpCallInitRoutine）：它在 call DllMain 前把 esp
+    # 快照存进 esi，返回后执行 `mov esp,esi` 再 pop/ret。stub 全程把
+    # ebx/esi/edi 当通用寄存器（ebx=config、chacha 内为 buf/临时），若不还原
+    # 就跳 OEP，`mov esp,esi` 会用被污染的 esi 覆盖栈指针 →
+    # `pop` 落在非法地址 → 0xC0000005（实测 esp=2，LoadLibrary 返回 1114）。
+    movl %ebx, -100(%ebp)
+    movl %esi, -104(%ebp)
+    movl %edi, -108(%ebp)
     call .Lgetbase
 .Lgetbase:
     popl %eax                    # eax = .Lgetbase 运行时地址
@@ -220,6 +229,9 @@ kbox_entry:
     movl %eax, -20(%ebp)         # 模块基址
     movl CFG_OEP_RVA(%ebx), %eax
     addl -20(%ebp), %eax
+    movl -100(%ebp), %ebx        # 还原非易失寄存器（同尾部跳 OEP）
+    movl -104(%ebp), %esi
+    movl -108(%ebp), %edi
     leave                        # 与尾部跳 OEP 相同的还原序列
     jmp *%eax
 
@@ -639,8 +651,15 @@ kbox_entry:
     pushl %ebx
     call *%ecx
     # ---- 跳转 OEP ----
+    # 与 x64 侧一致：先把非易失寄存器还原成「本函数就是入口点」时的值，
+    # 再用 leave 还原 esp，然后跳原入口。ntdll!LdrpCallInitRoutine 依赖
+    # esi（进入 DllMain 前的 esp 快照）不被破坏，否则返回时 `mov esp,esi`
+    # 会把栈指针指向非法地址。
     movl CFG_OEP_RVA(%ebx), %eax
     addl -20(%ebp), %eax
+    movl -100(%ebp), %ebx
+    movl -104(%ebp), %esi
+    movl -108(%ebp), %edi
     leave                          # 还原 esp/ebp，OEP 期望入口栈布局
     jmp *%eax
 
@@ -1638,10 +1657,14 @@ kbox_chacha:
     movl %ecx, %edx              # 保留密钥流字（cl 将被移位数占用）
     movb %al, %cl
     shrl %cl, %edx              # dl = keystream 字节
+    # 注：buf 指针必须留在 %eax 中供寻址。切勿用 %al 承载数据字节——
+    # `movb (%eax,%edi), %al` 会覆写 %eax 低字节，使后续 `movb %al,(%eax,%edi)`
+    # 以「buf 低字节 = 数据字节」的伪地址写入（实测会把明文散落到导入名
+    # 字符串区并截断 "KERNEL32.dll"/"msvcrt.dll" → LoadLibrary 失败 → 1114）。
     movl 128(%esp), %eax
-    movb (%eax,%edi), %al
-    xorb %dl, %al
-    movb %al, (%eax,%edi)
+    movb (%eax,%edi), %cl       # %ecx 中的 keystream 字已消费完毕，可复用
+    xorb %dl, %cl
+    movb %cl, (%eax,%edi)
     incl %edi
     jmp .Lchacha_tail_byte
 

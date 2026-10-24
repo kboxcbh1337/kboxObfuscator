@@ -4,6 +4,43 @@
 
 ---
 
+## 3.0.5 — 2026-10-24
+
+### 修复
+
+- **x86 (PE32) 加壳产物 `LoadLibrary` 返回 1114**
+  - `stub_x86.S` 的 `kbox_chacha` 尾字节循环用 `%al` 承载数据字节，覆写了
+    `%eax`（buf 指针）的低 8 位，末块明文被写到「地址低字节 = 数据字节」的伪地址，
+    并截断 `KERNEL32.dll` / `msvcrt.dll` → 两个 `LoadLibraryA` 失败 → IAT 未绑定。
+    改为用 `%cl` 承载。
+  - stub 把 `ebx/esi/edi` 当通用寄存器且跳 OEP 前未还原；`ntdll!LdrpCallInitRoutine`
+    依赖 `esi` 保存的进入前栈快照，返回时 `mov esp,esi` 破坏栈指针（实测 `esp=2`）。
+    入口保存、两处跳 OEP 前恢复。
+  - `BlobLayout.X86` 手抄常量在 stub 指令增删后整体漂移（本次 `+32`），配置解密种子
+    读错导致 `.Ldead` 静默死循环。同步常量，并在 `build_blobs.py` 增加
+    `BlobLayout.java` 一致性构建闸门（失配即构建失败）。
+- **x64 C++ 类型匹配 catch 崩溃（`catch(...)` 正常、`catch(int)` AV）**
+  - `PeExports` 原先把 `.xdata` 整体复制到新增 `.kbxed` 节。GCC 的 LSDA **内联**在
+    `UNWIND_INFO` 之后，type table 条目用 `pcrel`（相对条目自身）编码；副本位移后
+    `type_info` 计算值偏出 `.rdata`/`.data`，`catch_type` 成野指针（崩在 libstdc++
+    `get_adjusted_ptr` 的 `mov rax,[rbx]`）。改为 `.pdata` 副本的 `UnwindData` 指回
+    原 `.xdata` 节的新 VA，不再复制该节。
+  - `ShieldPacker.shiftImageInternals` 补齐 `.xdata` 中 `UNWIND_INFO` 的
+    `ExceptionHandler RVA` 平移（按 `RUNTIME_FUNCTION` 去重）。缺失时人格例程按旧
+    RVA 被调用，落点是平移后 `.text` 的中段乱码。
+
+### 验证
+
+`docs/reports/shield-matrix.md`：x86/x64 各 3 个样本（普通导出、TLS 回调、C++ 异常）
+全部 PASS（`checks` 断言 + 退出码 0）。
+
+### 已知限制
+
+- chained unwind（`UNW_FLAG_CHAININFO`）未平移，未标注为支持。
+- 延迟导入、序号导出的序号连续性、并发调用、AV 共存未测试。
+
+---
+
 ## 3.0.4 — 2026-10-23
 
 ### 新增

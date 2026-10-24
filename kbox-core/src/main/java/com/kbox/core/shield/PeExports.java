@@ -274,9 +274,22 @@ final class PeExports {
         int xdataOff = align(pdataOff + pdataLen, 4);
         byte[] xdataCopy = null;
         int xdataInVa = 0;
+        int xdataReuseVa = 0;
         if (pdataRows != null && !pdataRows.isEmpty()) {
             Sec xin = findSection(inPe, ".xdata");
-            if (xin != null) {
+            Sec xout = outByName.get(".xdata");
+            if (xin != null && xout != null) {
+                // 复用原 .xdata 节：GCC 的 LSDA 内联在 UNWIND_INFO 之后，type table
+                // 条目用 pcrel（相对条目自身）编码。若把 .xdata 复制到本节的末尾，
+                // LSDA 基址整体位移，pcrel 算出的 type_info 就会偏出 .data/.rdata
+                // ——实测 catch(int) 拿到的 catch_type 是野指针，崩在
+                // libstdc++ get_adjusted_ptr 的 `mov rax,[rbx]`。
+                // 因此这里只翻译 UnwindData（指回原节的新 VA），节内容保持不变；
+                // 其中 ExceptionHandler RVA 已由 ShieldPacker.shiftImageInternals
+                // 随代码一并平移。
+                xdataInVa = xin.virtualAddress;
+                xdataReuseVa = xout.virtualAddress;
+            } else if (xin != null) {
                 int len = Math.max(xin.rawSize, xin.virtualSize);
                 if (xin.rawPtr >= 0 && xin.rawPtr + len <= input.length) {
                     xdataInVa = xin.virtualAddress;
@@ -293,8 +306,14 @@ final class PeExports {
             int xdataNewVa = newVa + xdataOff;
             for (int i = 0; i < pdataRows.size(); i++) {
                 int[] r = pdataRows.get(i);
-                int newUnwind = (xdataCopy == null || r[2] == 0)
-                        ? r[2] : xdataNewVa + (r[2] - xdataInVa);
+                int newUnwind;
+                if (xdataReuseVa != 0) {
+                    newUnwind = (r[2] == 0) ? 0 : xdataReuseVa + (r[2] - xdataInVa);
+                } else if (xdataCopy == null || r[2] == 0) {
+                    newUnwind = r[2];
+                } else {
+                    newUnwind = xdataNewVa + (r[2] - xdataInVa);
+                }
                 w32(pdata, i * 12, r[0]);
                 w32(pdata, i * 12 + 4, r[1]);
                 w32(pdata, i * 12 + 8, newUnwind);
@@ -427,17 +446,10 @@ final class PeExports {
                     int nh = mapRva(in, out, outByName, h);
                     if (nh > 0) w32(xdata, p, nh);
                 }
-                // The 4 bytes after the personality RVA are the handler-data RVA
-                // (for GCC's SEH personality this points into
-                // .gcc_except_table). It must be translated too, otherwise the
-                // catch clause table is never found and the exception escapes.
-                if (p + 8 <= xdata.length) {
-                    int hd = u4(xdata, p + 4);
-                    if (hd != 0) {
-                        int nhd = mapRva(in, out, outByName, hd);
-                        if (nhd > 0) w32(xdata, p + 4, nhd);
-                    }
-                }
+                // 注意：紧随 personality RVA 的是 **LSDA 本体**（内联），不是指向
+                // LSDA 的 RVA。GCC 的 type table 条目为 pcrel 编码，副本整体位移后
+                // 计算出的 type_info 会失配，故主路径已改为复用原 .xdata 节；
+                // 本回退分支（输出镜像无 .xdata 映射）保持旧行为且未经异常验证。
             }
             if ((flags & 4) != 0 && codes >= 1) {
                 int co = o + 4 + (codes - 1) * 2;

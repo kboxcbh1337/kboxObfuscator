@@ -92,17 +92,18 @@ java -jar kboxObfuscator.jar --shield-matrix samples\ --shield-out shield-out\ \
 | 独立 DLL 入口 + 契约 + 导出表校验 | ✅ 已实现 |
 | DLL 导出表重建（打包后仍可 `GetProcAddress`） | ✅ 已实现：新增明文 `.kbxed` 节承载导出目录，EAT 指向移位后的函数 RVA |
 | x64 DLL 运行时加载 + 导出调用 | ✅ 实测 PASS（LoadLibrary + GetProcAddress + 调用返回值正确） |
-| TLS 回调 | ✅ x64 实测 PASS（回调在 OEP 前由 stub 触发） |
+| TLS 回调 | ✅ x86/x64 实测 PASS（回调在 OEP 前由 stub 触发） |
 | x64 EXE | 🟡 可打包，样本有限 |
-| C++ 异常展开（SEH / `.pdata`+`.xdata`） | ⛔ 仍失败：已重建 `.pdata` 与 `.xdata` 副本并翻译 RVA，但抛异常时 mingw 运行时仍报 “has no image-section” |
-| x86 (PE32) | 🟡 未实测（本机无 x86 工具链） |
+| C++ 异常展开（SEH / `.pdata`+`.xdata`） | ✅ x86/x64 实测 PASS，含 `catch(...)` 与类型匹配 `catch(int)`（3.0.5 修复） |
+| x86 (PE32) | ✅ 实测 PASS（3.0.5 修复后：普通导出 / TLS / C++ 异常三样本） |
+| chained unwind（`UNW_FLAG_CHAININFO`） | 🟡 未平移链式 `RUNTIME_FUNCTION`，未实测 |
 | 延迟导入 | 🟡 未实测 |
 | 序号导出（无名） | 🟡 部分：条目数量保留，未做名字级验证 |
 | 反病毒共存 | 默认 `defFlags` 已改为 `0`（AV 安全）；需要主动防御时显式 `--shield-def-flags 0x3FFFF` |
 
-> **3.0.4 实测结论**（`docs/reports/shield-matrix.md` + 宿主运行时验证）：
-> x64 具名导出 DLL、TLS 回调 DLL 均为 PASS；C++ 异常展开 DLL 为 FAIL（未通过），
-> 该用例已列入已知问题，不得写成“支持”。
+> **3.0.5 实测结论**（`docs/reports/shield-matrix.md` + 宿主运行时验证）：
+> x86 与 x64 的普通导出 DLL、TLS 回调 DLL、C++ 异常展开 DLL 全部 PASS
+> （`checks` 断言通过且退出码 0）。chained unwind、延迟导入等未覆盖项仍按“未验证”处理。
 
 未列出的组合一律视为**未验证**，不得在发布说明中写成“支持”。
 

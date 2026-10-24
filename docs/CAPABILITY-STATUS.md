@@ -1,6 +1,6 @@
 # 能力状态清单（Capability Status）
 
-> 适用版本：3.0.4 ｜ 更新：2026-10-23
+> 适用版本：3.0.5 ｜ 更新：2026-10-24
 >
 > 目的：把"已实现并测试 / 已实现未充分验证 / 设计中 / 暂不支持"分开标注，避免把计划当成能力。
 > 任何对外宣传只能引用本表的状态，不得越级。
@@ -25,10 +25,11 @@
 | 导出表保留**校验**（静态，失败即拒绝） | ✅ | `shield/ShieldCli.PeInfo` | 缺失即退出码 4 |
 | DLL **导出表重建**（明文 `.kbxed` 节） | ✅ | `shield/PeExports` | 运行期 GetProcAddress 通过 |
 | x64 DLL 加壳（可被宿主加载） | ✅ | `shield/ShieldPacker` | 宿主测试 PASS |
-| C++ 异常展开（SEH） | ⛔ | — | 实测 FAIL（重建 .pdata/.xdata 仍未通过） |
+| C++ 异常展开（SEH，含 `catch(...)` 与 `catch(int)`） | ✅ | `shield/ShieldPacker` + `shield/PeExports` | 3.0.5 修复后 x86/x64 宿主测试 PASS |
 | x64 EXE 加壳 | 🟡 | 同上 | 样本有限 |
-| x86 (PE32) | 🟡 | 同上 | 未实测 |
-| TLS 回调 / 延迟导入 / SEH | 🟡 | 同上 | 未验证 |
+| x86 (PE32) | ✅ | 同上 | 3.0.5 修复后三样本 PASS |
+| TLS 回调 | ✅ | 同上 | x86/x64 样本 PASS |
+| 延迟导入 / chained unwind | 🟡 | 同上 | 未验证 |
 | 序号导出 | 🟡 | 同上 | 仅数量校验 |
 | 函数级虚拟化 | 🟡 | `shield/VmEngine` | 有实现，无第三方分析报告 |
 | VM 跨构建差异化度量 | 🟡 | `shield/Srox*` | `docs/KBOXSHEID-DIFFERENTIATION.md` |

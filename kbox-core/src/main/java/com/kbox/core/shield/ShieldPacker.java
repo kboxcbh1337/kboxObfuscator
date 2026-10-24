@@ -1607,6 +1607,42 @@ public final class ShieldPacker {
         }
     }
 
+    /**
+     * 平移单个 UNWIND_INFO 的异常处理器 RVA（UNW_FLAG_EHANDLER）。
+     *
+     * <p>GCC 的 LSDA <b>内联</b>在 UNWIND_INFO 之后（handler data 不是 RVA 指针，
+     * 而是 LSDA 本体），其 type table 条目用 pcrel（相对条目自身）编码。只要
+     * LSDA 与代码同量平移，pcrel 计算出的 type_info 地址就自洽，因此这里只改
+     * handler RVA，绝不改 LSDA 内容。</p>
+     *
+     * <p>漏改 handler 的后果：RtlVirtualUnwind 仍按旧 RVA 调人格例程，落点是
+     * 平移后 .text 的中段乱码（实测 RIP = 镜像+0x18350，正确应为 +0x2a350），
+     * 表现为 C++ 异常展开时 0xC0000005。</p>
+     *
+     * <p>UNW_FLAG_CHAININFO（chained unwind）未在此处理：本项目的样本与常见
+     * MSVC/GCC 输出均为独立 UNWIND_INFO，chained 场景未验证，不宣称支持。</p>
+     */
+    private static void patchUnwindInfoHandler(PeImage img, Vec file,
+                                               int unwindRva, int shift, int[] off) {
+        if (unwindRva == 0 || !img.rvaToOffset(unwindRva, off)) {
+            return;
+        }
+        int o = off[0];
+        byte[] a = file.array();
+        if (o < 0 || o + 4 > a.length) {
+            return;
+        }
+        int flags = (Bin.u8(a, o) >>> 3) & 0x1F;
+        int codes = Bin.u8(a, o + 2);
+        int p = (o + 4 + codes * 2 + 3) & ~3;
+        if ((flags & 1) != 0 && p + 4 <= a.length) {
+            int h = Bin.i32(a, p);
+            if (h != 0) {
+                Bin.w32(a, p, h + shift);
+            }
+        }
+    }
+
     /** {@code memcpy(sh.Name, name.c_str(), name.size())}（8 字节定长，含 NUL）。 */
     private static void writeSectionName(byte[] sh, String name) {
         byte[] raw = name.getBytes(StandardCharsets.US_ASCII);
@@ -1661,7 +1697,17 @@ public final class ShieldPacker {
                         && Integer.compareUnsigned(dirRva,
                                 s.virtualAddress + s.rawSize) < 0) {
                     int cnt = (s.rawSize / 12) * 12;
+                    // 2b) 先按「原始」UnwindData RVA 修正 .xdata 内 UNWIND_INFO 的
+                    //     ExceptionHandler RVA（此时该 RUNTIME_FUNCTION 字段尚未 +shift）。
+                    //     多个函数可共享同一 UNWIND_INFO，必须去重，否则 handler 会被
+                    //     重复累加 shift。漏改的表现：异常展开跳到 .text 中段的乱码处
+                    //     （实测 RIP = 镜像+0x18350，而正确值应为镜像+0x2a350）。
+                    java.util.HashSet<Integer> patched = new java.util.HashSet<Integer>();
                     for (int o = 0; o < cnt; o += 12) {
+                        int unwindRva = Bin.i32(file.array(), s.rawPtr + o + 8);
+                        if (unwindRva != 0 && patched.add(unwindRva)) {
+                            patchUnwindInfoHandler(img, file, unwindRva, shift, off);
+                        }
                         for (int k = 0; k < 12; k += 4) {
                             long v = Bin.u32(file.array(), s.rawPtr + o + k);
                             Bin.w32(file.array(), s.rawPtr + o + k, (int) (v + shift));
